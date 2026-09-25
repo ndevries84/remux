@@ -871,15 +871,18 @@ pub struct MediaSourceSortKey {
     hdr_variant: u8,
 }
 
-/// All request-independent inputs used to rank sources. Bitrate limits are
-/// intentionally absent: they are live playback policy, not a durable device
-/// capability and therefore must never affect source ordering.
+/// All request-independent inputs used to rank sources, plus `max_bitrate` —
+/// live playback policy rather than a durable device capability, so `assess`
+/// only ever applies it under `SortMediaSourcesMode::Compatibility` (see its
+/// doc comment); every other mode ignores it, exactly as before this field
+/// existed.
 #[derive(Debug, Clone, Copy)]
 pub struct SourceRankingContext<'a> {
     pub mode: SortMediaSourcesMode,
     pub device_profile: Option<&'a DeviceProfile>,
     pub subtitle_mode: EmbeddedSubtitleHandling,
     pub explicit_subtitle_index: Option<i64>,
+    pub max_bitrate: Option<u64>,
 }
 
 #[derive(Debug, Clone)]
@@ -911,12 +914,21 @@ impl SourceAssessment {
 
 impl SourceRankingContext<'_> {
     pub fn assess(&self, source: &MediaSourceInfo) -> SourceAssessment {
+        // Bitrate limits are live playback policy, not a durable device
+        // capability: only Compatibility mode's ranking may be pushed around
+        // by the request's cap. Best/Quality stay bitrate-cap-blind.
+        let max_bitrate = match self.mode {
+            SortMediaSourcesMode::Compatibility => self
+                .max_bitrate
+                .map(|b| b as i64),
+            _ => None,
+        };
         let reasons = compute_transcode_reasons(
             source,
             self.device_profile,
             self.subtitle_mode,
             self.explicit_subtitle_index,
-            None,
+            max_bitrate,
         );
         let rank = source.capability_rank(self.device_profile, &reasons);
         SourceAssessment { reasons, rank }
@@ -2808,6 +2820,7 @@ mod tests {
             device_profile: Some(&profile),
             subtitle_mode: EmbeddedSubtitleHandling::default(),
             explicit_subtitle_index: None,
+            max_bitrate: None,
         }
         .assess(&source);
 
@@ -3229,6 +3242,7 @@ mod tests {
             device_profile: Some(&profile),
             subtitle_mode: EmbeddedSubtitleHandling::default(),
             explicit_subtitle_index: None,
+            max_bitrate: None,
         };
         let mut ranked: Vec<_> = fixtures
             .into_iter()
@@ -3818,6 +3832,7 @@ mod tests {
             device_profile: profile,
             subtitle_mode: EmbeddedSubtitleHandling::default(),
             explicit_subtitle_index: None,
+            max_bitrate: None,
         };
         let mut ranked: Vec<_> = candidates
             .into_iter()
@@ -3976,6 +3991,7 @@ mod tests {
             device_profile: Some(&profile),
             subtitle_mode: EmbeddedSubtitleHandling::default(),
             explicit_subtitle_index: None,
+            max_bitrate: None,
         };
 
         let (a_name, a_source) = candidates

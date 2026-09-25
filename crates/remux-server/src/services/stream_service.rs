@@ -1,10 +1,16 @@
 use crate::{
-    AppContext, api, db,
+    AppContext, api,
+    conversions::apply_filename_guess,
+    db,
     db::PreProbeQualityExt,
+    device_profile::{CodecProfileExt, DirectPlayProfileExt, ProfileConditionExt},
     playback::probe::{ProbeDataExt, probe_stream, resolve_stream_root},
 };
 use remux_sdks::{
-    remux::{MediaStreamType, StreamFilter, VideoRangeType},
+    remux::{
+        CodecProfileType, MediaStreamType, ProfileConditionProperty, StreamFilter,
+        VideoRangeType,
+    },
     remuxdb,
 };
 use tracing::debug;
@@ -52,12 +58,122 @@ pub(crate) struct StreamService {
     group: Option<(Uuid, String, Vec<db::Media>)>,
     stream: Option<db::Media>,
     pub streams: Vec<db::Media>,
+    /// Requesting client's device profile, when known. Drives device-aware
+    /// pre-probe ordering in the auto-play (`MediaSourceId == item_id`)
+    /// branch of `select_streams` — see `device_aware_probe_pool`. `None`
+    /// leaves that branch's behaviour unchanged.
+    pub(crate) device_profile: Option<api::DeviceProfile>,
+    /// Bitrate cap to weigh alongside `device_profile` in the same branch.
+    pub(crate) max_bitrate: Option<u64>,
 }
 
 fn quality_ordered_probe_pool(streams: &[db::Media]) -> Vec<db::Media> {
     let mut pool = streams.to_vec();
     pool.sort_by_cached_key(|stream| std::cmp::Reverse(stream.quality_weight()));
     pool
+}
+
+/// True when `stream`'s probed-or-filename-guessed video codec, range and
+/// estimated bitrate can all be satisfied by `profile`/`max_bitrate`:
+///
+/// (a) the video codec appears in any `DirectPlayProfile.VideoCodec` list
+///     (container is not considered here — that's a separate, independent
+///     direct-play concern this pre-probe heuristic isn't trying to answer);
+/// (b) if a video `CodecProfile` for that codec carries a `VideoRangeType`
+///     condition, the candidate's range (unknown ⇒ compatible) satisfies it;
+/// (c) if `max_bitrate` is given and an estimated bitrate is known, it is at
+///     or under the cap (unknown ⇒ compatible).
+///
+/// Reuses the same `MediaSourceInfo::from(db::Media)` + `apply_filename_guess`
+/// conversion the real playback/ranking path uses, so "probe data if present
+/// else filename guess" is exactly the engine's own fallback, not a
+/// reimplementation of it — and the same `DirectPlayProfileExt`/
+/// `CodecProfileExt`/`ProfileConditionExt` helpers `check_direct_play` itself
+/// is built from.
+fn device_aware_compatible(
+    stream: &db::Media,
+    profile: &api::DeviceProfile,
+    max_bitrate: Option<u64>,
+) -> bool {
+    let mut info = api::MediaSourceInfo::from(stream.clone());
+    apply_filename_guess(&mut info, stream);
+
+    let Some(codec) = info
+        .video_stream()
+        .and_then(|v| {
+            v.codec
+                .as_deref()
+        })
+    else {
+        // No usable video codec signal even after a filename guess: nothing
+        // to disqualify the candidate on, so treat it as compatible.
+        return true;
+    };
+
+    let codec_ok = profile
+        .direct_play_profiles
+        .iter()
+        .any(|p| p.supports_video_codec(codec));
+    if !codec_ok {
+        return false;
+    }
+
+    let range = info
+        .video_stream()
+        .and_then(|v| {
+            v.video_range_type
+                .as_ref()
+        })
+        .map(|r| r.as_str());
+    let range_ok = profile
+        .codec_profiles
+        .iter()
+        .filter(|cp| matches!(cp.type_, None | Some(CodecProfileType::Video)))
+        .filter(|cp| cp.applies_to_codec(codec))
+        .flat_map(|cp| &cp.conditions)
+        .filter(|cond| {
+            cond.property
+                .as_ref()
+                == Some(&ProfileConditionProperty::VideoRangeType)
+        })
+        .all(|cond| cond.is_satisfied_opt(range));
+    if !range_ok {
+        return false;
+    }
+
+    if let Some(max) = max_bitrate {
+        if let Some(bitrate) = info.bitrate {
+            if bitrate > 0 && bitrate as u64 > max {
+                return false;
+            }
+        }
+    }
+
+    true
+}
+
+/// Device-aware pre-probe ordering (lostb1t/remux#552): with `profile ==
+/// None` this is byte-for-byte `quality_ordered_probe_pool(streams)` — pure
+/// filename-derived quality order, unchanged from today. With a profile, the
+/// same quality-ordered pool is stably partitioned into compatible-first
+/// (per `device_aware_compatible`) then everything else, each half keeping
+/// its existing quality order.
+pub(crate) fn device_aware_probe_pool(
+    streams: &[db::Media],
+    profile: Option<&api::DeviceProfile>,
+    max_bitrate: Option<u64>,
+) -> Vec<db::Media> {
+    let pool = quality_ordered_probe_pool(streams);
+    let Some(profile) = profile else {
+        return pool;
+    };
+    let (compatible, rest): (Vec<db::Media>, Vec<db::Media>) = pool
+        .into_iter()
+        .partition(|stream| device_aware_compatible(stream, profile, max_bitrate));
+    compatible
+        .into_iter()
+        .chain(rest)
+        .collect()
 }
 
 impl StreamService {
@@ -72,6 +188,8 @@ impl StreamService {
             group: None,
             stream: None,
             streams: vec![],
+            device_profile: None,
+            max_bitrate: None,
         }
     }
 
@@ -430,8 +548,22 @@ impl StreamService {
             // media_source_id == item_id (Android TV auto-play) or stream not found:
             // return only the first stream; specific_requested stays false so
             // source[0].id is overridden to item_id below (required for Android TV routing).
-            let mut v = all_streams;
-            v.truncate(1);
+            // When a device profile is known, serve device_aware_probe_pool's top
+            // candidate instead of the raw addon-order first stream (#552); with no
+            // profile (e.g. Android TV) this is unchanged from before.
+            let v = if let Some(profile) = &self.device_profile {
+                let mut pool = device_aware_probe_pool(
+                    &all_streams,
+                    Some(profile),
+                    self.max_bitrate,
+                );
+                pool.truncate(1);
+                pool
+            } else {
+                let mut v = all_streams;
+                v.truncate(1);
+                v
+            };
             (v, None)
         } else {
             // No stream ID: return all versions for the selection UI,

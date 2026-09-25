@@ -285,6 +285,15 @@ async fn items_playbackinfo_inner(
         (a, b) => a.or(b),
     };
 
+    // Device-aware auto-play (#552): when a profile is known (this request's
+    // own, or the last one persisted for this device), the MediaSourceId ==
+    // item_id branch of `select_streams` picks the top of
+    // `device_aware_probe_pool` instead of the raw first candidate. Leaving
+    // both fields `None` (e.g. Android TV, which never sends or persists a
+    // profile) keeps that branch's behaviour exactly as before.
+    service.device_profile = sort_device_profile.clone();
+    service.max_bitrate = max_bitrate.map(|b| b.max(0) as u64);
+
     let play_session_id = common::get_uuid()
         .as_simple()
         .to_string();
@@ -599,6 +608,7 @@ async fn items_playbackinfo_inner(
             device_profile: sort_device_profile.as_ref(),
             subtitle_mode,
             explicit_subtitle_index: q.subtitle_stream_index,
+            max_bitrate: max_bitrate.map(|b| b.max(0) as u64),
         };
         let mut paired: Vec<_> = media_sources
             .drain(..)
