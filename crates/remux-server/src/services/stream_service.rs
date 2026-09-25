@@ -1546,7 +1546,10 @@ mod tests {
         let preferred_filename = preferred
             .stream_info
             .as_ref()
-            .and_then(|si| si.filename.as_deref())
+            .and_then(|si| {
+                si.filename
+                    .as_deref()
+            })
             .unwrap_or_default();
 
         println!("pre-probe preferred candidate (device-blind): {preferred_filename}");
@@ -1620,7 +1623,10 @@ mod tests {
         let picked_filename = picked
             .stream_info
             .as_ref()
-            .and_then(|si| si.filename.as_deref())
+            .and_then(|si| {
+                si.filename
+                    .as_deref()
+            })
             .unwrap_or_default();
         println!("auto-play (MediaSourceId == item_id) picked: {picked_filename}");
 
@@ -2017,7 +2023,10 @@ mod tests {
         let first_filename = first
             .stream_info
             .as_ref()
-            .and_then(|si| si.filename.as_deref())
+            .and_then(|si| {
+                si.filename
+                    .as_deref()
+            })
             .unwrap_or_default();
         assert!(
             !first_filename.contains("REMUX"),
@@ -2060,7 +2069,10 @@ mod tests {
             .position(|m| {
                 m.stream_info
                     .as_ref()
-                    .and_then(|si| si.filename.as_deref())
+                    .and_then(|si| {
+                        si.filename
+                            .as_deref()
+                    })
                     .is_some_and(|f| f.contains("DOVIUNDERCAP"))
             })
             .expect("the under-cap DOVI candidate (D) must be present");
@@ -2106,15 +2118,17 @@ mod tests {
         let streams = device_aware_candidates();
         let profile = infuse_like_dovi_profile();
 
-        let pool =
-            device_aware_probe_pool(&streams, Some(&profile), Some(200_000_000));
+        let pool = device_aware_probe_pool(&streams, Some(&profile), Some(200_000_000));
 
         let first_filename = pool
             .first()
             .and_then(|m| {
                 m.stream_info
                     .as_ref()
-                    .and_then(|si| si.filename.as_deref())
+                    .and_then(|si| {
+                        si.filename
+                            .as_deref()
+                    })
             })
             .unwrap_or_default();
         assert!(
@@ -2157,10 +2171,11 @@ mod tests {
         );
         let served = &sel.candidates[0];
 
-        let expected_first = device_aware_probe_pool(&streams, Some(&profile), Some(max_bitrate))
-            .into_iter()
-            .next()
-            .expect("pool must not be empty");
+        let expected_first =
+            device_aware_probe_pool(&streams, Some(&profile), Some(max_bitrate))
+                .into_iter()
+                .next()
+                .expect("pool must not be empty");
         assert_eq!(
             served.id, expected_first.id,
             "{label}: auto-play with a device profile present must serve \
@@ -2192,7 +2207,10 @@ mod tests {
         let served_filename = served
             .stream_info
             .as_ref()
-            .and_then(|si| si.filename.as_deref())
+            .and_then(|si| {
+                si.filename
+                    .as_deref()
+            })
             .unwrap_or_default();
         assert!(
             !served_filename.contains("REMUX"),
@@ -2253,8 +2271,7 @@ mod tests {
                 .iter()
                 .any(|s| {
                     matches!(s.type_, Some(MediaStreamType::Video))
-                        && s.height
-                            == Some(2160)
+                        && s.height == Some(2160)
                 });
             if is_2160p {
                 assert!(
@@ -2309,8 +2326,7 @@ mod tests {
 
     /// SPEC: with the Infuse-like profile set on the service, auto-play must still serve the 2160p remux.
     #[tokio::test]
-    async fn desired_auto_play_uses_device_aware_selection_with_infuse_like_profile()
-     {
+    async fn desired_auto_play_uses_device_aware_selection_with_infuse_like_profile() {
         use crate::integration_test::authenticated_server;
 
         let (_server, guard, _token) = authenticated_server().await;
@@ -2341,7 +2357,10 @@ mod tests {
         let served_filename = served
             .stream_info
             .as_ref()
-            .and_then(|si| si.filename.as_deref())
+            .and_then(|si| {
+                si.filename
+                    .as_deref()
+            })
             .unwrap_or_default();
         assert!(
             served_filename.contains("REMUX"),

@@ -3708,8 +3708,9 @@ mod tests {
             (VideoRangeType::Hdr10, "eac3", 6, 20.3, true, true),
             (VideoRangeType::Dovi, "truehd", 8, 29.5, true, false),
         ];
-        for (i, (range, acodec, ch, size_gb, cached, probed)) in
-            alt_2160p.into_iter().enumerate()
+        for (i, (range, acodec, ch, size_gb, cached, probed)) in alt_2160p
+            .into_iter()
+            .enumerate()
         {
             let range_tag = match range {
                 VideoRangeType::Dovi => "DV.HDR",
@@ -3724,10 +3725,8 @@ mod tests {
                 "Toy.Story.5.2025.2160p.WEB-DL.{range_tag}.HEVC.{acodec_tag}-GROUP{i}.mkv"
             );
             let source_label = if probed { "remux_db" } else { "filename_guess" };
-            let name = format!(
-                "B{}: 2160p {range:?} HEVC {acodec} ({source_label})",
-                i + 1
-            );
+            let name =
+                format!("B{}: 2160p {range:?} HEVC {acodec} ({source_label})", i + 1);
             if probed {
                 v.push(repro_probed_candidate(
                     name,
@@ -3767,16 +3766,15 @@ mod tests {
             ("eac3", 6, 6.2, true, true),
             ("eac3", 6, 6.7, true, false),
         ];
-        for (i, (acodec, ch, size_gb, cached, probed)) in
-            alt_1080p.into_iter().enumerate()
+        for (i, (acodec, ch, size_gb, cached, probed)) in alt_1080p
+            .into_iter()
+            .enumerate()
         {
             let acodec_tag = if acodec == "aac" { "AAC" } else { "DDP5.1" };
             let filename = if i % 2 == 0 {
                 format!("Toy.Story.5.2025.1080p.BluRay.x264.{acodec_tag}-GROUP{i}.mkv")
             } else {
-                format!(
-                    "Toy.Story.5.2025.1080p.WEB-DL.{acodec_tag}.H.264-GROUP{i}.mkv"
-                )
+                format!("Toy.Story.5.2025.1080p.WEB-DL.{acodec_tag}.H.264-GROUP{i}.mkv")
             };
             let source_label = if probed { "remux_db" } else { "filename_guess" };
             let name = format!("C{}: 1080p H.264 {acodec} ({source_label})", i + 1);
@@ -3849,11 +3847,14 @@ mod tests {
                 (name, source, assessment, sort_key, live_reasons)
             })
             .collect();
-        ranked.sort_by_cached_key(|(_, _, _, sort_key, _)| std::cmp::Reverse(*sort_key));
+        ranked
+            .sort_by_cached_key(|(_, _, _, sort_key, _)| std::cmp::Reverse(*sort_key));
 
         println!("\n--- {label} ---");
-        for (i, (name, _source, assessment, sort_key, live_reasons)) in
-            ranked.iter().enumerate().take(5)
+        for (i, (name, _source, assessment, sort_key, live_reasons)) in ranked
+            .iter()
+            .enumerate()
+            .take(5)
         {
             println!(
                 "#{:02} {name}\n     rank_reasons={:?} tier={} live_reasons_with_bitrate_cap={:?} key={sort_key:?}",
@@ -4006,14 +4007,32 @@ mod tests {
 
         let key_a = ranking.sort_key(a_source);
         let key_best_1080p = ranking.sort_key(best_source);
-        let reasons_a = ranking.assess(a_source).reasons;
-        let reasons_best_1080p = ranking.assess(best_source).reasons;
+        let reasons_a = ranking
+            .assess(a_source)
+            .reasons;
+        let reasons_best_1080p = ranking
+            .assess(best_source)
+            .reasons;
 
-        println!("\n--- Full MediaSourceSortKey (Compatibility, Chrome/jellyfin-web) ---");
-        println!("A ({a_name}):\n  reasons={:?}\n  key={key_a:#?}",
-            reasons_a.0.iter().map(TranscodeReason::name).collect::<Vec<_>>());
-        println!("best 1080p AAC ({best_name}):\n  reasons={:?}\n  key={key_best_1080p:#?}",
-            reasons_best_1080p.0.iter().map(TranscodeReason::name).collect::<Vec<_>>());
+        println!(
+            "\n--- Full MediaSourceSortKey (Compatibility, Chrome/jellyfin-web) ---"
+        );
+        println!(
+            "A ({a_name}):\n  reasons={:?}\n  key={key_a:#?}",
+            reasons_a
+                .0
+                .iter()
+                .map(TranscodeReason::name)
+                .collect::<Vec<_>>()
+        );
+        println!(
+            "best 1080p AAC ({best_name}):\n  reasons={:?}\n  key={key_best_1080p:#?}",
+            reasons_best_1080p
+                .0
+                .iter()
+                .map(TranscodeReason::name)
+                .collect::<Vec<_>>()
+        );
 
         // The decisive field: whichever of `key_a`/`key_best_1080p` differs
         // first, in declaration order (cached, plausibility_before_cost,
@@ -4140,8 +4159,13 @@ mod tests {
                 "A: 2160p REMUX DV/HDR HEVC TrueHD 7.1",
                 "Toy.Story.5.2025.2160p.UHD.BluRay.REMUX.DV.HDR.HEVC.TrueHD.Atmos.7.1-FraMeSToR.mkv",
                 repro_video_stream(
-                    "hevc", 3840, 2160, Some(VideoRangeType::Dovi), Some(10),
-                    Some("hev1"), Some(23.976),
+                    "hevc",
+                    3840,
+                    2160,
+                    Some(VideoRangeType::Dovi),
+                    Some(10),
+                    Some("hev1"),
+                    Some(23.976),
                 ),
                 repro_audio_stream("truehd", 8),
                 52.4,
@@ -4152,8 +4176,13 @@ mod tests {
                 "B: 2160p HDR10 HEVC eac3",
                 "Toy.Story.5.2025.2160p.WEB-DL.HDR10.HEVC.DDP5.1-GROUP0.mkv",
                 repro_video_stream(
-                    "hevc", 3840, 2160, Some(VideoRangeType::Hdr10), Some(10),
-                    Some("hev1"), Some(23.976),
+                    "hevc",
+                    3840,
+                    2160,
+                    Some(VideoRangeType::Hdr10),
+                    Some(10),
+                    Some("hev1"),
+                    Some(23.976),
                 ),
                 repro_audio_stream("eac3", 6),
                 24.0,
@@ -4164,7 +4193,12 @@ mod tests {
                 "C1: 1080p H.264 aac",
                 "Toy.Story.5.2025.1080p.BluRay.x264.AAC-GROUP0.mkv",
                 repro_video_stream(
-                    "h264", 1920, 1080, Some(VideoRangeType::Sdr), Some(8), None,
+                    "h264",
+                    1920,
+                    1080,
+                    Some(VideoRangeType::Sdr),
+                    Some(8),
+                    None,
                     Some(23.976),
                 ),
                 repro_audio_stream("aac", 2),
@@ -4176,7 +4210,12 @@ mod tests {
                 "C2: 1080p H.264 eac3",
                 "Toy.Story.5.2025.1080p.WEB-DL.DDP5.1.H.264-GROUP3.mkv",
                 repro_video_stream(
-                    "h264", 1920, 1080, Some(VideoRangeType::Sdr), Some(8), None,
+                    "h264",
+                    1920,
+                    1080,
+                    Some(VideoRangeType::Sdr),
+                    Some(8),
+                    None,
                     Some(23.976),
                 ),
                 repro_audio_stream("eac3", 6),
@@ -4297,7 +4336,7 @@ mod tests {
     /// SPEC: once `confident_4k_capable` stops crediting jellyfin-web's `LessThanEqual` VideoLevel ceiling as 4K support, the Compatibility top-1 (whichever candidate that is) must not need a video re-encode against the repo jellyfin-web fixture (no bitrate cap).
     #[test]
     fn desired_compatibility_top1_needs_no_video_reencode_on_jellyfin_web_repo_profile()
-     {
+    {
         let profile = jellyfin_web_real_profile();
         let order = repro_run_and_print(
             "desired: Compatibility / Chrome (jellyfin-web repo fixture) / no bitrate cap",
@@ -4330,7 +4369,7 @@ mod tests {
     /// SPEC: same as above, against the live-like jellyfin-web profile.
     #[test]
     fn desired_compatibility_top1_needs_no_video_reencode_on_jellyfin_web_live_profile()
-     {
+    {
         let profile = jellyfin_web_live_profile();
         let order = repro_run_and_print(
             "desired: Compatibility / Chrome (jellyfin-web live profile) / no bitrate cap",
