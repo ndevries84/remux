@@ -1503,4 +1503,718 @@ mod tests {
         // pipeline as an explicit PlaybackInfo request, instead of trusting
         // positional order in `self.streams`.
     }
+
+    // =========================================================================
+    // Desired behaviour (lostb1t/remux#552): pre-probe / auto-play selection
+    // becomes device-aware. See `device_profile.rs`'s `repro_*`/`desired_*`
+    // tests for the post-probe capability-sort half of this fix.
+    //
+    // These fixtures build `db::Media` directly (not `MediaSourceInfo`), in
+    // the same probe_data-populated / filename-guess-only shape as
+    // `device_profile.rs`'s `repro_probed_candidate`/`repro_guessed_candidate`,
+    // because `device_aware_probe_pool` (unlike the post-probe capability
+    // sort) operates pre-probe on `db::Media`.
+    //
+    // Candidates `A` and `B` are kept above the 65,573,770 bps (~65.6 Mbps)
+    // cap used below, so bitrate (rule c) alone disqualifies them regardless
+    // of profile. Candidate `D` is deliberately kept UNDER that cap so rule
+    // (b) (VideoRangeType) can be exercised on its own: the repo
+    // jellyfin-web fixture's hevc `CodecProfile` allows
+    // SDR/HDR10/HDR10Plus/HLG/DOVI, so `D` is genuinely compatible there
+    // (and correctly outranks 1080p — HDR is not gated, per lead review);
+    // the live-like profile (`jellyfin_web_live_profile`, see below) narrows
+    // that list to exclude DOVI, so `D` must fail rule (b) there instead.
+    // Container is explicitly not considered by rule (a), and the hevc/h264
+    // codecs themselves are allowed by jellyfin-web's mp4/m4v
+    // DirectPlayProfile regardless of profile variant.
+
+    /// Same jellyfin-web 10.11 profile as `device_profile.rs`'s
+    /// `jellyfin_web_real_profile()`. Duplicated here (test-only) because
+    /// that helper lives in a different module's private `#[cfg(test)]`
+    /// block.
+    fn jellyfin_web_real_profile() -> api::DeviceProfile {
+        serde_json::from_str(include_str!(
+            "../testdata/jellyfin_web_device_profile.json"
+        ))
+        .expect("fixture must parse")
+    }
+
+    /// Same jellyfin-web profile as the repo fixture, but with the HEVC
+    /// `CodecProfile`'s `VideoRangeType` condition narrowed to
+    /// `SDR|HDR10|HDR10Plus|HLG` (no `DOVI`) and every video
+    /// `DirectPlayProfile`'s `AudioCodec` narrowed to
+    /// `aac,mp3,mp2,opus,flac,vorbis` (no `ac3`/`eac3`) — this is what the
+    /// user's actual Chrome instance sends (verified against the instance DB
+    /// and the live `VideoRangeTypeNotSupported` reason observed on a DoVi
+    /// title). Duplicated from `device_profile.rs`'s helper of the same
+    /// intent for the same cross-module-private-test-mod reason as above.
+    fn jellyfin_web_live_profile() -> api::DeviceProfile {
+        let mut value: serde_json::Value = serde_json::from_str(include_str!(
+            "../testdata/jellyfin_web_device_profile.json"
+        ))
+        .expect("fixture must parse as JSON");
+
+        if let Some(profiles) = value
+            .get_mut("DirectPlayProfiles")
+            .and_then(|v| v.as_array_mut())
+        {
+            for profile in profiles {
+                if profile
+                    .get("Type")
+                    .and_then(|t| t.as_str())
+                    == Some("Video")
+                {
+                    profile["AudioCodec"] = serde_json::Value::String(
+                        "aac,mp3,mp2,opus,flac,vorbis".to_string(),
+                    );
+                }
+            }
+        }
+
+        if let Some(codec_profiles) = value
+            .get_mut("CodecProfiles")
+            .and_then(|v| v.as_array_mut())
+        {
+            for cp in codec_profiles {
+                let is_hevc = cp
+                    .get("Codec")
+                    .and_then(|c| c.as_str())
+                    == Some("hevc");
+                if !is_hevc {
+                    continue;
+                }
+                if let Some(conditions) = cp
+                    .get_mut("Conditions")
+                    .and_then(|v| v.as_array_mut())
+                {
+                    for cond in conditions {
+                        if cond
+                            .get("Property")
+                            .and_then(|p| p.as_str())
+                            == Some("VideoRangeType")
+                        {
+                            cond["Value"] = serde_json::Value::String(
+                                "SDR|HDR10|HDR10Plus|HLG".to_string(),
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
+        serde_json::from_value(value)
+            .expect("mutated fixture must still parse as a DeviceProfile")
+    }
+
+    /// True when `reasons` contains none of the reasons that force a real
+    /// video re-encode (as opposed to a cheap audio/container remux).
+    fn has_no_video_reencode_reason(reasons: &api::TranscodeReasons) -> bool {
+        !reasons
+            .0
+            .iter()
+            .any(|r| {
+                matches!(
+                    r,
+                    api::TranscodeReason::VideoCodecNotSupported(_)
+                        | api::TranscodeReason::VideoRangeTypeNotSupported(_)
+                        | api::TranscodeReason::VideoLevelNotSupported(_)
+                        | api::TranscodeReason::VideoProfileNotSupported(_)
+                        | api::TranscodeReason::ContainerBitrateExceedsLimit
+                )
+            })
+    }
+
+    /// Same Infuse-like DoVi/TrueHD-capable profile as `device_profile.rs`'s
+    /// `infuse_like_dovi_profile()`. Duplicated here for the same reason.
+    fn infuse_like_dovi_profile() -> api::DeviceProfile {
+        api::DeviceProfile {
+            max_streaming_bitrate: Some(200_000_000),
+            direct_play_profiles: vec![api::DirectPlayProfile {
+                container: Some(vec![
+                    api::VideoContainer::Mkv,
+                    api::VideoContainer::Mp4,
+                ]),
+                video_codec: Some(vec![
+                    api::VideoCodec::Hevc,
+                    api::VideoCodec::H264,
+                    api::VideoCodec::Av1,
+                ]),
+                audio_codec: Some(vec![
+                    api::AudioCodec::TrueHd,
+                    api::AudioCodec::Eac3,
+                    api::AudioCodec::Ac3,
+                    api::AudioCodec::Aac,
+                    api::AudioCodec::Dts,
+                    api::AudioCodec::Flac,
+                ]),
+                type_: Some(api::DlnaProfileType::Video),
+            }],
+            codec_profiles: vec![api::CodecProfile {
+                type_: Some(api::CodecProfileType::Video),
+                codec: Some(vec!["hevc".to_string()]),
+                conditions: vec![api::ProfileCondition {
+                    condition: Some(api::ProfileConditionType::EqualsAny),
+                    property: Some(api::ProfileConditionProperty::VideoRangeType),
+                    value: Some(
+                        "SDR|HDR10|HDR10Plus|HLG|DOVI|DOVIWithHDR10".to_string(),
+                    ),
+                    is_required: Some(false),
+                }],
+                ..Default::default()
+            }],
+            ..Default::default()
+        }
+    }
+
+    /// A candidate with `probe_data` already populated (mirrors
+    /// `source=remux_db`), built the same way
+    /// `device_profile.rs::repro_probed_candidate` builds its underlying
+    /// `db::Media`, minus the `MediaSourceInfo` conversion step —
+    /// `device_aware_probe_pool` reads `db::Media.probe_data` directly.
+    fn device_aware_probed_media(
+        filename: &str,
+        width: i64,
+        height: i64,
+        video_codec: &str,
+        video_range: Option<VideoRangeType>,
+        audio_codec: &str,
+        size_gb: f64,
+        bitrate_mbps: f64,
+    ) -> db::Media {
+        let size = (size_gb * 1_000_000_000.0) as i64;
+        let bitrate = (bitrate_mbps * 1_000_000.0) as i64;
+        let mut media = stream_media(StreamInfo {
+            filename: Some(filename.to_string()),
+            size: Some(size),
+            ..Default::default()
+        });
+        media.id = Uuid::new_v4();
+        media.title = "Toy Story 5".to_string();
+        media.probe_data = Some(api::MediaSourceInfo {
+            media_streams: vec![
+                api::MediaStream {
+                    type_: Some(MediaStreamType::Video),
+                    codec: Some(video_codec.to_string()),
+                    width: Some(width),
+                    height: Some(height),
+                    video_range_type: video_range,
+                    ..Default::default()
+                },
+                api::MediaStream {
+                    type_: Some(MediaStreamType::Audio),
+                    codec: Some(audio_codec.to_string()),
+                    ..Default::default()
+                },
+            ],
+            container: Some(api::VideoContainer::Mkv),
+            bitrate: Some(bitrate),
+            size: Some(size),
+            ..Default::default()
+        });
+        media
+    }
+
+    /// A candidate with no stored probe data at all (mirrors
+    /// `source=filename_guess`) — `device_aware_probe_pool` must fall back to
+    /// a filename guess for its video codec/range/bitrate, same as
+    /// `device_profile.rs::repro_guessed_candidate`'s underlying `db::Media`.
+    fn device_aware_guessed_media(
+        filename: &str,
+        size_gb: f64,
+        runtime_secs: i64,
+    ) -> db::Media {
+        let size = (size_gb * 1_000_000_000.0) as i64;
+        let mut media = stream_media(StreamInfo {
+            filename: Some(filename.to_string()),
+            size: Some(size),
+            ..Default::default()
+        });
+        media.id = Uuid::new_v4();
+        media.title = "Toy Story 5".to_string();
+        media.runtime = Some(runtime_secs);
+        media
+    }
+
+    /// A small Toy Story 5 scenario in the same spirit as
+    /// `device_profile.rs::repro_candidates()`'s 19-candidate scenario: one
+    /// 2160p DoVi HEVC REMUX (`A`), a second 2160p HEVC HDR10 alternate
+    /// (`B`), two probed 1080p H.264 candidates (`C1`/`C2`), one
+    /// filename-guess-only 1080p H.264 candidate (`C3`) exercising the
+    /// "else filename guess" half of the spec's compatibility rule (a), and
+    /// a correctly-tagged 2160p DOVI HEVC candidate (`D`) UNDER the bitrate
+    /// cap, exercising rule (b) (VideoRangeType) on its own.
+    fn device_aware_candidates() -> Vec<db::Media> {
+        const RUNTIME_SECS: i64 = 8280;
+        vec![
+            // A: the 2160p DoVi HEVC REMUX actually served in production.
+            device_aware_probed_media(
+                "Toy.Story.5.2025.2160p.UHD.BluRay.REMUX.DV.HDR.HEVC.TrueHD.Atmos.7.1-FraMeSToR.mkv",
+                3840,
+                2160,
+                "hevc",
+                Some(VideoRangeType::Dovi),
+                "truehd",
+                52.4,
+                68.6,
+            ),
+            // B: a second 2160p HEVC alternate (HDR10). Bitrate deliberately
+            // kept above the 65.6 Mbps cap used below (see module doc
+            // comment): jellyfin-web's hevc VideoRangeType condition allows
+            // HDR10, so bitrate is the only thing that can disqualify it
+            // under the spec's simplified compatibility rule.
+            device_aware_probed_media(
+                "Toy.Story.5.2025.2160p.WEB-DL.HDR10.HEVC.DDP5.1-GROUP0.mkv",
+                3840,
+                2160,
+                "hevc",
+                Some(VideoRangeType::Hdr10),
+                "eac3",
+                24.0,
+                78.0,
+            ),
+            // C1/C2: compatible 1080p H.264 candidates, well under the cap.
+            device_aware_probed_media(
+                "Toy.Story.5.2025.1080p.BluRay.x264.AAC-GROUP0.mkv",
+                1920,
+                1080,
+                "h264",
+                Some(VideoRangeType::Sdr),
+                "aac",
+                2.3,
+                8.0,
+            ),
+            device_aware_probed_media(
+                "Toy.Story.5.2025.1080p.WEB-DL.DDP5.1.H.264-GROUP3.mkv",
+                1920,
+                1080,
+                "h264",
+                Some(VideoRangeType::Sdr),
+                "eac3",
+                6.7,
+                18.5,
+            ),
+            // C3: filename-guess-only 1080p candidate (no probe_data).
+            device_aware_guessed_media(
+                "Toy.Story.5.2025.1080p.WEB-DL.AAC.H.264-GROUP1.mkv",
+                3.9,
+                RUNTIME_SECS,
+            ),
+            // D: a correctly-tagged 2160p DOVI HEVC candidate UNDER the 65.6
+            // Mbps cap — bitrate alone (rule c) cannot disqualify it, so
+            // this exercises rule (b) (VideoRangeType) on its own. Under a
+            // profile whose hevc CodecProfile still allows DOVI (the repo
+            // fixture), D is genuinely compatible and correctly outranks
+            // 1080p by resolution — that is desired, device-aware behaviour.
+            // Under a profile that does not allow DOVI (the live-like
+            // profile), D must fail rule (b) and rank after every
+            // compatible candidate.
+            device_aware_probed_media(
+                "Toy.Story.5.2025.2160p.WEB-DL.DV.HDR.HEVC.DDP5.1-DOVIUNDERCAP.mkv",
+                3840,
+                2160,
+                "hevc",
+                Some(VideoRangeType::Dovi),
+                "eac3",
+                20.0,
+                28.0,
+            ),
+        ]
+    }
+
+    /// SPEC: with `profile == None`, `device_aware_probe_pool` returns exactly `quality_ordered_probe_pool(streams)` — byte-for-byte the same order.
+    #[test]
+    fn desired_device_aware_probe_pool_with_no_profile_matches_quality_ordered_pool() {
+        let streams = device_aware_candidates();
+
+        let expected: Vec<Uuid> = quality_ordered_probe_pool(&streams)
+            .iter()
+            .map(|s| s.id)
+            .collect();
+        let actual: Vec<Uuid> = device_aware_probe_pool(&streams, None, None)
+            .iter()
+            .map(|s| s.id)
+            .collect();
+
+        assert_eq!(
+            actual, expected,
+            "device_aware_probe_pool(streams, None, _) must be byte-for-byte \
+             identical to quality_ordered_probe_pool(streams)"
+        );
+    }
+
+    /// Runs `device_aware_probe_pool` against `profile` at `max_bitrate` and
+    /// asserts the "honest, profile-agnostic" outcome per lead review: the
+    /// winner must not need a video re-encode (checked against the same
+    /// profile/cap via the full `compute_transcode_reasons` engine — a
+    /// stronger, more meaningful check than device_aware_probe_pool's own
+    /// simplified rules), and the 52.4 GB / 68.6 Mbps remux (candidate `A`)
+    /// must never win at this cap. A compatible, in-cap HDR/DoVi 2160p
+    /// candidate legitimately winning (e.g. candidate `D`) is NOT an error.
+    fn assert_device_aware_pool_outcome(
+        profile: &api::DeviceProfile,
+        max_bitrate: u64,
+        label: &str,
+    ) {
+        let streams = device_aware_candidates();
+        let pool = device_aware_probe_pool(&streams, Some(profile), Some(max_bitrate));
+
+        let first = pool
+            .first()
+            .expect("pool must not be empty");
+        let first_probe_data = first
+            .probe_data
+            .as_ref()
+            .expect("top-1 candidate must carry probe data");
+        let reasons = crate::device_profile::compute_transcode_reasons(
+            first_probe_data,
+            Some(profile),
+            api::EmbeddedSubtitleHandling::default(),
+            None,
+            Some(max_bitrate as i64),
+        );
+        assert!(
+            has_no_video_reencode_reason(&reasons),
+            "{label}: top-1 must not need a video re-encode; reasons={:?}",
+            reasons
+                .0
+                .iter()
+                .map(api::TranscodeReason::name)
+                .collect::<Vec<_>>()
+        );
+
+        let first_filename = first
+            .stream_info
+            .as_ref()
+            .and_then(|si| si.filename.as_deref())
+            .unwrap_or_default();
+        assert!(
+            !first_filename.contains("REMUX"),
+            "{label}: the 52.4 GB / 68.6 Mbps remux (candidate A) must never \
+             be top-1 at this cap; got {first_filename}"
+        );
+    }
+
+    /// SPEC: with a profile, candidates partition into compatible-first then others; against the repo jellyfin-web fixture at a 65.6 Mbps cap, the winner needs no video re-encode and the 52.4 GB remux is never top-1.
+    #[test]
+    fn desired_device_aware_probe_pool_outcome_on_jellyfin_web_repo_profile() {
+        assert_device_aware_pool_outcome(
+            &jellyfin_web_real_profile(),
+            65_573_770,
+            "jellyfin-web repo fixture",
+        );
+    }
+
+    /// SPEC: same as above, against the live-like jellyfin-web profile (no DOVI, no ac3/eac3).
+    #[test]
+    fn desired_device_aware_probe_pool_outcome_on_jellyfin_web_live_profile() {
+        assert_device_aware_pool_outcome(
+            &jellyfin_web_live_profile(),
+            65_573_770,
+            "jellyfin-web live profile",
+        );
+    }
+
+    /// SPEC: rule (b) coverage — a correctly-tagged DOVI 2160p HEVC candidate that is UNDER the bitrate cap (so rule (c) alone can't disqualify it) must rank after every compatible candidate once the profile's hevc CodecProfile no longer allows DOVI (the live-like profile).
+    #[test]
+    fn desired_device_aware_probe_pool_orders_under_cap_dovi_after_compatible_on_live_profile()
+     {
+        let streams = device_aware_candidates();
+        let profile = jellyfin_web_live_profile();
+
+        let pool = device_aware_probe_pool(&streams, Some(&profile), Some(65_573_770));
+
+        let dovi_under_cap_position = pool
+            .iter()
+            .position(|m| {
+                m.stream_info
+                    .as_ref()
+                    .and_then(|si| si.filename.as_deref())
+                    .is_some_and(|f| f.contains("DOVIUNDERCAP"))
+            })
+            .expect("the under-cap DOVI candidate (D) must be present");
+
+        // Everything genuinely compatible under the live-like profile (the
+        // three 1080p H.264 candidates, probed or filename-guessed) must
+        // rank before D.
+        let compatible_positions: Vec<usize> = pool
+            .iter()
+            .enumerate()
+            .filter(|(_, m)| {
+                match &m.probe_data {
+                    Some(info) => info
+                        .media_streams
+                        .iter()
+                        .any(|s| {
+                            matches!(s.type_, Some(MediaStreamType::Video))
+                                && s.codec
+                                    .as_deref()
+                                    == Some("h264")
+                        }),
+                    // C3: filename-guess-only 1080p H.264 candidate.
+                    None => true,
+                }
+            })
+            .map(|(i, _)| i)
+            .collect();
+
+        for pos in compatible_positions {
+            assert!(
+                pos < dovi_under_cap_position,
+                "an under-cap DOVI candidate must rank after every \
+                 compatible candidate once the profile's hevc CodecProfile \
+                 no longer allows DOVI; compatible candidate at {pos}, DOVI \
+                 candidate at {dovi_under_cap_position}"
+            );
+        }
+    }
+
+    /// SPEC: with the Infuse-like profile (genuinely mkv/HEVC/DoVi/TrueHD capable) and a 200 Mbps cap, the first element is the 2160p remux — unchanged from today's pre-probe behaviour.
+    #[test]
+    fn desired_device_aware_probe_pool_keeps_remux_first_on_infuse_like_profile() {
+        let streams = device_aware_candidates();
+        let profile = infuse_like_dovi_profile();
+
+        let pool =
+            device_aware_probe_pool(&streams, Some(&profile), Some(200_000_000));
+
+        let first_filename = pool
+            .first()
+            .and_then(|m| {
+                m.stream_info
+                    .as_ref()
+                    .and_then(|si| si.filename.as_deref())
+            })
+            .unwrap_or_default();
+        assert!(
+            first_filename.contains("REMUX"),
+            "an Infuse-like profile can direct-play/cheap-remux the 4K \
+             release, so it must stay first; got {first_filename}"
+        );
+    }
+
+    /// Builds a fresh `StreamService` with `profile`/`max_bitrate` set, runs
+    /// the auto-play branch, and asserts the same "honest, profile-agnostic"
+    /// outcome as `assert_device_aware_pool_outcome` — plus that the served
+    /// candidate really is `device_aware_probe_pool(...)[0]`.
+    fn assert_auto_play_outcome(
+        ctx: &AppContext,
+        profile: api::DeviceProfile,
+        max_bitrate: u64,
+        label: &str,
+    ) {
+        let item_id = Uuid::new_v4();
+        let streams = device_aware_candidates();
+
+        let mut service = StreamService::new(StreamServiceConfig {
+            ctx: ctx.clone(),
+            item_id,
+            requested_id: Some(item_id),
+            show_ungrouped: false,
+            stream_filter: None,
+            user_id: None,
+        });
+        service.streams = streams.clone();
+        service.device_profile = Some(profile.clone());
+        service.max_bitrate = Some(max_bitrate);
+
+        let sel = service.select_streams();
+        assert_eq!(
+            sel.candidates
+                .len(),
+            1
+        );
+        let served = &sel.candidates[0];
+
+        let expected_first = device_aware_probe_pool(&streams, Some(&profile), Some(max_bitrate))
+            .into_iter()
+            .next()
+            .expect("pool must not be empty");
+        assert_eq!(
+            served.id, expected_first.id,
+            "{label}: auto-play with a device profile present must serve \
+             device_aware_probe_pool(...)[0], not all_streams[0]"
+        );
+
+        let served_probe_data = served
+            .probe_data
+            .as_ref()
+            .expect("served candidate must carry probe data");
+        let reasons = crate::device_profile::compute_transcode_reasons(
+            served_probe_data,
+            Some(&profile),
+            api::EmbeddedSubtitleHandling::default(),
+            None,
+            Some(max_bitrate as i64),
+        );
+        assert!(
+            has_no_video_reencode_reason(&reasons),
+            "{label}: served candidate must not need a video re-encode; \
+             reasons={:?}",
+            reasons
+                .0
+                .iter()
+                .map(api::TranscodeReason::name)
+                .collect::<Vec<_>>()
+        );
+
+        let served_filename = served
+            .stream_info
+            .as_ref()
+            .and_then(|si| si.filename.as_deref())
+            .unwrap_or_default();
+        assert!(
+            !served_filename.contains("REMUX"),
+            "{label}: the 52.4 GB / 68.6 Mbps remux (candidate A) must never \
+             be served at this cap; got {served_filename}"
+        );
+    }
+
+    /// SPEC: same outcome rule as S2/S4/S5 — auto-play with a device profile must serve `device_aware_probe_pool(...)[0]`, that candidate must not need a video re-encode, and candidate A must never be served at a 65.6 Mbps cap. Repo jellyfin-web fixture.
+    #[tokio::test]
+    async fn desired_auto_play_outcome_on_jellyfin_web_repo_profile() {
+        use crate::integration_test::authenticated_server;
+
+        let (_server, guard, _token) = authenticated_server().await;
+        assert_auto_play_outcome(
+            &guard.0,
+            jellyfin_web_real_profile(),
+            65_573_770,
+            "jellyfin-web repo fixture",
+        );
+    }
+
+    /// SPEC: same as above, against the live-like jellyfin-web profile (no DOVI, no ac3/eac3).
+    #[tokio::test]
+    async fn desired_auto_play_outcome_on_jellyfin_web_live_profile() {
+        use crate::integration_test::authenticated_server;
+
+        let (_server, guard, _token) = authenticated_server().await;
+        assert_auto_play_outcome(
+            &guard.0,
+            jellyfin_web_live_profile(),
+            65_573_770,
+            "jellyfin-web live profile",
+        );
+    }
+
+    /// SPEC: with the live-like profile and a 20 Mbps cap — where every 2160p candidate in the fixture exceeds the cap (asserted below) — auto-play must serve a 1080p H.264 candidate.
+    #[tokio::test]
+    async fn desired_auto_play_serves_1080p_h264_on_live_profile_20mbps_cap() {
+        use crate::integration_test::authenticated_server;
+
+        let (_server, guard, _token) = authenticated_server().await;
+        let ctx = &guard.0;
+        let item_id = Uuid::new_v4();
+        let streams = device_aware_candidates();
+
+        // Precondition: every 2160p candidate in this fixture exceeds the 20
+        // Mbps cap, so "1080p wins" follows necessarily.
+        for stream in &streams {
+            let Some(info) = stream
+                .probe_data
+                .as_ref()
+            else {
+                continue;
+            };
+            let is_2160p = info
+                .media_streams
+                .iter()
+                .any(|s| {
+                    matches!(s.type_, Some(MediaStreamType::Video))
+                        && s.height
+                            == Some(2160)
+                });
+            if is_2160p {
+                assert!(
+                    info.bitrate
+                        .unwrap_or(0)
+                        > 20_000_000,
+                    "precondition: every 2160p candidate must exceed the 20 \
+                     Mbps cap"
+                );
+            }
+        }
+
+        let mut service = StreamService::new(StreamServiceConfig {
+            ctx: ctx.clone(),
+            item_id,
+            requested_id: Some(item_id),
+            show_ungrouped: false,
+            stream_filter: None,
+            user_id: None,
+        });
+        service.streams = streams;
+        service.device_profile = Some(jellyfin_web_live_profile());
+        service.max_bitrate = Some(20_000_000);
+
+        let sel = service.select_streams();
+        assert_eq!(
+            sel.candidates
+                .len(),
+            1
+        );
+        let served = &sel.candidates[0];
+        let served_video = served
+            .probe_data
+            .as_ref()
+            .and_then(|info| {
+                info.media_streams
+                    .iter()
+                    .find(|s| matches!(s.type_, Some(MediaStreamType::Video)))
+            })
+            .expect("served candidate must carry probe data");
+        assert_eq!(
+            served_video
+                .codec
+                .as_deref(),
+            Some("h264")
+        );
+        assert_eq!(
+            (served_video.width, served_video.height),
+            (Some(1920), Some(1080))
+        );
+    }
+
+    /// SPEC: with the Infuse-like profile set on the service, auto-play must still serve the 2160p remux.
+    #[tokio::test]
+    async fn desired_auto_play_uses_device_aware_selection_with_infuse_like_profile()
+     {
+        use crate::integration_test::authenticated_server;
+
+        let (_server, guard, _token) = authenticated_server().await;
+        let ctx = &guard.0;
+        let item_id = Uuid::new_v4();
+
+        let streams = device_aware_candidates();
+
+        let mut service = StreamService::new(StreamServiceConfig {
+            ctx: ctx.clone(),
+            item_id,
+            requested_id: Some(item_id),
+            show_ungrouped: false,
+            stream_filter: None,
+            user_id: None,
+        });
+        service.streams = streams.clone();
+        service.device_profile = Some(infuse_like_dovi_profile());
+        service.max_bitrate = Some(200_000_000);
+
+        let sel = service.select_streams();
+        assert_eq!(
+            sel.candidates
+                .len(),
+            1
+        );
+        let served = &sel.candidates[0];
+        let served_filename = served
+            .stream_info
+            .as_ref()
+            .and_then(|si| si.filename.as_deref())
+            .unwrap_or_default();
+        assert!(
+            served_filename.contains("REMUX"),
+            "an Infuse-like profile must still get served the 2160p remux; \
+             got {served_filename}"
+        );
+    }
 }

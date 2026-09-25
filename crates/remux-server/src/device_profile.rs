@@ -4008,4 +4008,394 @@ mod tests {
         // `-- --nocapture`) for the actual values observed against the
         // real jellyfin-web fixture.
     }
+
+    // =========================================================================
+    // Desired behaviour (lostb1t/remux#552): `SourceRankingContext` gains a
+    // `max_bitrate` input that IS applied under `SortMediaSourcesMode::
+    // Compatibility` (and stays `None` under `Best`/`Quality`), so a real
+    // bitrate cap can push an over-cap source below an under-cap one instead
+    // of being silently dropped on the floor, as documented today on
+    // `SourceRankingContext`: "Bitrate limits are intentionally absent".
+    //
+    // Per lead review: HDR is NOT gated by `hdr_class`. A compatible, in-cap
+    // HDR/DoVi 2160p source legitimately outranking a 1080p one is correct
+    // device-aware behaviour, not a bug to suppress. "Top-1 is 1080p" only
+    // follows *necessarily* when the cap is low enough that every 2160p
+    // candidate in the fixture exceeds it (asserted explicitly below);
+    // otherwise the honest, profile-agnostic assertion is "the winner needs
+    // no video re-encode" plus "the mistagged/over-budget remux (`A`) never
+    // wins at the 65.6 Mbps cap".
+
+    /// Same jellyfin-web profile as the repo fixture, but with the HEVC
+    /// `CodecProfile`'s `VideoRangeType` condition narrowed to
+    /// `SDR|HDR10|HDR10Plus|HLG` (no `DOVI`) and every video
+    /// `DirectPlayProfile`'s `AudioCodec` narrowed to
+    /// `aac,mp3,mp2,opus,flac,vorbis` (no `ac3`/`eac3`) — this is what the
+    /// user's actual Chrome instance sends (verified against the instance DB
+    /// and the live `VideoRangeTypeNotSupported` reason observed on a DoVi
+    /// title), unlike the more permissive checked-in fixture file.
+    fn jellyfin_web_live_profile() -> DeviceProfile {
+        let mut value: serde_json::Value = serde_json::from_str(include_str!(
+            "testdata/jellyfin_web_device_profile.json"
+        ))
+        .expect("fixture must parse as JSON");
+
+        if let Some(profiles) = value
+            .get_mut("DirectPlayProfiles")
+            .and_then(|v| v.as_array_mut())
+        {
+            for profile in profiles {
+                if profile
+                    .get("Type")
+                    .and_then(|t| t.as_str())
+                    == Some("Video")
+                {
+                    profile["AudioCodec"] = serde_json::Value::String(
+                        "aac,mp3,mp2,opus,flac,vorbis".to_string(),
+                    );
+                }
+            }
+        }
+
+        if let Some(codec_profiles) = value
+            .get_mut("CodecProfiles")
+            .and_then(|v| v.as_array_mut())
+        {
+            for cp in codec_profiles {
+                let is_hevc = cp
+                    .get("Codec")
+                    .and_then(|c| c.as_str())
+                    == Some("hevc");
+                if !is_hevc {
+                    continue;
+                }
+                if let Some(conditions) = cp
+                    .get_mut("Conditions")
+                    .and_then(|v| v.as_array_mut())
+                {
+                    for cond in conditions {
+                        if cond
+                            .get("Property")
+                            .and_then(|p| p.as_str())
+                            == Some("VideoRangeType")
+                        {
+                            cond["Value"] = serde_json::Value::String(
+                                "SDR|HDR10|HDR10Plus|HLG".to_string(),
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
+        serde_json::from_value(value)
+            .expect("mutated fixture must still parse as a DeviceProfile")
+    }
+
+    /// True when `reasons` contains none of the reasons that force a real
+    /// video re-encode (as opposed to a cheap audio/container remux):
+    /// `VideoCodecNotSupported`, `VideoRangeTypeNotSupported`,
+    /// `VideoLevelNotSupported`, `VideoProfileNotSupported`, or
+    /// `ContainerBitrateExceedsLimit`.
+    fn has_no_video_reencode_reason(reasons: &TranscodeReasons) -> bool {
+        !reasons
+            .0
+            .iter()
+            .any(|r| {
+                matches!(
+                    r,
+                    TranscodeReason::VideoCodecNotSupported(_)
+                        | TranscodeReason::VideoRangeTypeNotSupported(_)
+                        | TranscodeReason::VideoLevelNotSupported(_)
+                        | TranscodeReason::VideoProfileNotSupported(_)
+                        | TranscodeReason::ContainerBitrateExceedsLimit
+                )
+            })
+    }
+
+    /// A small, hand-picked Toy Story 5 scenario — unlike the full
+    /// 19-candidate `repro_candidates()`, every 2160p entry here is
+    /// deliberately kept above 20 Mbps, so a 20 Mbps Compatibility cap makes
+    /// "the winner is 1080p H.264" follow necessarily, not just
+    /// empirically for one particular profile.
+    fn chrome_20mbps_candidates() -> Vec<(String, MediaSourceInfo)> {
+        vec![
+            repro_probed_candidate(
+                "A: 2160p REMUX DV/HDR HEVC TrueHD 7.1",
+                "Toy.Story.5.2025.2160p.UHD.BluRay.REMUX.DV.HDR.HEVC.TrueHD.Atmos.7.1-FraMeSToR.mkv",
+                repro_video_stream(
+                    "hevc", 3840, 2160, Some(VideoRangeType::Dovi), Some(10),
+                    Some("hev1"), Some(23.976),
+                ),
+                repro_audio_stream("truehd", 8),
+                52.4,
+                68.6,
+                true,
+            ),
+            repro_probed_candidate(
+                "B: 2160p HDR10 HEVC eac3",
+                "Toy.Story.5.2025.2160p.WEB-DL.HDR10.HEVC.DDP5.1-GROUP0.mkv",
+                repro_video_stream(
+                    "hevc", 3840, 2160, Some(VideoRangeType::Hdr10), Some(10),
+                    Some("hev1"), Some(23.976),
+                ),
+                repro_audio_stream("eac3", 6),
+                24.0,
+                78.0,
+                true,
+            ),
+            repro_probed_candidate(
+                "C1: 1080p H.264 aac",
+                "Toy.Story.5.2025.1080p.BluRay.x264.AAC-GROUP0.mkv",
+                repro_video_stream(
+                    "h264", 1920, 1080, Some(VideoRangeType::Sdr), Some(8), None,
+                    Some(23.976),
+                ),
+                repro_audio_stream("aac", 2),
+                2.3,
+                8.0,
+                true,
+            ),
+            repro_probed_candidate(
+                "C2: 1080p H.264 eac3",
+                "Toy.Story.5.2025.1080p.WEB-DL.DDP5.1.H.264-GROUP3.mkv",
+                repro_video_stream(
+                    "h264", 1920, 1080, Some(VideoRangeType::Sdr), Some(8), None,
+                    Some(23.976),
+                ),
+                repro_audio_stream("eac3", 6),
+                6.7,
+                18.5,
+                true,
+            ),
+        ]
+    }
+
+    fn assert_20mbps_cap_forces_1080p(profile: &DeviceProfile, label: &str) {
+        let candidates = chrome_20mbps_candidates();
+
+        // Precondition: every 2160p candidate in this fixture exceeds the
+        // 20 Mbps cap, so "1080p wins" follows necessarily rather than
+        // merely coincidentally for this profile.
+        for (name, source) in &candidates {
+            if name.contains("2160p") {
+                assert!(
+                    source
+                        .bitrate
+                        .unwrap_or(0)
+                        > 20_000_000,
+                    "precondition: every 2160p candidate must exceed the 20 \
+                     Mbps cap; {name} did not"
+                );
+            }
+        }
+
+        let ranking = SourceRankingContext {
+            mode: SortMediaSourcesMode::Compatibility,
+            device_profile: Some(profile),
+            subtitle_mode: EmbeddedSubtitleHandling::default(),
+            explicit_subtitle_index: None,
+            max_bitrate: Some(20_000_000),
+        };
+        let mut ranked: Vec<(String, MediaSourceSortKey)> = candidates
+            .into_iter()
+            .map(|(name, source)| (name, ranking.sort_key(&source)))
+            .collect();
+        ranked.sort_by_cached_key(|(_, key)| std::cmp::Reverse(*key));
+
+        println!("\n--- desired: Compatibility / {label} / 20 Mbps cap ---");
+        for (name, key) in &ranked {
+            println!("{name} key={key:?}");
+        }
+
+        assert!(
+            ranked[0]
+                .0
+                .starts_with('C'),
+            "{label}: every 2160p candidate exceeds the 20 Mbps cap, so \
+             top-1 must be one of the 1080p H.264 candidates; got {}",
+            ranked[0].0
+        );
+    }
+
+    /// SPEC: superseded by this test (S4) — under `Compatibility` with a 20 Mbps cap, where every 2160p candidate in the fixture exceeds the cap, `SourceRankingContext`'s new `max_bitrate` field must push them all below the compatible 1080p H.264 candidates. `repro_compatibility_sort_order_chrome_20mbps` is left in place, unmodified.
+    #[test]
+    fn desired_compatibility_sort_order_chrome_20mbps_repo_profile() {
+        assert_20mbps_cap_forces_1080p(
+            &jellyfin_web_real_profile(),
+            "Chrome (jellyfin-web repo fixture)",
+        );
+    }
+
+    /// SPEC: same as above, against the live-like jellyfin-web profile (no DOVI, no ac3/eac3) actually sent by the user's Chrome.
+    #[test]
+    fn desired_compatibility_sort_order_chrome_20mbps_live_profile() {
+        assert_20mbps_cap_forces_1080p(
+            &jellyfin_web_live_profile(),
+            "Chrome (jellyfin-web live profile)",
+        );
+    }
+
+    /// SPEC: `max_bitrate` must stay `None` (have no effect) under `Best`/`Quality` mode — those modes' existing bitrate-blind sort key must not change just because a `max_bitrate` is now supplied to `SourceRankingContext`.
+    #[test]
+    fn desired_max_bitrate_ignored_outside_compatibility_mode() {
+        let profile = jellyfin_web_real_profile();
+        let candidates = repro_candidates();
+
+        for mode in [SortMediaSourcesMode::Best, SortMediaSourcesMode::Quality] {
+            let without_cap = SourceRankingContext {
+                mode,
+                device_profile: Some(&profile),
+                subtitle_mode: EmbeddedSubtitleHandling::default(),
+                explicit_subtitle_index: None,
+                max_bitrate: None,
+            };
+            let with_absurdly_low_cap = SourceRankingContext {
+                mode,
+                device_profile: Some(&profile),
+                subtitle_mode: EmbeddedSubtitleHandling::default(),
+                explicit_subtitle_index: None,
+                // Absurdly low: would tank every source's rank under
+                // Compatibility. Must have zero effect here.
+                max_bitrate: Some(1_000_000),
+            };
+            for (name, source) in &candidates {
+                assert_eq!(
+                    without_cap.sort_key(source),
+                    with_absurdly_low_cap.sort_key(source),
+                    "mode {mode:?}: max_bitrate must not affect the sort key \
+                     outside Compatibility mode (candidate {name})"
+                );
+            }
+        }
+    }
+
+    // =========================================================================
+    // Desired behaviour (lostb1t/remux#552): with S1's direction-aware fix
+    // applied, `confident_4k_capable(jellyfin_web)` no longer gives a 2160p
+    // source an unconditional resolution-tier boost under `Compatibility`
+    // mode. Per lead review, a compatible in-cap HDR/DoVi 2160p source
+    // legitimately outranking 1080p is still correct — the honest, uncapped
+    // assertion is that whichever candidate wins needs no video re-encode.
+
+    /// SPEC: once `confident_4k_capable` stops crediting jellyfin-web's `LessThanEqual` VideoLevel ceiling as 4K support, the Compatibility top-1 (whichever candidate that is) must not need a video re-encode against the repo jellyfin-web fixture (no bitrate cap).
+    #[test]
+    fn desired_compatibility_top1_needs_no_video_reencode_on_jellyfin_web_repo_profile()
+     {
+        let profile = jellyfin_web_real_profile();
+        let order = repro_run_and_print(
+            "desired: Compatibility / Chrome (jellyfin-web repo fixture) / no bitrate cap",
+            Some(&profile),
+            SortMediaSourcesMode::Compatibility,
+            None,
+        );
+        let (winner_name, winner_source) = repro_candidates()
+            .into_iter()
+            .find(|(name, _)| *name == order[0].0)
+            .expect("top-1 must be one of the candidates");
+        let reasons = compute_transcode_reasons(
+            &winner_source,
+            Some(&profile),
+            EmbeddedSubtitleHandling::default(),
+            None,
+            None,
+        );
+        assert!(
+            has_no_video_reencode_reason(&reasons),
+            "top-1 ({winner_name}) must not need a video re-encode; reasons={:?}",
+            reasons
+                .0
+                .iter()
+                .map(TranscodeReason::name)
+                .collect::<Vec<_>>()
+        );
+    }
+
+    /// SPEC: same as above, against the live-like jellyfin-web profile.
+    #[test]
+    fn desired_compatibility_top1_needs_no_video_reencode_on_jellyfin_web_live_profile()
+     {
+        let profile = jellyfin_web_live_profile();
+        let order = repro_run_and_print(
+            "desired: Compatibility / Chrome (jellyfin-web live profile) / no bitrate cap",
+            Some(&profile),
+            SortMediaSourcesMode::Compatibility,
+            None,
+        );
+        let (winner_name, winner_source) = repro_candidates()
+            .into_iter()
+            .find(|(name, _)| *name == order[0].0)
+            .expect("top-1 must be one of the candidates");
+        let reasons = compute_transcode_reasons(
+            &winner_source,
+            Some(&profile),
+            EmbeddedSubtitleHandling::default(),
+            None,
+            None,
+        );
+        assert!(
+            has_no_video_reencode_reason(&reasons),
+            "top-1 ({winner_name}) must not need a video re-encode; reasons={:?}",
+            reasons
+                .0
+                .iter()
+                .map(TranscodeReason::name)
+                .collect::<Vec<_>>()
+        );
+    }
+
+    /// SPEC: the Infuse-like profile (genuinely mkv/HEVC/DoVi/TrueHD capable) must keep a 2160p candidate on top, and that candidate must not need a video re-encode.
+    #[test]
+    fn desired_compatibility_top1_is_2160p_remux_on_infuse_like_profile() {
+        let profile = infuse_like_dovi_profile();
+        let order = repro_run_and_print(
+            "desired: Compatibility / Infuse-like (mkv/HEVC/DoVi/TrueHD capable) / 200 Mbps cap",
+            Some(&profile),
+            SortMediaSourcesMode::Compatibility,
+            Some(200_000_000),
+        );
+        // Candidate "A" itself carries a deliberately *mistagged* SDR
+        // VideoRangeType (see repro_candidates()'s doc comment — it
+        // simulates a real RemuxDB misclassification), so it loses the
+        // hdr_class tie-break to a correctly-tagged Dovi/HDR10 2160p
+        // alternate even on a fully-capable profile; this is observed,
+        // unchanged behaviour today (confirmed via
+        // repro_compatibility_sort_order_infuse_like_dovi_capable's own
+        // stdout) and not something S1-S5 touches. What must hold is the
+        // spec's actual intent: a 2160p HEVC DoVi/TrueHD-class candidate
+        // stays on top for a profile that can really direct-play/cheap-remux
+        // it, in contrast to jellyfin-web where the winner must be
+        // compatible without a video re-encode instead.
+        assert!(
+            order[0]
+                .0
+                .contains("2160p"),
+            "the Infuse-like profile can actually direct-play/cheap-remux \
+             the 4K release, so a 2160p candidate must keep winning; got {}",
+            order[0].0
+        );
+
+        let (winner_name, winner_source) = repro_candidates()
+            .into_iter()
+            .find(|(name, _)| *name == order[0].0)
+            .expect("top-1 must be one of the candidates");
+        let reasons = compute_transcode_reasons(
+            &winner_source,
+            Some(&profile),
+            EmbeddedSubtitleHandling::default(),
+            None,
+            Some(200_000_000),
+        );
+        assert!(
+            has_no_video_reencode_reason(&reasons),
+            "the Infuse-like profile can really direct-play/cheap-remux the \
+             winner ({winner_name}); it must not need a video re-encode; \
+             reasons={:?}",
+            reasons
+                .0
+                .iter()
+                .map(TranscodeReason::name)
+                .collect::<Vec<_>>()
+        );
+    }
 }
