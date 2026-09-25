@@ -284,6 +284,10 @@ async fn items_playbackinfo_inner(
         (Some(a), Some(b)) => Some(a.min(b)),
         (a, b) => a.or(b),
     };
+    // Jellyfin semantics: 0 (or absent) means "unlimited", not a real
+    // zero-bitrate ceiling. Normalise once here so every downstream consumer
+    // (PlaybackConfig, StreamService, SourceRankingContext) agrees.
+    let max_bitrate = max_bitrate.filter(|b| *b > 0);
 
     // Device-aware auto-play (#552): when a profile is known (this request's
     // own, or the last one persisted for this device), the MediaSourceId ==
@@ -292,7 +296,7 @@ async fn items_playbackinfo_inner(
     // both fields `None` (e.g. Android TV, which never sends or persists a
     // profile) keeps that branch's behaviour exactly as before.
     service.device_profile = sort_device_profile.clone();
-    service.max_bitrate = max_bitrate.map(|b| b.max(0) as u64);
+    service.max_bitrate = max_bitrate.map(|b| b as u64);
 
     let play_session_id = common::get_uuid()
         .as_simple()
@@ -608,7 +612,7 @@ async fn items_playbackinfo_inner(
             device_profile: sort_device_profile.as_ref(),
             subtitle_mode,
             explicit_subtitle_index: q.subtitle_stream_index,
-            max_bitrate: max_bitrate.map(|b| b.max(0) as u64),
+            max_bitrate: max_bitrate.map(|b| b as u64),
         };
         let mut paired: Vec<_> = media_sources
             .drain(..)

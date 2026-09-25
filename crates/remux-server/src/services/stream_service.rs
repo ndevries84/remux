@@ -3,7 +3,10 @@ use crate::{
     conversions::apply_filename_guess,
     db,
     db::PreProbeQualityExt,
-    device_profile::{CodecProfileExt, DirectPlayProfileExt, ProfileConditionExt},
+    device_profile::{
+        CodecProfileExt, ConditionValue, DirectPlayProfileExt,
+        condition_satisfied_for_value,
+    },
     playback::probe::{ProbeDataExt, probe_stream, resolve_stream_root},
 };
 use remux_sdks::{
@@ -76,20 +79,28 @@ fn quality_ordered_probe_pool(streams: &[db::Media]) -> Vec<db::Media> {
 /// True when `stream`'s probed-or-filename-guessed video codec, range and
 /// estimated bitrate can all be satisfied by `profile`/`max_bitrate`:
 ///
-/// (a) the video codec appears in any `DirectPlayProfile.VideoCodec` list
-///     (container is not considered here — that's a separate, independent
-///     direct-play concern this pre-probe heuristic isn't trying to answer);
-/// (b) if a video `CodecProfile` for that codec carries a `VideoRangeType`
-///     condition, the candidate's range (unknown ⇒ compatible) satisfies it;
-/// (c) if `max_bitrate` is given and an estimated bitrate is known, it is at
-///     or under the cap (unknown ⇒ compatible).
+/// (a) the video codec appears in any `DirectPlayProfile.VideoCodec` list —
+///     `DirectPlayProfile`'s own container check is deliberately skipped:
+///     this is only a pre-probe compatibility *heuristic* for pool ordering,
+///     and a container mismatch alone is a cheap remux, not a real
+///     incompatibility, so it must not demote a candidate here;
+/// (b) if a video `CodecProfile` that `applies_to_media` (codec + its own
+///     container scope + `apply_conditions` — the same gate `check_reasons`
+///     itself is built from) carries a `VideoRangeType` condition, the
+///     candidate's range (unknown ⇒ compatible) satisfies it, evaluated via
+///     `condition_satisfied_for_value` (the canonical evaluator
+///     `compute_transcode_reasons` uses, including its HDR10Plus→HDR10
+///     fallback) rather than the raw `ProfileCondition::is_satisfied_opt`;
+/// (c) if `max_bitrate` is given (`Some(0)` normalises to "no cap" — 0/absent
+///     both mean unlimited) and an estimated bitrate is known, it is at or
+///     under the cap (unknown ⇒ compatible).
 ///
 /// Reuses the same `MediaSourceInfo::from(db::Media)` + `apply_filename_guess`
 /// conversion the real playback/ranking path uses, so "probe data if present
 /// else filename guess" is exactly the engine's own fallback, not a
-/// reimplementation of it — and the same `DirectPlayProfileExt`/
-/// `CodecProfileExt`/`ProfileConditionExt` helpers `check_direct_play` itself
-/// is built from.
+/// reimplementation of it — and the same `DirectPlayProfileExt`,
+/// `CodecProfileExt::applies_to_media`, and `condition_satisfied_for_value`
+/// helpers `check_direct_play`/`check_reasons` are themselves built from.
 fn device_aware_compatible(
     stream: &db::Media,
     profile: &api::DeviceProfile,
@@ -98,15 +109,15 @@ fn device_aware_compatible(
     let mut info = api::MediaSourceInfo::from(stream.clone());
     apply_filename_guess(&mut info, stream);
 
-    let Some(codec) = info
-        .video_stream()
-        .and_then(|v| {
-            v.codec
-                .as_deref()
-        })
-    else {
-        // No usable video codec signal even after a filename guess: nothing
+    let Some(video) = info.video_stream() else {
+        // No usable video stream signal even after a filename guess: nothing
         // to disqualify the candidate on, so treat it as compatible.
+        return true;
+    };
+    let Some(codec) = video
+        .codec
+        .as_deref()
+    else {
         return true;
     };
 
@@ -118,29 +129,39 @@ fn device_aware_compatible(
         return false;
     }
 
-    let range = info
-        .video_stream()
-        .and_then(|v| {
-            v.video_range_type
-                .as_ref()
-        })
+    let range = video
+        .video_range_type
+        .as_ref()
         .map(|r| r.as_str());
+    let range_actual = match range {
+        Some(r) => ConditionValue::Known(r.to_string()),
+        None => ConditionValue::Missing,
+    };
     let range_ok = profile
         .codec_profiles
         .iter()
         .filter(|cp| matches!(cp.type_, None | Some(CodecProfileType::Video)))
-        .filter(|cp| cp.applies_to_codec(codec))
+        .filter(|cp| cp.applies_to_media(&info, video, codec))
         .flat_map(|cp| &cp.conditions)
         .filter(|cond| {
             cond.property
                 .as_ref()
                 == Some(&ProfileConditionProperty::VideoRangeType)
         })
-        .all(|cond| cond.is_satisfied_opt(range));
+        .all(|cond| {
+            condition_satisfied_for_value(
+                cond,
+                &ProfileConditionProperty::VideoRangeType,
+                &range_actual,
+            )
+        });
     if !range_ok {
         return false;
     }
 
+    // Jellyfin semantics: a `0` cap means unlimited, not a zero-bitrate
+    // ceiling — normalise the same way playback.rs/SourceRankingContext do.
+    let max_bitrate = max_bitrate.filter(|b| *b > 0);
     if let Some(max) = max_bitrate {
         if let Some(bitrate) = info.bitrate {
             if bitrate > 0 && bitrate as u64 > max {

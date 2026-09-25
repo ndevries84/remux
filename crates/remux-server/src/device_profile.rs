@@ -518,7 +518,7 @@ fn condition_satisfied(
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-enum ConditionValue {
+pub(crate) enum ConditionValue {
     Known(String),
     Missing,
     Unsupported,
@@ -547,7 +547,13 @@ fn optional_condition_value<T: ToString>(value: Option<T>) -> ConditionValue {
         .unwrap_or(ConditionValue::Missing)
 }
 
-fn condition_satisfied_for_value(
+/// The canonical `ProfileCondition` evaluator `check_reasons`/`check_codec_profiles`
+/// build on — callers outside this module (e.g. `device_aware_probe_pool`'s
+/// pre-probe `VideoRangeType` check) should reuse this rather than calling
+/// `ProfileCondition::is_satisfied_opt` directly, so they inherit the same
+/// HDR10Plus→HDR10 fallback (Jellyfin treats HDR10+ as satisfying an HDR10
+/// constraint) instead of silently drifting from it.
+pub(crate) fn condition_satisfied_for_value(
     condition: &ProfileCondition,
     property: &ProfileConditionProperty,
     actual: &ConditionValue,
@@ -917,9 +923,13 @@ impl SourceRankingContext<'_> {
         // Bitrate limits are live playback policy, not a durable device
         // capability: only Compatibility mode's ranking may be pushed around
         // by the request's cap. Best/Quality stay bitrate-cap-blind.
+        // `Some(0)` is normalised to "no cap" defensively here too — Jellyfin
+        // semantics treat 0/absent as unlimited, not a zero-bitrate ceiling —
+        // even though callers (playback.rs) already normalise at the source.
         let max_bitrate = match self.mode {
             SortMediaSourcesMode::Compatibility => self
                 .max_bitrate
+                .filter(|b| *b > 0)
                 .map(|b| b as i64),
             _ => None,
         };
