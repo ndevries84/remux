@@ -1361,4 +1361,146 @@ mod tests {
             Some(alive.id)
         );
     }
+
+    // =========================================================================
+    // Reproduction: Chrome web client offered a 4K DoVi HEVC remux instead of
+    // a 1080p H.264 file under `SortMediaSourcesMode::Compatibility`. See
+    // `device_profile.rs`'s `repro_*` tests for the post-probe capability-sort
+    // half of this investigation. These two tests cover the pre-probe layer:
+    // which candidate becomes the probe target / the auto-play pick, before
+    // any device profile is even consulted.
+
+    /// Real filenames for the 19-version scenario (same set as
+    /// `device_profile.rs`'s `repro_candidates()`, filenames only — this
+    /// layer only cares about `quality_weight()`, which is filename-derived).
+    /// `A` (the 2160p REMUX actually served to Chrome in production) is
+    /// deliberately placed in the *middle* of the list, not first, to prove
+    /// the pre-probe pick is driven by parsed quality, not by addon/DB order.
+    fn repro_production_filenames() -> Vec<&'static str> {
+        vec![
+            "Toy.Story.5.2025.1080p.BluRay.x264.AAC-GROUP0.mkv",
+            "Toy.Story.5.2025.2160p.WEB-DL.HDR10.HEVC.DDP5.1-GROUP3.mkv",
+            "Toy.Story.5.2025.1080p.WEB-DL.AAC.H.264-GROUP1.mkv",
+            "Toy.Story.5.2025.2160p.UHD.BluRay.REMUX.DV.HDR.HEVC.TrueHD.Atmos.7.1-FraMeSToR.mkv", // A
+            "Toy.Story.5.2025.2160p.WEB-DL.DV.HDR.HEVC.DDP5.1-GROUP0.mkv",
+            "Toy.Story.5.2025.1080p.WEB-DL.DDP5.1.H.264-GROUP3.mkv",
+            "Toy.Story.5.2025.2160p.WEB-DL.HDR10.HEVC.TrueHD.Atmos.7.1-GROUP1.mkv",
+            "Toy.Story.5.2025.1080p.BluRay.x264.DDP5.1-GROUP4.mkv",
+        ]
+    }
+
+    /// `quality_ordered_probe_pool` takes no `DeviceProfile` argument at all
+    /// (see its doc comment: "used only to choose probe attempt order before
+    /// real technical specs are available" / "must not be used to mutate the
+    /// persisted addon source order") — it ranks purely by
+    /// `PreProbeQualityExt::quality_weight()`, i.e. filename-derived
+    /// resolution + release-source tier. A 2160p BluRay REMUX scores the
+    /// maximum possible weight `(5, 6)`, strictly higher than every other
+    /// 2160p (WEB-DL/BluRay-encode, weight `(5, <6)`) or 1080p (`(4, _)`)
+    /// candidate, so it is the pre-probe pick for every client — Chrome
+    /// included — regardless of whether Chrome can actually play DoVi/TrueHD.
+    #[test]
+    fn repro_chrome_prefers_4k_remux_pre_probe() {
+        let filenames = repro_production_filenames();
+        let streams: Vec<db::Media> = filenames
+            .iter()
+            .map(|f| quality_stream(f))
+            .collect();
+
+        let pool = quality_ordered_probe_pool(&streams);
+        let preferred = pool
+            .first()
+            .expect("pool must not be empty");
+        let preferred_filename = preferred
+            .stream_info
+            .as_ref()
+            .and_then(|si| si.filename.as_deref())
+            .unwrap_or_default();
+
+        println!("pre-probe preferred candidate (device-blind): {preferred_filename}");
+
+        assert!(
+            preferred_filename.contains("REMUX"),
+            "quality_ordered_probe_pool has no DeviceProfile parameter — it must \
+             pick the highest filename-derived quality_weight() candidate \
+             regardless of which client is asking. Got {preferred_filename}"
+        );
+        // TODO(patch): desired = the pre-probe pick should only decide probe
+        // ORDER (which candidate gets a fresh ffprobe first), never which
+        // candidate is actually served for playback — that decision belongs
+        // entirely to the post-probe, device-aware capability sort.
+    }
+
+    /// `select_streams()`'s "requested_id == item_id" branch — the auto-play
+    /// signal real clients send (Android TV, and Chrome/jellyfin-web's
+    /// initial `MediaSourceId` on some playback paths) per the existing
+    /// comment at its call site: "media_source_id == item_id (Android TV
+    /// auto-play) ... return only the first stream; specific_requested stays
+    /// false". This truncates `self.streams` to its first element *before*
+    /// `quality_ordered_probe_pool` or any device-capability ranking ever
+    /// runs. If the addon/DB happens to list the flashiest 4K release first
+    /// (a common addon behaviour — biggest/most "definitive" release first),
+    /// auto-play serves exactly that release, on every device, with no
+    /// ranking of any kind involved.
+    #[tokio::test]
+    async fn repro_auto_play_media_source_id_bypasses_all_ranking() {
+        use crate::integration_test::authenticated_server;
+
+        let (_server, guard, _token) = authenticated_server().await;
+        let ctx = &guard.0;
+        let item_id = Uuid::new_v4();
+
+        // Addon/DB order: candidate A (the 2160p REMUX) happens to be first —
+        // exactly what an addon that lists biggest/"best" release first would
+        // return, and unrelated to any device capability.
+        let mut filenames = repro_production_filenames();
+        filenames.retain(|f| !f.contains("REMUX"));
+        filenames.insert(
+            0,
+            "Toy.Story.5.2025.2160p.UHD.BluRay.REMUX.DV.HDR.HEVC.TrueHD.Atmos.7.1-FraMeSToR.mkv",
+        );
+        let streams: Vec<db::Media> = filenames
+            .iter()
+            .map(|f| quality_stream(f))
+            .collect();
+
+        let mut service = StreamService::new(StreamServiceConfig {
+            ctx: ctx.clone(),
+            item_id,
+            // The auto-play signal: MediaSourceId == the item being played.
+            requested_id: Some(item_id),
+            show_ungrouped: false,
+            stream_filter: None,
+            user_id: None,
+        });
+        service.streams = streams.clone();
+
+        let sel = service.select_streams();
+
+        assert_eq!(
+            sel.candidates
+                .len(),
+            1,
+            "auto-play truncates to a single candidate before any \
+             device-capability ranking (or even quality_ordered_probe_pool) runs"
+        );
+        let picked = &sel.candidates[0];
+        let picked_filename = picked
+            .stream_info
+            .as_ref()
+            .and_then(|si| si.filename.as_deref())
+            .unwrap_or_default();
+        println!("auto-play (MediaSourceId == item_id) picked: {picked_filename}");
+
+        assert_eq!(
+            picked.id, streams[0].id,
+            "select_streams() returns literally whichever stream is first in \
+             self.streams for auto-play — not the quality-ordered pick, and \
+             not a capability-ranked pick. Picked {picked_filename}"
+        );
+        // TODO(patch): desired = the auto-play path should route through the
+        // same `quality_ordered_probe_pool` + post-probe capability-sort
+        // pipeline as an explicit PlaybackInfo request, instead of trusting
+        // positional order in `self.streams`.
+    }
 }

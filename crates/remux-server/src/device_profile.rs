@@ -1474,17 +1474,17 @@ impl MediaSourceCapabilityExt for MediaSourceInfo {
 mod tests {
     use super::{
         CodecProfileExt, DeviceProfileExt, MediaSourceCapabilityExt, MediaSourceRank,
-        MediaSourceSortKey, SourceRankingContext, failed_condition_reason,
-        playback_decision_label, primary_video_stream, subtitle_burn_reason,
-        transcode_cost_tier,
+        MediaSourceSortKey, SourceRankingContext, compute_transcode_reasons,
+        failed_condition_reason, playback_decision_label, primary_video_stream,
+        subtitle_burn_reason, transcode_cost_tier,
     };
     use remux_sdks::remux::{
         AudioCodec, CodecProfile, CodecProfileType, DeviceProfile, DirectPlayProfile,
-        DlnaProfileType, EmbeddedSubtitleHandling, MediaSourceInfo, MediaStream,
-        MediaStreamType, ProfileCondition, ProfileConditionProperty,
-        ProfileConditionType, SortMediaSourcesMode, SubtitleDeliveryMethod,
-        SubtitleProfile, TranscodeReason, TranscodeReasons, VideoCodec, VideoContainer,
-        VideoRangeType,
+        DlnaProfileType, EmbeddedSubtitleHandling, MediaSourceInfo,
+        MediaSourceRemuxInfo, MediaStream, MediaStreamType, ProbeOrigin,
+        ProfileCondition, ProfileConditionProperty, ProfileConditionType,
+        SortMediaSourcesMode, SubtitleDeliveryMethod, SubtitleProfile, TranscodeReason,
+        TranscodeReasons, VideoCodec, VideoContainer, VideoRangeType,
     };
 
     #[test]
@@ -3501,5 +3501,511 @@ mod tests {
     fn hail_mary_real_versions_on_lenient_streamyfin_profile() {
         let profile = streamyfin_mpv_real_profile();
         ranked_for_profile(&profile, "Streamyfin MPV");
+    }
+
+    // =====================================================================
+    // Reproduction: Chrome web client (jellyfin-web 10.11) offered a 4K DoVi
+    // HEVC remux instead of a 1080p H.264 file under
+    // `SortMediaSourcesMode::Compatibility`. See `services/stream_service.rs`
+    // (`repro_chrome_prefers_4k_remux_pre_probe`,
+    // `repro_auto_play_media_source_id_bypasses_all_ranking`) for the
+    // pre-probe half of this investigation. This module covers the
+    // post-probe capability sort: given 19 realistic versions of one title
+    // (approximated from a production RemuxDB snapshot — see task notes for
+    // the exact numbers), what does `SourceRankingContext` actually compute
+    // for a Chrome client, and does it favor the 1080p H.264 file the way a
+    // human would expect?
+    //
+    // Candidate `A` is the 2160p REMUX that was actually served in
+    // production: probe data on file mis-tags `VideoRangeType` as SDR (a
+    // real, observed RemuxDB classification miss) even though the release is
+    // really Dolby Vision.
+
+    fn repro_video_stream(
+        codec: &str,
+        width: i64,
+        height: i64,
+        range: Option<VideoRangeType>,
+        bit_depth: Option<i64>,
+        codec_tag: Option<&str>,
+        real_frame_rate: Option<f32>,
+    ) -> MediaStream {
+        MediaStream {
+            index: 0,
+            type_: Some(MediaStreamType::Video),
+            codec: Some(codec.to_string()),
+            width: Some(width),
+            height: Some(height),
+            video_range_type: range,
+            bit_depth,
+            codec_tag: codec_tag.map(str::to_string),
+            real_frame_rate,
+            is_default: Some(true),
+            ..Default::default()
+        }
+    }
+
+    fn repro_audio_stream(codec: &str, channels: i64) -> MediaStream {
+        MediaStream {
+            index: 1,
+            type_: Some(MediaStreamType::Audio),
+            codec: Some(codec.to_string()),
+            channels: Some(channels),
+            is_default: Some(true),
+            ..Default::default()
+        }
+    }
+
+    fn repro_estimate_mbps(size_gb: f64, runtime_secs: f64) -> f64 {
+        size_gb * 1_000_000_000.0 * 8.0 / runtime_secs / 1_000_000.0
+    }
+
+    /// A candidate whose `probe_data` is already populated, as if RemuxDB
+    /// (or a prior real ffprobe) had already stored it — mirrors
+    /// `source=remux_db` in the production snapshot.
+    fn repro_probed_candidate(
+        name: impl Into<String>,
+        filename: &str,
+        video: MediaStream,
+        audio: MediaStream,
+        size_gb: f64,
+        bitrate_mbps: f64,
+        cached: bool,
+    ) -> (String, MediaSourceInfo) {
+        let size = (size_gb * 1_000_000_000.0) as i64;
+        let bitrate = (bitrate_mbps * 1_000_000.0) as i64;
+        let media = crate::db::Media {
+            title: "Toy Story 5".to_string(),
+            stream_info: Some(crate::stream::StreamInfo {
+                filename: Some(filename.to_string()),
+                service_cached: Some(cached),
+                size: Some(size),
+                ..Default::default()
+            }),
+            probe_data: Some(MediaSourceInfo {
+                media_streams: vec![video, audio],
+                container: Some(VideoContainer::Mkv),
+                bitrate: Some(bitrate),
+                size: Some(size),
+                remux: Some(MediaSourceRemuxInfo {
+                    source: Some(ProbeOrigin::RemuxDb),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let mut source = MediaSourceInfo::from(media.clone());
+        crate::conversions::apply_filename_guess(&mut source, &media);
+        source.resolve_default_streams(
+            &crate::api::UserConfiguration::default(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        (name.into(), source)
+    }
+
+    /// A candidate with no stored probe data at all — production behaviour
+    /// for a RemuxDB-miss the server never got around to probing
+    /// (`source=filename_guess`). Goes through the exact same
+    /// `apply_filename_guess`/`guess_media_source_from_filename` conversion
+    /// `api/playback.rs` calls, so it looks exactly as it would over the
+    /// wire.
+    fn repro_guessed_candidate(
+        name: impl Into<String>,
+        filename: &str,
+        size_gb: f64,
+        runtime_secs: i64,
+        cached: bool,
+    ) -> (String, MediaSourceInfo) {
+        let size = (size_gb * 1_000_000_000.0) as i64;
+        let media = crate::db::Media {
+            title: "Toy Story 5".to_string(),
+            runtime: Some(runtime_secs),
+            stream_info: Some(crate::stream::StreamInfo {
+                filename: Some(filename.to_string()),
+                service_cached: Some(cached),
+                size: Some(size),
+                ..Default::default()
+            }),
+            probe_data: None,
+            ..Default::default()
+        };
+        let mut source = MediaSourceInfo::from(media.clone());
+        crate::conversions::apply_filename_guess(&mut source, &media);
+        source.resolve_default_streams(
+            &crate::api::UserConfiguration::default(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        (name.into(), source)
+    }
+
+    /// The 19 real-world candidates: 1 REMUX (A), 11 more 2160p HEVC
+    /// alternates (DOVI/HDR10, EAC3/TrueHD), and 7 x 1080p H.264 (3 AAC + 4
+    /// EAC3) — a mix of `remux_db` (already-probed) and `filename_guess`
+    /// sources, matching what a real multi-addon RemuxDB snapshot looks
+    /// like. Movie runtime assumed ~138 min (8280s) for filename-guess
+    /// bitrate estimation.
+    fn repro_candidates() -> Vec<(String, MediaSourceInfo)> {
+        const RUNTIME_SECS: i64 = 8280;
+        let mut v = Vec::new();
+
+        // Candidate A: the 2160p DoVi HEVC REMUX actually served to Chrome.
+        v.push(repro_probed_candidate(
+            "A: 2160p REMUX DV/HDR HEVC TrueHD 7.1 (misclassified SDR, remux_db)",
+            "Toy.Story.5.2025.2160p.UHD.BluRay.REMUX.DV.HDR.HEVC.TrueHD.Atmos.7.1-FraMeSToR.mkv",
+            repro_video_stream(
+                "hevc",
+                3840,
+                2160,
+                Some(VideoRangeType::Sdr), // misclassified: really DOVI
+                Some(10),
+                Some("hev1"),
+                Some(23.976),
+            ),
+            repro_audio_stream("truehd", 8),
+            52.4,
+            68.6,
+            true,
+        ));
+
+        // 11 more 2160p HEVC alternates: correctly tagged HDR10/DOVI,
+        // smaller (non-remux) encodes, mix of EAC3/TrueHD audio and probe
+        // sources.
+        let alt_2160p: [(VideoRangeType, &str, i64, f64, bool, bool); 11] = [
+            (VideoRangeType::Dovi, "eac3", 6, 22.0, true, true),
+            (VideoRangeType::Hdr10, "truehd", 8, 28.0, true, true),
+            (VideoRangeType::Dovi, "eac3", 6, 18.5, true, false),
+            (VideoRangeType::Hdr10, "eac3", 6, 15.2, true, false),
+            (VideoRangeType::Dovi, "truehd", 8, 26.3, true, true),
+            (VideoRangeType::Hdr10, "eac3", 6, 19.8, true, true),
+            (VideoRangeType::Dovi, "eac3", 6, 21.1, true, false),
+            (VideoRangeType::Hdr10, "truehd", 8, 24.7, true, true),
+            (VideoRangeType::Dovi, "eac3", 6, 16.9, true, false),
+            (VideoRangeType::Hdr10, "eac3", 6, 20.3, true, true),
+            (VideoRangeType::Dovi, "truehd", 8, 29.5, true, false),
+        ];
+        for (i, (range, acodec, ch, size_gb, cached, probed)) in
+            alt_2160p.into_iter().enumerate()
+        {
+            let range_tag = match range {
+                VideoRangeType::Dovi => "DV.HDR",
+                _ => "HDR10",
+            };
+            let acodec_tag = if acodec == "truehd" {
+                "TrueHD.Atmos.7.1"
+            } else {
+                "DDP5.1"
+            };
+            let filename = format!(
+                "Toy.Story.5.2025.2160p.WEB-DL.{range_tag}.HEVC.{acodec_tag}-GROUP{i}.mkv"
+            );
+            let source_label = if probed { "remux_db" } else { "filename_guess" };
+            let name = format!(
+                "B{}: 2160p {range:?} HEVC {acodec} ({source_label})",
+                i + 1
+            );
+            if probed {
+                v.push(repro_probed_candidate(
+                    name,
+                    &filename,
+                    repro_video_stream(
+                        "hevc",
+                        3840,
+                        2160,
+                        Some(range),
+                        Some(10),
+                        Some("hev1"),
+                        Some(23.976),
+                    ),
+                    repro_audio_stream(acodec, ch),
+                    size_gb,
+                    repro_estimate_mbps(size_gb, RUNTIME_SECS as f64),
+                    cached,
+                ));
+            } else {
+                v.push(repro_guessed_candidate(
+                    name,
+                    &filename,
+                    size_gb,
+                    RUNTIME_SECS,
+                    cached,
+                ));
+            }
+        }
+
+        // 7 x 1080p H.264 candidates: 3 AAC + 4 EAC3, correctly SDR, cached.
+        let alt_1080p: [(&str, i64, f64, bool, bool); 7] = [
+            ("aac", 2, 2.3, true, false),
+            ("aac", 2, 3.9, true, true),
+            ("aac", 6, 4.4, true, false),
+            ("eac3", 6, 5.1, true, true),
+            ("eac3", 6, 5.8, true, false),
+            ("eac3", 6, 6.2, true, true),
+            ("eac3", 6, 6.7, true, false),
+        ];
+        for (i, (acodec, ch, size_gb, cached, probed)) in
+            alt_1080p.into_iter().enumerate()
+        {
+            let acodec_tag = if acodec == "aac" { "AAC" } else { "DDP5.1" };
+            let filename = if i % 2 == 0 {
+                format!("Toy.Story.5.2025.1080p.BluRay.x264.{acodec_tag}-GROUP{i}.mkv")
+            } else {
+                format!(
+                    "Toy.Story.5.2025.1080p.WEB-DL.{acodec_tag}.H.264-GROUP{i}.mkv"
+                )
+            };
+            let source_label = if probed { "remux_db" } else { "filename_guess" };
+            let name = format!("C{}: 1080p H.264 {acodec} ({source_label})", i + 1);
+            if probed {
+                v.push(repro_probed_candidate(
+                    name,
+                    &filename,
+                    repro_video_stream(
+                        "h264",
+                        1920,
+                        1080,
+                        Some(VideoRangeType::Sdr),
+                        Some(8),
+                        None,
+                        Some(23.976),
+                    ),
+                    repro_audio_stream(acodec, ch),
+                    size_gb,
+                    repro_estimate_mbps(size_gb, RUNTIME_SECS as f64),
+                    cached,
+                ));
+            } else {
+                v.push(repro_guessed_candidate(
+                    name,
+                    &filename,
+                    size_gb,
+                    RUNTIME_SECS,
+                    cached,
+                ));
+            }
+        }
+
+        assert_eq!(v.len(), 19, "must model all 19 real-world candidates");
+        v
+    }
+
+    /// Ranks `repro_candidates()` under `mode`/`profile`, printing the top 5
+    /// with both the rank-time reasons (bitrate-blind, as
+    /// `SourceRankingContext::assess` computes them — see its doc comment:
+    /// "Bitrate limits are intentionally absent") and the live
+    /// request-level reasons including `max_bitrate` (what a real playback
+    /// decision would see once this source is actually chosen). Returns the
+    /// sorted (name, sort_key) pairs for callers to assert on.
+    fn repro_run_and_print(
+        label: &str,
+        profile: Option<&DeviceProfile>,
+        mode: SortMediaSourcesMode,
+        max_bitrate: Option<i64>,
+    ) -> Vec<(String, MediaSourceSortKey)> {
+        let candidates = repro_candidates();
+        let ranking = SourceRankingContext {
+            mode,
+            device_profile: profile,
+            subtitle_mode: EmbeddedSubtitleHandling::default(),
+            explicit_subtitle_index: None,
+        };
+        let mut ranked: Vec<_> = candidates
+            .into_iter()
+            .map(|(name, source)| {
+                let assessment = ranking.assess(&source);
+                let sort_key = assessment.sort_key(mode);
+                let live_reasons = compute_transcode_reasons(
+                    &source,
+                    profile,
+                    EmbeddedSubtitleHandling::default(),
+                    None,
+                    max_bitrate,
+                );
+                (name, source, assessment, sort_key, live_reasons)
+            })
+            .collect();
+        ranked.sort_by_cached_key(|(_, _, _, sort_key, _)| std::cmp::Reverse(*sort_key));
+
+        println!("\n--- {label} ---");
+        for (i, (name, _source, assessment, sort_key, live_reasons)) in
+            ranked.iter().enumerate().take(5)
+        {
+            println!(
+                "#{:02} {name}\n     rank_reasons={:?} tier={} live_reasons_with_bitrate_cap={:?} key={sort_key:?}",
+                i + 1,
+                assessment
+                    .reasons
+                    .0
+                    .iter()
+                    .map(TranscodeReason::name)
+                    .collect::<Vec<_>>(),
+                transcode_cost_tier(&assessment.reasons),
+                live_reasons
+                    .0
+                    .iter()
+                    .map(TranscodeReason::name)
+                    .collect::<Vec<_>>(),
+            );
+        }
+
+        ranked
+            .into_iter()
+            .map(|(name, _, _, sort_key, _)| (name, sort_key))
+            .collect()
+    }
+
+    #[test]
+    fn repro_compatibility_sort_order_chrome_120mbps() {
+        let profile = jellyfin_web_real_profile();
+        let order = repro_run_and_print(
+            "Compatibility / Chrome (jellyfin-web) / 120 Mbps cap (profile default)",
+            Some(&profile),
+            SortMediaSourcesMode::Compatibility,
+            Some(120_000_000),
+        );
+        println!("observed top-1: {}", order[0].0);
+    }
+
+    #[test]
+    fn repro_compatibility_sort_order_chrome_20mbps() {
+        let profile = jellyfin_web_real_profile();
+        let order = repro_run_and_print(
+            "Compatibility / Chrome (jellyfin-web) / 20 Mbps cap (typical web quality setting)",
+            Some(&profile),
+            SortMediaSourcesMode::Compatibility,
+            Some(20_000_000),
+        );
+        println!("observed top-1: {}", order[0].0);
+    }
+
+    #[test]
+    fn repro_best_mode_order_chrome() {
+        let profile = jellyfin_web_real_profile();
+        let order = repro_run_and_print(
+            "Best / Chrome (jellyfin-web) / 120 Mbps cap",
+            Some(&profile),
+            SortMediaSourcesMode::Best,
+            Some(120_000_000),
+        );
+        println!("observed top-1: {}", order[0].0);
+    }
+
+    #[test]
+    fn repro_quality_mode_order_chrome() {
+        let profile = jellyfin_web_real_profile();
+        let order = repro_run_and_print(
+            "Quality / Chrome (jellyfin-web) / 120 Mbps cap",
+            Some(&profile),
+            SortMediaSourcesMode::Quality,
+            Some(120_000_000),
+        );
+        println!("observed top-1: {}", order[0].0);
+    }
+
+    /// An Infuse-like client: genuinely capable of direct-playing mkv,
+    /// HEVC, Dolby Vision and TrueHD — the contrast case where preferring
+    /// the 4K remux is the *correct* outcome, not a bug.
+    fn infuse_like_dovi_profile() -> DeviceProfile {
+        DeviceProfile {
+            max_streaming_bitrate: Some(200_000_000),
+            direct_play_profiles: vec![DirectPlayProfile {
+                container: Some(vec![VideoContainer::Mkv, VideoContainer::Mp4]),
+                video_codec: Some(vec![
+                    VideoCodec::Hevc,
+                    VideoCodec::H264,
+                    VideoCodec::Av1,
+                ]),
+                audio_codec: Some(vec![
+                    AudioCodec::TrueHd,
+                    AudioCodec::Eac3,
+                    AudioCodec::Ac3,
+                    AudioCodec::Aac,
+                    AudioCodec::Dts,
+                    AudioCodec::Flac,
+                ]),
+                type_: Some(DlnaProfileType::Video),
+            }],
+            codec_profiles: vec![CodecProfile {
+                type_: Some(CodecProfileType::Video),
+                codec: Some(vec!["hevc".to_string()]),
+                conditions: vec![ProfileCondition {
+                    condition: Some(ProfileConditionType::EqualsAny),
+                    property: Some(ProfileConditionProperty::VideoRangeType),
+                    value: Some(
+                        "SDR|HDR10|HDR10Plus|HLG|DOVI|DOVIWithHDR10".to_string(),
+                    ),
+                    is_required: Some(false),
+                }],
+                ..Default::default()
+            }],
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn repro_compatibility_sort_order_infuse_like_dovi_capable() {
+        let profile = infuse_like_dovi_profile();
+        let order = repro_run_and_print(
+            "Compatibility / Infuse-like (mkv/HEVC/DoVi/TrueHD capable) / 200 Mbps cap",
+            Some(&profile),
+            SortMediaSourcesMode::Compatibility,
+            Some(200_000_000),
+        );
+        println!("observed top-1: {}", order[0].0);
+        // Intended contrast: a client that can actually direct-play
+        // mkv/HEVC/DoVi/TrueHD SHOULD prefer the 4K remux — the bug is
+        // specific to clients (like Chrome/jellyfin-web) that can't.
+    }
+
+    #[test]
+    fn repro_full_sort_key_chrome_a_vs_best_1080p_aac() {
+        let profile = jellyfin_web_real_profile();
+        let candidates = repro_candidates();
+        let ranking = SourceRankingContext {
+            mode: SortMediaSourcesMode::Compatibility,
+            device_profile: Some(&profile),
+            subtitle_mode: EmbeddedSubtitleHandling::default(),
+            explicit_subtitle_index: None,
+        };
+
+        let (a_name, a_source) = candidates
+            .iter()
+            .find(|(name, _)| name.starts_with("A:"))
+            .expect("candidate A must exist");
+        let (best_name, best_source) = candidates
+            .iter()
+            .filter(|(name, _)| name.contains("1080p H.264 aac"))
+            .max_by_key(|(_, source)| ranking.sort_key(source))
+            .expect("at least one 1080p AAC candidate must exist");
+
+        let key_a = ranking.sort_key(a_source);
+        let key_best_1080p = ranking.sort_key(best_source);
+        let reasons_a = ranking.assess(a_source).reasons;
+        let reasons_best_1080p = ranking.assess(best_source).reasons;
+
+        println!("\n--- Full MediaSourceSortKey (Compatibility, Chrome/jellyfin-web) ---");
+        println!("A ({a_name}):\n  reasons={:?}\n  key={key_a:#?}",
+            reasons_a.0.iter().map(TranscodeReason::name).collect::<Vec<_>>());
+        println!("best 1080p AAC ({best_name}):\n  reasons={:?}\n  key={key_best_1080p:#?}",
+            reasons_best_1080p.0.iter().map(TranscodeReason::name).collect::<Vec<_>>());
+
+        // The decisive field: whichever of `key_a`/`key_best_1080p` differs
+        // first, in declaration order (cached, plausibility_before_cost,
+        // cost, plausibility_after_cost, resolution, hdr_class,
+        // release_quality, bitrate, bit_depth, audio_tier, audio_channels,
+        // hdr_variant), is what decides the winner. Printed above in full so
+        // the field is unambiguous; see this test's stdout (run with
+        // `-- --nocapture`) for the actual values observed against the
+        // real jellyfin-web fixture.
     }
 }
