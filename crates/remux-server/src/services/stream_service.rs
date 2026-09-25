@@ -2368,4 +2368,318 @@ mod tests {
              got {served_filename}"
         );
     }
+
+    // =========================================================================
+    // Desired behaviour (lostb1t/remux#552 follow-up): code review found two
+    // gaps in `device_aware_compatible` versus the canonical
+    // `compute_transcode_reasons`/`check_direct_play` semantics, plus a
+    // third "zero cap" gap shared by the pre-probe pool.
+
+    /// A device profile whose HEVC `CodecProfile` `VideoRangeType` condition
+    /// allows `SDR|HDR10|HLG` only — no `HDR10Plus`, no `DOVI`.
+    fn hdr10plus_capable_but_not_listed_profile() -> api::DeviceProfile {
+        api::DeviceProfile {
+            direct_play_profiles: vec![api::DirectPlayProfile {
+                container: Some(vec![
+                    api::VideoContainer::Mkv,
+                    api::VideoContainer::Mp4,
+                ]),
+                video_codec: Some(vec![api::VideoCodec::Hevc, api::VideoCodec::H264]),
+                type_: Some(api::DlnaProfileType::Video),
+                ..Default::default()
+            }],
+            codec_profiles: vec![api::CodecProfile {
+                type_: Some(api::CodecProfileType::Video),
+                codec: Some(vec!["hevc".to_string()]),
+                conditions: vec![api::ProfileCondition {
+                    condition: Some(api::ProfileConditionType::EqualsAny),
+                    property: Some(api::ProfileConditionProperty::VideoRangeType),
+                    value: Some("SDR|HDR10|HLG".to_string()),
+                    is_required: Some(false),
+                }],
+                ..Default::default()
+            }],
+            ..Default::default()
+        }
+    }
+
+    /// SPEC: a DeviceProfile whose HEVC `VideoRangeType` condition allows `SDR|HDR10|HLG` (no HDR10Plus) must still treat an HDR10Plus 2160p HEVC candidate under the bitrate cap as compatible, because the canonical engine's `condition_satisfied_for_value` falls HDR10Plus back to HDR10 — and must serve it via auto-play.
+    #[tokio::test]
+    async fn desired_device_aware_pool_treats_hdr10plus_as_hdr10_when_profile_lacks_hdr10plus()
+     {
+        use crate::integration_test::authenticated_server;
+
+        let (_server, guard, _token) = authenticated_server().await;
+        let ctx = &guard.0;
+
+        let profile = hdr10plus_capable_but_not_listed_profile();
+        let cap = 65_573_770u64;
+
+        let hdr10plus_candidate = device_aware_probed_media(
+            "Toy.Story.5.2025.2160p.WEB-DL.HDR10Plus.HEVC.DDP5.1-GROUP2.mkv",
+            3840,
+            2160,
+            "hevc",
+            Some(VideoRangeType::Hdr10Plus),
+            "eac3",
+            20.0,
+            28.0,
+        );
+        // Clearly incompatible on this profile: DOVI has no fallback rule.
+        let dovi_candidate = device_aware_probed_media(
+            "Toy.Story.5.2025.2160p.WEB-DL.DV.HDR.HEVC.DDP5.1-GROUP3.mkv",
+            3840,
+            2160,
+            "hevc",
+            Some(VideoRangeType::Dovi),
+            "eac3",
+            20.0,
+            28.0,
+        );
+        // A genuinely compatible but lower-quality-weight (1080p) baseline.
+        // Same-tier candidates preserve their relative insertion order
+        // within a stable-partition bucket regardless of compatibility, so
+        // comparing HDR10Plus only against the same-tier DOVI candidate
+        // can't by itself prove HDR10Plus landed in the *compatible*
+        // bucket — ranking ahead of this lower-quality-weight 1080p
+        // candidate can only happen if HDR10Plus is genuinely compatible
+        // (compatible-first partitioning, then quality order: 2160p beats
+        // 1080p by resolution).
+        let compatible_1080p_baseline = device_aware_probed_media(
+            "Toy.Story.5.2025.1080p.BluRay.x264.AAC-GROUP6.mkv",
+            1920,
+            1080,
+            "h264",
+            Some(VideoRangeType::Sdr),
+            "aac",
+            2.3,
+            8.0,
+        );
+
+        let streams = vec![
+            hdr10plus_candidate.clone(),
+            dovi_candidate.clone(),
+            compatible_1080p_baseline.clone(),
+        ];
+        let pool = device_aware_probe_pool(&streams, Some(&profile), Some(cap));
+        let hdr10plus_pos = pool
+            .iter()
+            .position(|m| m.id == hdr10plus_candidate.id)
+            .expect("HDR10Plus candidate must be present");
+        let dovi_pos = pool
+            .iter()
+            .position(|m| m.id == dovi_candidate.id)
+            .expect("DOVI candidate must be present");
+        let baseline_pos = pool
+            .iter()
+            .position(|m| m.id == compatible_1080p_baseline.id)
+            .expect("1080p baseline candidate must be present");
+        assert!(
+            hdr10plus_pos < baseline_pos,
+            "the HDR10Plus candidate must be genuinely compatible — ranking \
+             ahead of the compatible 1080p baseline by resolution — not just \
+             tied with the incompatible DOVI candidate by insertion order"
+        );
+        assert!(
+            hdr10plus_pos < dovi_pos,
+            "the HDR10Plus candidate must be ordered in the compatible \
+             partition, before the clearly-incompatible DOVI candidate"
+        );
+
+        let item_id = Uuid::new_v4();
+        let mut service = StreamService::new(StreamServiceConfig {
+            ctx: ctx.clone(),
+            item_id,
+            requested_id: Some(item_id),
+            show_ungrouped: false,
+            stream_filter: None,
+            user_id: None,
+        });
+        service.streams = streams;
+        service.device_profile = Some(profile);
+        service.max_bitrate = Some(cap);
+
+        let sel = service.select_streams();
+        assert_eq!(
+            sel.candidates
+                .len(),
+            1
+        );
+        assert_eq!(
+            sel.candidates[0].id, hdr10plus_candidate.id,
+            "auto-play must be able to serve the HDR10Plus candidate on a \
+             profile that only lists HDR10"
+        );
+    }
+
+    /// A device profile whose HEVC `CodecProfile` excludes DOVI from
+    /// `VideoRangeType`, but that `CodecProfile` is scoped to the `mp4`
+    /// container only — it must not apply to an `mkv` candidate.
+    fn mp4_scoped_dovi_excluding_profile() -> api::DeviceProfile {
+        api::DeviceProfile {
+            direct_play_profiles: vec![api::DirectPlayProfile {
+                container: Some(vec![
+                    api::VideoContainer::Mkv,
+                    api::VideoContainer::Mp4,
+                ]),
+                video_codec: Some(vec![api::VideoCodec::Hevc, api::VideoCodec::H264]),
+                type_: Some(api::DlnaProfileType::Video),
+                ..Default::default()
+            }],
+            codec_profiles: vec![api::CodecProfile {
+                type_: Some(api::CodecProfileType::Video),
+                codec: Some(vec!["hevc".to_string()]),
+                container: Some("mp4".to_string()),
+                conditions: vec![api::ProfileCondition {
+                    condition: Some(api::ProfileConditionType::EqualsAny),
+                    property: Some(api::ProfileConditionProperty::VideoRangeType),
+                    value: Some("SDR|HDR10|HDR10Plus|HLG".to_string()),
+                    is_required: Some(false),
+                }],
+                ..Default::default()
+            }],
+            ..Default::default()
+        }
+    }
+
+    /// SPEC: a CodecProfile's `VideoRangeType` condition must not demote a candidate it does not apply to — here, scoped to `container: "mp4"` while the candidate is `mkv` — mirroring how `applies_to_media` gates `check_reasons` in the canonical engine.
+    #[test]
+    fn desired_device_aware_pool_ignores_codec_profiles_that_do_not_apply_to_media() {
+        let profile = mp4_scoped_dovi_excluding_profile();
+        let cap = 65_573_770u64;
+
+        // DOVI + mkv: the only DOVI-excluding CodecProfile is scoped to mp4,
+        // so it must not apply here.
+        let dovi_mkv_candidate = device_aware_probed_media(
+            "Toy.Story.5.2025.2160p.WEB-DL.DV.HDR.HEVC.DDP5.1-GROUP4.mkv",
+            3840,
+            2160,
+            "hevc",
+            Some(VideoRangeType::Dovi),
+            "eac3",
+            20.0,
+            28.0,
+        );
+        // Clearly incompatible regardless of this test's bug: av1 is not in
+        // any DirectPlayProfile's VideoCodec list on this profile.
+        let av1_incompatible_candidate = device_aware_probed_media(
+            "Toy.Story.5.2025.2160p.WEB-DL.HDR10.AV1.DDP5.1-GROUP5.mkv",
+            3840,
+            2160,
+            "av1",
+            Some(VideoRangeType::Hdr10),
+            "eac3",
+            20.0,
+            28.0,
+        );
+        // A genuinely compatible but lower-quality-weight (1080p) baseline —
+        // see the equivalent comment in the HDR10Plus test above for why
+        // this is needed to distinguish "genuinely compatible" from
+        // "merely tied with an incompatible same-tier sibling by insertion
+        // order".
+        let compatible_1080p_baseline = device_aware_probed_media(
+            "Toy.Story.5.2025.1080p.BluRay.x264.AAC-GROUP7.mkv",
+            1920,
+            1080,
+            "h264",
+            Some(VideoRangeType::Sdr),
+            "aac",
+            2.3,
+            8.0,
+        );
+
+        let streams = vec![
+            dovi_mkv_candidate.clone(),
+            av1_incompatible_candidate.clone(),
+            compatible_1080p_baseline.clone(),
+        ];
+        let pool = device_aware_probe_pool(&streams, Some(&profile), Some(cap));
+        let dovi_pos = pool
+            .iter()
+            .position(|m| m.id == dovi_mkv_candidate.id)
+            .expect("DOVI mkv candidate must be present");
+        let baseline_pos = pool
+            .iter()
+            .position(|m| m.id == compatible_1080p_baseline.id)
+            .expect("1080p baseline candidate must be present");
+        let av1_pos = pool
+            .iter()
+            .position(|m| m.id == av1_incompatible_candidate.id)
+            .expect("av1 candidate must be present");
+        assert!(
+            dovi_pos < baseline_pos,
+            "the DOVI mkv candidate must be genuinely compatible — ranking \
+             ahead of the compatible 1080p baseline by resolution — not \
+             just tied with the incompatible av1 candidate by insertion \
+             order"
+        );
+        assert!(
+            dovi_pos < av1_pos,
+            "a CodecProfile scoped to a different container must not demote \
+             the DOVI mkv candidate; it must rank in the compatible \
+             partition, before the clearly-incompatible av1 candidate"
+        );
+    }
+
+    /// SPEC: `device_aware_probe_pool(streams, Some(profile), Some(0))` must behave exactly as `Some(profile), None` — a zero cap means unlimited, not "everything exceeds it".
+    #[test]
+    fn desired_zero_max_bitrate_is_unlimited_in_probe_pool() {
+        // `device_aware_candidates()` doesn't discriminate here: every one
+        // of its candidates is codec/range-compatible with
+        // `jellyfin_web_real_profile()` regardless of bitrate, so an
+        // uncapped run and a bug where `Some(0)` demotes every known
+        // bitrate would coincidentally produce the *same* final order
+        // (everything ends up in one bucket either way). Use a pair that
+        // deterministically reverses order if `Some(0)` incorrectly demotes
+        // a known bitrate: `x` is compatible only because there is no cap
+        // (DOVI is allowed, WEB-DL tier); `z` is *always* incompatible on
+        // codec alone (av1 isn't in any DirectPlayProfile's VideoCodec list)
+        // but outranks `x` on quality (REMUX tier) if they ever land in the
+        // same bucket. Uncapped: [x, z] (x compatible, z not). Buggy zero
+        // cap: [z, x] (both incompatible, quality order decides) — a
+        // reversal `assert_eq!` on the full order catches directly.
+        let x = device_aware_probed_media(
+            "Toy.Story.5.2025.2160p.WEB-DL.DV.HDR.HEVC.DDP5.1-GROUPX.mkv",
+            3840,
+            2160,
+            "hevc",
+            Some(VideoRangeType::Dovi),
+            "eac3",
+            20.0,
+            28.0,
+        );
+        let z = device_aware_probed_media(
+            "Toy.Story.5.2025.2160p.UHD.BluRay.REMUX.HDR10.AV1.DDP5.1-GROUPZ.mkv",
+            3840,
+            2160,
+            "av1",
+            Some(VideoRangeType::Hdr10),
+            "eac3",
+            50.0,
+            30.0,
+        );
+        let streams = vec![x.clone(), z.clone()];
+        let profile = jellyfin_web_real_profile();
+
+        let uncapped: Vec<Uuid> =
+            device_aware_probe_pool(&streams, Some(&profile), None)
+                .iter()
+                .map(|m| m.id)
+                .collect();
+        let zero_capped: Vec<Uuid> =
+            device_aware_probe_pool(&streams, Some(&profile), Some(0))
+                .iter()
+                .map(|m| m.id)
+                .collect();
+
+        assert_eq!(
+            zero_capped, uncapped,
+            "max_bitrate: Some(0) must behave exactly like None, not like a \
+             zero-bitrate ceiling that demotes every candidate with a known \
+             bitrate (uncapped must be [x, z]: x is compatible without a \
+             cap; a zero-cap bug would demote x, flipping the order to \
+             [z, x] since z outranks x on quality once both are \
+             incompatible)"
+        );
+    }
 }

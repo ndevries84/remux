@@ -4453,4 +4453,40 @@ mod tests {
                 .collect::<Vec<_>>()
         );
     }
+
+    // =========================================================================
+    // Desired behaviour (lostb1t/remux#552 follow-up): `max_bitrate: Some(0)`
+    // must mean "no cap", the same as `None` — a `0` is a sentinel some
+    // clients/configs send for "unlimited", not a real zero-bitrate ceiling.
+
+    /// SPEC: under `Compatibility`, `SourceRankingContext` with `max_bitrate: Some(0)` must produce the exact same sort key as `max_bitrate: None` for every candidate — no candidate may be demoted for "exceeding" a zero cap.
+    #[test]
+    fn desired_zero_max_bitrate_is_unlimited_in_compatibility_ranking() {
+        let profile = jellyfin_web_real_profile();
+        let candidates = repro_candidates();
+
+        let uncapped = SourceRankingContext {
+            mode: SortMediaSourcesMode::Compatibility,
+            device_profile: Some(&profile),
+            subtitle_mode: EmbeddedSubtitleHandling::default(),
+            explicit_subtitle_index: None,
+            max_bitrate: None,
+        };
+        let zero_capped = SourceRankingContext {
+            mode: SortMediaSourcesMode::Compatibility,
+            device_profile: Some(&profile),
+            subtitle_mode: EmbeddedSubtitleHandling::default(),
+            explicit_subtitle_index: None,
+            max_bitrate: Some(0),
+        };
+
+        for (name, source) in &candidates {
+            assert_eq!(
+                zero_capped.sort_key(source),
+                uncapped.sort_key(source),
+                "candidate {name}: max_bitrate: Some(0) must behave exactly \
+                 like None, not like a zero-bitrate ceiling"
+            );
+        }
+    }
 }
