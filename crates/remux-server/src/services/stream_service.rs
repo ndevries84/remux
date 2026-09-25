@@ -16,7 +16,7 @@ use remux_sdks::{
     },
     remuxdb,
 };
-use tracing::debug;
+use tracing::{debug, trace};
 use uuid::Uuid;
 
 /// Result of probing a single stream candidate.
@@ -173,6 +173,64 @@ fn device_aware_compatible(
     true
 }
 
+/// `trace!`-only diagnostic: which of `device_aware_compatible`'s rules (if
+/// any) disqualified `stream` — reuses the same profile helpers, never the
+/// compatibility decision itself, which stays single-sourced above.
+fn device_aware_failing_rule(
+    stream: &db::Media,
+    profile: &api::DeviceProfile,
+    max_bitrate: Option<u64>,
+) -> Option<&'static str> {
+    let mut info = api::MediaSourceInfo::from(stream.clone());
+    apply_filename_guess(&mut info, stream);
+    let video = info.video_stream()?;
+    let codec = video
+        .codec
+        .as_deref()?;
+    if !profile
+        .direct_play_profiles
+        .iter()
+        .any(|p| p.supports_video_codec(codec))
+    {
+        return Some("codec");
+    }
+    let range = video
+        .video_range_type
+        .as_ref()
+        .map(|r| r.as_str());
+    let actual = range
+        .map(|r| ConditionValue::Known(r.to_string()))
+        .unwrap_or(ConditionValue::Missing);
+    let range_ok = profile
+        .codec_profiles
+        .iter()
+        .filter(|cp| {
+            matches!(cp.type_, None | Some(CodecProfileType::Video))
+                && cp.applies_to_media(&info, video, codec)
+        })
+        .flat_map(|cp| &cp.conditions)
+        .filter(|c| {
+            c.property
+                .as_ref()
+                == Some(&ProfileConditionProperty::VideoRangeType)
+        })
+        .all(|c| {
+            condition_satisfied_for_value(
+                c,
+                &ProfileConditionProperty::VideoRangeType,
+                &actual,
+            )
+        });
+    if !range_ok {
+        return Some("range");
+    }
+    max_bitrate
+        .filter(|b| *b > 0)
+        .zip(info.bitrate)
+        .filter(|(max, br)| *br > 0 && *br as u64 > *max)
+        .map(|_| "bitrate")
+}
+
 /// Device-aware pre-probe ordering (lostb1t/remux#552): with `profile ==
 /// None` this is byte-for-byte `quality_ordered_probe_pool(streams)` — pure
 /// filename-derived quality order, unchanged from today. With a profile, the
@@ -191,6 +249,32 @@ pub(crate) fn device_aware_probe_pool(
     let (compatible, rest): (Vec<db::Media>, Vec<db::Media>) = pool
         .into_iter()
         .partition(|stream| device_aware_compatible(stream, profile, max_bitrate));
+    debug!(
+        candidates = compatible.len() + rest.len(),
+        compatible = compatible.len(),
+        ?max_bitrate,
+        "device_aware_probe_pool: partitioned candidates"
+    );
+    for (idx, stream) in compatible
+        .iter()
+        .chain(rest.iter())
+        .enumerate()
+    {
+        let mut info = api::MediaSourceInfo::from(stream.clone());
+        apply_filename_guess(&mut info, stream);
+        let video = info.video_stream();
+        trace!(
+            idx,
+            id = %stream.id,
+            name = %stream.title,
+            codec = ?video.and_then(|v| v.codec.as_deref()),
+            range = ?video.and_then(|v| v.video_range_type),
+            bitrate = info.bitrate,
+            compatible = idx < compatible.len(),
+            failing_rule = device_aware_failing_rule(stream, profile, max_bitrate),
+            "device_aware_probe_pool: candidate"
+        );
+    }
     compatible
         .into_iter()
         .chain(rest)
@@ -558,6 +642,7 @@ impl StreamService {
 
         let (candidates, preferred_probe_id) = if specific_requested {
             let sid = requested_id.unwrap();
+            debug!(media_source_id = %sid, "client pinned media source id (selection bypassed)");
             (
                 all_streams
                     .into_iter()
@@ -579,10 +664,16 @@ impl StreamService {
                     self.max_bitrate,
                 );
                 pool.truncate(1);
+                debug!(
+                    id = ?pool.first().map(|s| s.id),
+                    name = ?pool.first().map(|s| &s.title),
+                    "auto-play: device-aware selection used"
+                );
                 pool
             } else {
                 let mut v = all_streams;
                 v.truncate(1);
+                debug!("auto-play: no device profile, serving first candidate");
                 v
             };
             (v, None)

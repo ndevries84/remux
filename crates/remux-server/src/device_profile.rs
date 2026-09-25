@@ -933,6 +933,12 @@ impl SourceRankingContext<'_> {
                 .map(|b| b as i64),
             _ => None,
         };
+        if let Some(cap) = max_bitrate {
+            tracing::debug!(
+                max_bitrate = cap,
+                "compatibility ranking: bitrate cap applied"
+            );
+        }
         let reasons = compute_transcode_reasons(
             source,
             self.device_profile,
