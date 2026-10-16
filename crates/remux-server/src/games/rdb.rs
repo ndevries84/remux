@@ -68,6 +68,39 @@ pub struct GameMeta {
     pub region: Option<String>,
     pub year: Option<u16>,
     pub players: Option<u8>,
+    /// Description text; only LaunchBox supplies one.
+    pub overview: Option<String>,
+    /// Community rating; only LaunchBox supplies one.
+    pub rating: Option<Rating>,
+}
+
+/// A community rating on the 0 to 5 scale, kept in hundredths so the
+/// metadata stays `Eq`. Out-of-range or non-finite input is not a rating.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Rating(u16);
+
+impl Rating {
+    const MAX_HUNDREDTHS: u16 = 500;
+
+    pub fn parse(value: f64) -> Option<Self> {
+        if !value.is_finite() || !(0.0..=5.0).contains(&value) {
+            return None;
+        }
+        let h = (value * 100.0).round() as u16;
+        (h <= Self::MAX_HUNDREDTHS).then_some(Self(h))
+    }
+
+    pub fn from_hundredths(h: u16) -> Option<Self> {
+        (h <= Self::MAX_HUNDREDTHS).then_some(Self(h))
+    }
+
+    pub fn hundredths(self) -> u16 {
+        self.0
+    }
+
+    pub fn as_f64(self) -> f64 {
+        f64::from(self.0) / 100.0
+    }
 }
 
 impl GameMeta {
@@ -89,6 +122,8 @@ impl GameMeta {
         fill(&mut self.region, &other.region);
         fill(&mut self.year, &other.year);
         fill(&mut self.players, &other.players);
+        fill(&mut self.overview, &other.overview);
+        fill(&mut self.rating, &other.rating);
     }
 }
 
@@ -438,6 +473,8 @@ fn rom_stem(rom_name: &str) -> &str {
 #[derive(Debug, Default)]
 pub struct RdbIndex {
     metas: Vec<GameMeta>,
+    /// Canonical (database) name of each entry, parallel to `metas`.
+    names: Vec<Option<String>>,
     by_crc: HashMap<u32, u32>,
     by_name: HashMap<String, u32>,
 }
@@ -454,12 +491,22 @@ impl RdbIndex {
                 continue;
             }
             let mut slot: Option<u32> = None;
+            let canon = rec
+                .name
+                .clone()
+                .or_else(|| {
+                    rec.rom_name
+                        .as_deref()
+                        .map(rom_stem)
+                        .map(str::to_string)
+                });
             if let Some(crc) = rec.crc {
                 let i = idx.attach(
                     idx.by_crc
                         .get(&crc)
                         .copied(),
                     &rec.meta,
+                    &canon,
                 );
                 idx.by_crc
                     .insert(crc, i);
@@ -501,7 +548,7 @@ impl RdbIndex {
                         let i = match slot {
                             Some(i) => i,
                             None => {
-                                let i = idx.attach(None, &rec.meta);
+                                let i = idx.attach(None, &rec.meta, &canon);
                                 slot = Some(i);
                                 i
                             }
@@ -516,15 +563,25 @@ impl RdbIndex {
     }
 
     /// Merges `meta` into the entry at `existing`, or starts a new entry.
-    fn attach(&mut self, existing: Option<u32>, meta: &GameMeta) -> u32 {
+    fn attach(
+        &mut self,
+        existing: Option<u32>,
+        meta: &GameMeta,
+        name: &Option<String>,
+    ) -> u32 {
         match existing {
             Some(i) => {
                 self.metas[i as usize].fill_from(meta);
+                if self.names[i as usize].is_none() {
+                    self.names[i as usize].clone_from(name);
+                }
                 i
             }
             None => {
                 self.metas
                     .push(meta.clone());
+                self.names
+                    .push(name.clone());
                 (self
                     .metas
                     .len()
@@ -541,13 +598,32 @@ impl RdbIndex {
     /// Best match for a game: the first CRC that is known, else the first
     /// normalized name (see [`normalize_name`]) that is, else (only when
     /// `allow_prefix`) the unambiguous closest prefix relative of a name.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn lookup(
         &self,
         crcs: &[u32],
         names: &[String],
         allow_prefix: bool,
     ) -> Option<GameMeta> {
-        let pick = |i: &u32| Some(self.metas[*i as usize].clone());
+        self.lookup_named(crcs, names, allow_prefix)
+            .map(|(m, _)| m)
+    }
+
+    /// [`lookup`](Self::lookup) that also returns the matched entry's
+    /// canonical database name (cleaner than a file name, so a good key for
+    /// other databases).
+    pub fn lookup_named(
+        &self,
+        crcs: &[u32],
+        names: &[String],
+        allow_prefix: bool,
+    ) -> Option<(GameMeta, Option<String>)> {
+        let pick = |i: &u32| {
+            Some((
+                self.metas[*i as usize].clone(),
+                self.names[*i as usize].clone(),
+            ))
+        };
         for crc in crcs {
             if let Some(m) = self
                 .by_crc
@@ -839,6 +915,7 @@ mod tests {
                 region: Some("USA".into()),
                 year: Some(1988),
                 players: Some(2),
+                ..Default::default()
             }
         );
         assert!(

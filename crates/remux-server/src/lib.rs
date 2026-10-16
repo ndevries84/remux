@@ -740,6 +740,20 @@ pub struct Config {
     /// images) are matched by name only.
     #[serde(default = "default_games_metadata_max_hash_bytes")]
     pub games_metadata_max_hash_bytes: u64,
+    /// Opt-in: fill game descriptions and ratings from the LaunchBox Games
+    /// Database (`Metadata.zip`, ~108 MB, downloaded in the background and
+    /// reduced to a small local index). Off by default: LaunchBox publishes no
+    /// terms for the download, so enabling it makes you responsible for them.
+    #[serde(default)]
+    pub games_launchbox_enabled: bool,
+    /// Where to fetch the LaunchBox `Metadata.zip` (an http(s) URL), or the
+    /// path of a local copy of it.
+    #[serde(default = "default_games_launchbox_url")]
+    pub games_launchbox_url: String,
+    /// Days before the LaunchBox download is revalidated (ETag, so an
+    /// unchanged archive is not fetched again).
+    #[serde(default = "default_games_launchbox_refresh_days")]
+    pub games_launchbox_refresh_days: u32,
     /// Optional JSON file holding admin default Moonfin settings (a flat
     /// profile object). It is the lowest-precedence layer when resolving a
     /// user's settings. A missing or invalid file means no defaults.
@@ -833,6 +847,14 @@ fn default_games_metadata_retry_secs() -> u64 {
 
 fn default_games_metadata_max_hash_bytes() -> u64 {
     64 * 1024 * 1024
+}
+
+fn default_games_launchbox_url() -> String {
+    "https://gamesdb.launchbox-app.com/Metadata.zip".to_string()
+}
+
+fn default_games_launchbox_refresh_days() -> u32 {
+    30
 }
 
 fn default_games_library_name() -> String {
@@ -1013,6 +1035,9 @@ impl Default for Config {
             games_metadata_refresh_days: default_games_metadata_refresh_days(),
             games_metadata_retry_secs: default_games_metadata_retry_secs(),
             games_metadata_max_hash_bytes: default_games_metadata_max_hash_bytes(),
+            games_launchbox_enabled: false,
+            games_launchbox_url: default_games_launchbox_url(),
+            games_launchbox_refresh_days: default_games_launchbox_refresh_days(),
             moonfin_default_settings_path: None,
             mdblist_api_key: None,
             mdblist_base_url: default_mdblist_base_url(),

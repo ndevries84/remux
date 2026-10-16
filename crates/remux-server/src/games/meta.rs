@@ -35,6 +35,7 @@ use uuid::Uuid;
 
 use super::{
     Game, GamesSnapshot,
+    launchbox::{self, LaunchBox},
     rdb::{self, GameMeta, MAX_RDB_BYTES, RdbIndex},
     resolver::Core,
     thumbs,
@@ -123,6 +124,9 @@ enum IndexState {
     Unavailable,
 }
 
+/// A CRC is still being computed.
+struct Pending;
+
 enum CrcState {
     /// Candidates known without any I/O.
     Known(Vec<u32>),
@@ -140,6 +144,7 @@ struct Inner {
     crc_inflight: DashMap<PathBuf, SharedCrcs>,
     /// `scanned_at` of the snapshot last used to pre-load databases.
     prewarmed: Mutex<Option<Instant>>,
+    launchbox: LaunchBox,
 }
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -175,6 +180,7 @@ impl Default for MetaService {
                 crc_cache: Mutex::new(HashMap::new()),
                 crc_inflight: DashMap::new(),
                 prewarmed: Mutex::new(None),
+                launchbox: LaunchBox::default(),
             }),
         }
     }
@@ -184,6 +190,24 @@ impl MetaService {
     /// Starts loading the databases of every system in `snap` (once per
     /// scan) so the first game opened already finds them ready. Never blocks.
     pub fn prewarm(&self, config: &Config, snap: &GamesSnapshot) {
+        if config.games_launchbox_enabled {
+            // Cheap and self-throttling: builds or refreshes the LaunchBox
+            // index in one background task, whatever the scan cadence.
+            let cores: HashSet<Core> = snap
+                .games
+                .iter()
+                .map(|g| g.core)
+                .collect();
+            self.inner
+                .launchbox
+                .prewarm(
+                    &self
+                        .inner
+                        .client,
+                    config,
+                    &cores,
+                );
+        }
         if !config.games_metadata_enabled {
             return;
         }
@@ -213,8 +237,14 @@ impl MetaService {
     /// Whatever is known about `game` right now. Work that is not finished
     /// within [`REQUEST_WAIT`] completes in the background; fields that are
     /// not resolved are simply absent.
+    ///
+    /// Precedence: a libretro database match supplies its fields as they are
+    /// (CRC matches are exact); LaunchBox only fills what is missing, and is
+    /// the sole source of `overview` and `rating`.
     pub async fn get(&self, config: &Config, game: &Game) -> GameMeta {
-        if !config.games_metadata_enabled {
+        let rdb_on = config.games_metadata_enabled;
+        let lb_on = config.games_launchbox_enabled;
+        if !rdb_on && !lb_on {
             return GameMeta::default();
         }
         let platforms = thumbs::platforms(game.core, game.served_file_name());
@@ -224,11 +254,56 @@ impl MetaService {
         let st = Settings::new(config);
         let deadline = tokio::time::Instant::now() + REQUEST_WAIT;
 
+        let (mut meta, canonical) = if rdb_on {
+            match self
+                .rdb_lookup(&st, game, platforms, deadline)
+                .await
+            {
+                Ok(found) => found.unwrap_or_default(),
+                // Still hashing: answer with nothing rather than guess by
+                // name while an exact match may be on its way.
+                Err(Pending) => return GameMeta::default(),
+            }
+        } else {
+            Default::default()
+        };
+
+        if lb_on {
+            let names = launchbox::name_candidates(
+                canonical.as_deref(),
+                &game.title,
+                [
+                    game.served_file_name(),
+                    game.file_name
+                        .as_str(),
+                ],
+            );
+            if let Some(lb) = self
+                .inner
+                .launchbox
+                .lookup(config, game.core, &names, deadline)
+                .await
+            {
+                meta.fill_from(&lb);
+            }
+        }
+        meta
+    }
+
+    /// The libretro match for a game and its canonical name; `Err` while a
+    /// CRC that may still produce an exact match is being computed.
+    async fn rdb_lookup(
+        &self,
+        st: &Settings,
+        game: &Game,
+        platforms: &'static [&'static str],
+        deadline: tokio::time::Instant,
+    ) -> Result<Option<(GameMeta, Option<String>)>, Pending> {
         // Start everything first so the pieces run concurrently.
-        let crcs = self.crc_state(&st, game);
+        let crcs = self.crc_state(st, game);
         let indexes: Vec<IndexState> = platforms
             .iter()
-            .map(|p| self.ensure_index(&st, p))
+            .map(|p| self.ensure_index(st, p))
             .collect();
 
         let crcs: Vec<u32> = match crcs {
@@ -240,9 +315,7 @@ impl MetaService {
                         .as_ref()
                         .clone(),
                     Ok(None) => Vec::new(),
-                    // Still hashing: answer with nothing rather than guess
-                    // by name while an exact match may be on its way.
-                    Err(_) => return GameMeta::default(),
+                    Err(_) => return Err(Pending),
                 }
             }
         };
@@ -266,11 +339,11 @@ impl MetaService {
                 IndexState::Unavailable => continue,
             };
             // Prefix guessing is only for games with no CRC to go by.
-            if let Some(m) = index.lookup(&crcs, &names, crcs.is_empty()) {
-                return m;
+            if let Some(m) = index.lookup_named(&crcs, &names, crcs.is_empty()) {
+                return Ok(Some(m));
             }
         }
-        GameMeta::default()
+        Ok(None)
     }
 
     // -- databases ---------------------------------------------------------

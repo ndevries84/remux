@@ -3,6 +3,7 @@
 //! "Games" user view. HTTP endpoints live elsewhere.
 
 pub mod archive;
+pub mod launchbox;
 pub mod meta;
 pub mod rdb;
 pub mod resolver;

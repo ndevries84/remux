@@ -95,7 +95,7 @@ struct GameDetailDto {
     backend_override_supported: bool,
     size_bytes: u64,
     bios: Vec<BiosDto>,
-    // Metadata from the libretro databases; each field is left out until it
+    // Metadata from the libretro databases (and LaunchBox, when enabled); each field is left out until it
     // is known (the client treats absent and empty alike).
     #[serde(skip_serializing_if = "Option::is_none")]
     genre: Option<String>,
@@ -111,6 +111,12 @@ struct GameDetailDto {
     year: Option<u16>,
     #[serde(skip_serializing_if = "Option::is_none")]
     players: Option<u8>,
+    // LaunchBox only (opt-in).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    overview: Option<String>,
+    /// 0 to 5.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    rating: Option<f64>,
 }
 
 impl From<&Game> for GameSummaryDto {
@@ -314,6 +320,10 @@ pub async fn games_detail(
         region: meta.region,
         year: meta.year,
         players: meta.players,
+        overview: meta.overview,
+        rating: meta
+            .rating
+            .map(|r| r.as_f64()),
     })
     .into_response()
 }
@@ -2857,5 +2867,544 @@ mod tests {
                 .join(NES_RDB_FILE)
                 .exists()
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // LaunchBox descriptions (opt-in)
+    // -----------------------------------------------------------------------
+
+    const LB_PATH: &str = "/Metadata.zip";
+    const LB_DIR: &str = "games/meta/launchbox";
+    const NES: &str = "Nintendo Entertainment System";
+
+    fn lb_game(platform: &str, name: &str, extra: &str) -> String {
+        format!(
+            "<Game><Name>{name}</Name><Platform>{platform}</Platform>{extra}</Game>"
+        )
+    }
+
+    fn lb_zip(games: &[String]) -> Vec<u8> {
+        let xml = format!(
+            "<?xml version=\"1.0\" encoding=\"utf-8\" standalone=\"yes\"?>\n<LaunchBox>{}\
+             <GameAlternateName><AlternateName>ignored</AlternateName></GameAlternateName>\
+             </LaunchBox>",
+            games.concat()
+        );
+        zip_bytes(&[("Metadata.xml", xml.as_bytes())])
+    }
+
+    fn lb_mock<'a>(
+        mock: &'a httpmock::MockServer,
+        zip: Vec<u8>,
+        etag: &str,
+    ) -> httpmock::Mock<'a> {
+        let etag = etag.to_string();
+        mock.mock(move |when, then| {
+            when.method(httpmock::Method::GET)
+                .path(LB_PATH);
+            then.status(200)
+                .header("etag", etag.as_str())
+                .body(zip);
+        })
+    }
+
+    async fn lb_harness(
+        base: String,
+        zip_url: String,
+        tweak: impl FnOnce(&mut Config) + Send + 'static,
+    ) -> Harness {
+        meta_harness(base, move |c| {
+            c.games_launchbox_enabled = true;
+            c.games_launchbox_url = zip_url;
+            tweak(c);
+        })
+        .await
+    }
+
+    fn lb_dir(h: &Harness) -> std::path::PathBuf {
+        h.data
+            .path()
+            .join(LB_DIR)
+    }
+
+    fn mario_lb() -> String {
+        lb_game(
+            NES,
+            "Super Mario",
+            "<Overview><![CDATA[Run & jump <fast> through the Mushroom Kingdom.]]> \
+             Rescue the princess &amp; save the day. Caf&#233;.</Overview>\
+             <Genres>Action</Genres><Developer>Nintendo EAD</Developer>\
+             <Publisher>Nintendo</Publisher>\
+             <ReleaseDate>1985-09-13T00:00:00-07:00</ReleaseDate>\
+             <MaxPlayers>2</MaxPlayers><CommunityRating>4.25</CommunityRating>\
+             <CommunityRatingCount>120</CommunityRatingCount>",
+        )
+    }
+
+    /// Waits until the background build is over (success or failure): the
+    /// partial download is gone and at least `hits` requests were made.
+    async fn lb_settled(
+        dir: &std::path::Path,
+        mock_hits: impl Fn() -> usize,
+        hits: usize,
+    ) {
+        for _ in 0..400 {
+            let leftovers = std::fs::read_dir(dir)
+                .map(|rd| {
+                    rd.flatten()
+                        .any(|e| {
+                            e.file_name()
+                                .to_string_lossy()
+                                .starts_with("download-")
+                        })
+                })
+                .unwrap_or(false);
+            if mock_hits() >= hits && !leftovers {
+                // Give the build task a beat to publish its result.
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        panic!("LaunchBox update never settled");
+    }
+
+    #[tokio::test]
+    async fn launchbox_overview_and_rating_reach_the_detail() {
+        let mock = httpmock::MockServer::start_async().await;
+        let hit = lb_mock(
+            &mock,
+            lb_zip(&[
+                mario_lb(),
+                // Not rated: overview only, no rating.
+                lb_game(
+                    NES,
+                    "Zelda",
+                    "<Overview>Hyrule.</Overview><CommunityRating>3.0</CommunityRating>\
+                     <CommunityRatingCount>0</CommunityRatingCount>",
+                ),
+                // Systems the library has no games for are not kept.
+                lb_game("Super Nintendo Entertainment System", "Super Mario", ""),
+                lb_game("Arcade", "Super Mario", ""),
+            ]),
+            "\"v1\"",
+        );
+        let h = lb_harness(mock.base_url(), mock.url(LB_PATH), |_| {}).await;
+        let id = game_id(&h, "Super Mario (U)").await;
+
+        let d = detail_until(&h, &id, "overview").await;
+        assert_eq!(
+            d["overview"],
+            "Run & jump <fast> through the Mushroom Kingdom. \
+             Rescue the princess & save the day. Café."
+        );
+        // Gap fields come from LaunchBox when no libretro data is around.
+        assert_eq!(d["genre"], "Action");
+        assert_eq!(d["developer"], "Nintendo EAD");
+        assert_eq!(d["publisher"], "Nintendo");
+        assert_eq!(d["year"], json!(1985));
+        assert_eq!(d["players"], json!(2));
+        assert_eq!(d["rating"], json!(4.25));
+        assert!(
+            d.get("region")
+                .is_none()
+        );
+
+        let zelda = game_id(&h, "Zelda").await;
+        let z = detail_until(&h, &zelda, "overview").await;
+        assert_eq!(z["overview"], "Hyrule.");
+        assert!(
+            z.get("rating")
+                .is_none()
+        );
+
+        // The list is untouched.
+        let list = get_json(&h, &format!("/Moonfin/Games/{}/Games", h.lib)).await;
+        for g in list
+            .as_array()
+            .unwrap()
+        {
+            assert_no_meta(g);
+        }
+
+        // Only the systems in the library were kept (NES and PlayStation).
+        hit.assert_hits(1);
+        let stamp: Value = serde_json::from_slice(
+            &std::fs::read(lb_dir(&h).join("stamp.json")).unwrap(),
+        )
+        .unwrap();
+        let gen_dir = lb_dir(&h).join(format!(
+            "gen-{}",
+            stamp["generation"]
+                .as_str()
+                .unwrap()
+        ));
+        let mut files: Vec<String> = std::fs::read_dir(&gen_dir)
+            .unwrap()
+            .flatten()
+            .map(|e| {
+                e.file_name()
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect();
+        files.sort();
+        assert_eq!(files, ["nes.json", "psx.json"]);
+    }
+
+    #[tokio::test]
+    async fn launchbox_matches_by_the_rdb_canonical_name_and_rdb_wins_fields() {
+        let mock = httpmock::MockServer::start_async().await;
+        let file = b"an oddly named dump";
+        rdb_mock(
+            &mock,
+            build_rdb(&[Rec::named("Super Mario (USA)")
+                .crc(crc32fast::hash(file))
+                .genre("Platform")
+                .region("USA")
+                .year(1986)]),
+        );
+        lb_mock(&mock, lb_zip(&[mario_lb()]), "\"v1\"");
+        let h = lb_harness(mock.base_url(), mock.url(LB_PATH), |_| {}).await;
+        std::fs::write(nes_dir(&h).join("weird.nes"), file).unwrap();
+        let id = game_id(&h, "weird").await;
+
+        let d = detail_until(&h, &id, "overview").await;
+        // The file name says nothing; the CRC-matched canonical name does.
+        assert!(
+            d["overview"]
+                .as_str()
+                .unwrap()
+                .starts_with("Run & jump")
+        );
+        // rdb wins what it has (genre, year), LaunchBox fills the rest, and
+        // region only ever comes from rdb.
+        assert_eq!(d["genre"], "Platform");
+        assert_eq!(d["year"], json!(1986));
+        assert_eq!(d["region"], "USA");
+        assert_eq!(d["publisher"], "Nintendo");
+        assert_eq!(d["rating"], json!(4.25));
+    }
+
+    #[tokio::test]
+    async fn launchbox_stays_off_by_default() {
+        let mock = httpmock::MockServer::start_async().await;
+        let hit = lb_mock(&mock, lb_zip(&[mario_lb()]), "\"v1\"");
+        rdb_mock(&mock, build_rdb(&[mario_record()]));
+        // The URL is configured but the switch is not flipped.
+        let h = meta_harness(mock.base_url(), {
+            let url = mock.url(LB_PATH);
+            move |c| c.games_launchbox_url = url
+        })
+        .await;
+        let id = game_id(&h, "Super Mario (U)").await;
+        let d = detail_until(&h, &id, "genre").await;
+        for _ in 0..5 {
+            detail(&h, &id).await;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        hit.assert_hits(0);
+        assert!(
+            d.get("overview")
+                .is_none()
+        );
+        assert!(!lb_dir(&h).exists());
+    }
+
+    #[tokio::test]
+    async fn launchbox_alone_needs_no_libretro_metadata() {
+        let mock = httpmock::MockServer::start_async().await;
+        lb_mock(&mock, lb_zip(&[mario_lb()]), "\"v1\"");
+        let h = lb_harness(mock.base_url(), mock.url(LB_PATH), |c| {
+            c.games_metadata_enabled = false;
+        })
+        .await;
+        let id = game_id(&h, "Super Mario (U)").await;
+        assert!(
+            detail_until(&h, &id, "overview").await["overview"]
+                .as_str()
+                .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn launchbox_bad_data_gives_no_data_and_backs_off() {
+        let bad: [(&str, Vec<u8>); 3] = [
+            (
+                "malformed xml",
+                zip_bytes(&[(
+                    "Metadata.xml",
+                    b"<LaunchBox><Game><Name>x</Name><Overview>oops</Game></LaunchBox>"
+                        .as_slice(),
+                )]),
+            ),
+            ("not a zip", b"<html>nope</html>".to_vec()),
+            (
+                "no Metadata.xml",
+                zip_bytes(&[("Other.xml", b"<LaunchBox/>".as_slice())]),
+            ),
+        ];
+        for (what, body) in bad {
+            let mock = httpmock::MockServer::start_async().await;
+            let hit = lb_mock(&mock, body, "\"v1\"");
+            let h = lb_harness(mock.base_url(), mock.url(LB_PATH), |_| {}).await;
+            let id = game_id(&h, "Super Mario (U)").await;
+            lb_settled(&lb_dir(&h), || hit.hits(), 1).await;
+
+            let d = detail(&h, &id).await;
+            assert!(
+                d.get("overview")
+                    .is_none(),
+                "{what}: {d}"
+            );
+            assert!(
+                !lb_dir(&h)
+                    .join("stamp.json")
+                    .exists(),
+                "{what}: stamp written"
+            );
+            let gens = std::fs::read_dir(lb_dir(&h))
+                .unwrap()
+                .flatten()
+                .filter(|e| {
+                    e.file_name()
+                        .to_string_lossy()
+                        .starts_with("gen-")
+                })
+                .count();
+            assert_eq!(gens, 0, "{what}: partial generation left behind");
+
+            // Backed off: more requests inside the window cause no new
+            // download.
+            for _ in 0..3 {
+                detail(&h, &id).await;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            hit.assert_hits(1);
+        }
+    }
+
+    #[tokio::test]
+    async fn launchbox_retries_after_the_backoff() {
+        let mock = httpmock::MockServer::start_async().await;
+        let hit = mock.mock(|when, then| {
+            when.method(httpmock::Method::GET)
+                .path(LB_PATH);
+            then.status(500);
+        });
+        let h = lb_harness(mock.base_url(), mock.url(LB_PATH), |c| {
+            c.games_metadata_retry_secs = 1
+        })
+        .await;
+        let id = game_id(&h, "Super Mario (U)").await;
+        lb_settled(&lb_dir(&h), || hit.hits(), 1).await;
+        tokio::time::sleep(std::time::Duration::from_millis(1300)).await;
+        detail(&h, &id).await;
+        lb_settled(&lb_dir(&h), || hit.hits(), 2).await;
+    }
+
+    #[tokio::test]
+    async fn launchbox_index_survives_restart_without_reparsing() {
+        let mock = httpmock::MockServer::start_async().await;
+        let hit = lb_mock(&mock, lb_zip(&[mario_lb()]), "\"v1\"");
+        let first = lb_harness(mock.base_url(), mock.url(LB_PATH), |_| {}).await;
+        let id = game_id(&first, "Super Mario (U)").await;
+        detail_until(&first, &id, "overview").await;
+        hit.assert_hits(1);
+        let stamp = lb_dir(&first).join("stamp.json");
+        let before = std::fs::metadata(&stamp)
+            .unwrap()
+            .modified()
+            .unwrap();
+        let data = first
+            .data
+            .path()
+            .to_path_buf();
+
+        // A second service instance on the same data dir.
+        let second = lb_harness(mock.base_url(), mock.url(LB_PATH), move |c| {
+            c.data_dir = data
+        })
+        .await;
+        let id = game_id(&second, "Super Mario (U)").await;
+        let d = detail_until(&second, &id, "overview").await;
+        assert_eq!(d["rating"], json!(4.25));
+        for _ in 0..3 {
+            detail(&second, &id).await;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        hit.assert_hits(1);
+        assert_eq!(
+            std::fs::metadata(&stamp)
+                .unwrap()
+                .modified()
+                .unwrap(),
+            before
+        );
+    }
+
+    /// Ages the stamp so the next start considers the data due for a check.
+    fn age_stamp(dir: &std::path::Path) {
+        let path = dir.join("stamp.json");
+        let mut v: Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        v["checked_at"] = json!(1);
+        std::fs::write(&path, serde_json::to_vec(&v).unwrap()).unwrap();
+    }
+
+    #[tokio::test]
+    async fn launchbox_refresh_revalidates_with_etag_and_rebuilds_on_change() {
+        let mock = httpmock::MockServer::start_async().await;
+        let mut first_hit = lb_mock(&mock, lb_zip(&[mario_lb()]), "\"v1\"");
+        let first = lb_harness(mock.base_url(), mock.url(LB_PATH), |_| {}).await;
+        let id = game_id(&first, "Super Mario (U)").await;
+        detail_until(&first, &id, "overview").await;
+        let data = first
+            .data
+            .path()
+            .to_path_buf();
+        let generation_of = |dir: &std::path::Path| -> String {
+            let v: Value =
+                serde_json::from_slice(&std::fs::read(dir.join("stamp.json")).unwrap())
+                    .unwrap();
+            v["generation"]
+                .as_str()
+                .unwrap()
+                .to_string()
+        };
+        let gen1 = generation_of(&lb_dir(&first));
+
+        // Stale + unchanged upstream: conditional request, 304, no rebuild.
+        first_hit.delete();
+        let mut not_modified = mock.mock(|when, then| {
+            when.method(httpmock::Method::GET)
+                .path(LB_PATH)
+                .header("if-none-match", "\"v1\"");
+            then.status(304);
+        });
+        age_stamp(&lb_dir(&first));
+        let d2 = data.clone();
+        let second =
+            lb_harness(mock.base_url(), mock.url(LB_PATH), move |c| c.data_dir = d2)
+                .await;
+        let id = game_id(&second, "Super Mario (U)").await;
+        lb_settled(&data.join(LB_DIR), || not_modified.hits(), 1).await;
+        assert!(
+            detail_until(&second, &id, "overview").await["overview"]
+                .as_str()
+                .is_some()
+        );
+        assert_eq!(generation_of(&data.join(LB_DIR)), gen1);
+        let stamp: Value = serde_json::from_slice(
+            &std::fs::read(
+                data.join(LB_DIR)
+                    .join("stamp.json"),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert!(
+            stamp["checked_at"]
+                .as_u64()
+                .unwrap()
+                > 1000
+        );
+
+        // Stale + changed upstream: full download, atomic swap, old
+        // generation removed, new text served.
+        not_modified.delete();
+        let changed = mock.mock(|when, then| {
+            when.method(httpmock::Method::GET)
+                .path(LB_PATH)
+                .header("if-none-match", "\"v1\"");
+            then.status(200)
+                .header("etag", "\"v2\"")
+                .body(lb_zip(&[lb_game(
+                    NES,
+                    "Super Mario",
+                    "<Overview>Second edition.</Overview>",
+                )]));
+        });
+        age_stamp(&data.join(LB_DIR));
+        let d3 = data.clone();
+        let third =
+            lb_harness(mock.base_url(), mock.url(LB_PATH), move |c| c.data_dir = d3)
+                .await;
+        let id = game_id(&third, "Super Mario (U)").await;
+        lb_settled(&data.join(LB_DIR), || changed.hits(), 1).await;
+        let mut overview = Value::Null;
+        for _ in 0..200 {
+            overview = detail(&third, &id).await["overview"].clone();
+            if overview == "Second edition." {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        assert_eq!(overview, "Second edition.");
+        let gen2 = generation_of(&data.join(LB_DIR));
+        assert_ne!(gen2, gen1);
+        assert!(
+            !data
+                .join(LB_DIR)
+                .join(format!("gen-{gen1}"))
+                .exists()
+        );
+    }
+
+    #[tokio::test]
+    async fn launchbox_rebuilds_when_the_library_gains_a_system() {
+        let mock = httpmock::MockServer::start_async().await;
+        let hit = lb_mock(&mock, lb_zip(&[mario_lb()]), "\"v1\"");
+        let first = lb_harness(mock.base_url(), mock.url(LB_PATH), |_| {}).await;
+        let id = game_id(&first, "Super Mario (U)").await;
+        detail_until(&first, &id, "overview").await;
+        let data = first
+            .data
+            .path()
+            .to_path_buf();
+        // Pretend the index was built before PlayStation games existed.
+        let path = lb_dir(&first).join("stamp.json");
+        let mut v: Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        v["cores"] = json!(["nes"]);
+        std::fs::write(&path, serde_json::to_vec(&v).unwrap()).unwrap();
+
+        let d2 = data.clone();
+        let second =
+            lb_harness(mock.base_url(), mock.url(LB_PATH), move |c| c.data_dir = d2)
+                .await;
+        game_id(&second, "Super Mario (U)").await;
+        lb_settled(&data.join(LB_DIR), || hit.hits(), 2).await;
+        let v: Value = serde_json::from_slice(
+            &std::fs::read(
+                data.join(LB_DIR)
+                    .join("stamp.json"),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(v["cores"], json!(["nes", "psx"]));
+    }
+
+    #[tokio::test]
+    async fn launchbox_accepts_a_local_zip() {
+        let dir = tempfile::tempdir().unwrap();
+        let zip = dir
+            .path()
+            .join("Metadata.zip");
+        std::fs::write(&zip, lb_zip(&[mario_lb()])).unwrap();
+        // Nothing listens on this base: any network attempt would fail.
+        let h = lb_harness(
+            "http://127.0.0.1:9".to_string(),
+            zip.to_string_lossy()
+                .into_owned(),
+            |c| c.games_metadata_enabled = false,
+        )
+        .await;
+        let id = game_id(&h, "Super Mario (U)").await;
+        let d = detail_until(&h, &id, "overview").await;
+        assert_eq!(d["rating"], json!(4.25));
+        // A local source is read in place, never copied or deleted.
+        assert!(zip.is_file());
     }
 }
