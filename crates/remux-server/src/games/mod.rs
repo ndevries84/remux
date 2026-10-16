@@ -2,6 +2,7 @@
 //! resolution, on-disk discovery, an in-memory id index and the synthetic
 //! "Games" user view. HTTP endpoints live elsewhere.
 
+pub mod archive;
 pub mod resolver;
 pub mod scanner;
 pub mod thumbs;

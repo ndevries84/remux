@@ -265,10 +265,17 @@ pub async fn games_detail(
                 .collect()
         })
         .unwrap_or_default();
+    // The ROM endpoint unpacks single-ROM archives, so the detail names what
+    // the client will actually receive (the list keeps the archive's name,
+    // like Moonbase).
+    let mut summary = GameSummaryDto::from(game);
+    summary.file_name = game
+        .served_file_name()
+        .to_string();
     Json(GameDetailDto {
-        summary: game.into(),
+        summary,
         backend_override_supported: false,
-        size_bytes: game.size_bytes,
+        size_bytes: game.served_size_bytes(),
         bios,
     })
     .into_response()
@@ -446,9 +453,15 @@ pub async fn games_rom(
         requested = params
             .get("file_name")
             .map(String::as_str),
-        served = %game.file_name,
+        served = %game.served_file_name(),
         "games: rom request"
     );
+    if game
+        .inner_rom
+        .is_some()
+    {
+        return serve_unpacked(&state, game, req).await;
+    }
     serve_file(
         game.path
             .clone(),
@@ -456,6 +469,42 @@ pub async fn games_rom(
         req,
     )
     .await
+}
+
+/// Serves the ROM inside a `.zip`/`.7z` (non-arcade cores) from the unpack
+/// cache, extracting it on first use. Range/HEAD behave like any plain file.
+async fn serve_unpacked(state: &AppState, game: &Game, req: Request<Body>) -> Response {
+    let config = &state
+        .ctx
+        .config;
+    let cache_root = config
+        .data_dir
+        .join("games")
+        .join("extracted");
+    match games::archive::ensure_unpacked(
+        &cache_root,
+        &game.id,
+        &game.path,
+        config.games_archive_max_extract_bytes,
+    )
+    .await
+    {
+        Ok(rom) => serve_file(rom.path, &rom.name, req).await,
+        Err(games::archive::ArchiveError::TooLarge { max, .. }) => (
+            StatusCode::PAYLOAD_TOO_LARGE,
+            Json(serde_json::json!({
+                "error": format!(
+                    "The archive entry exceeds the {} MB limit for extracted ROMs.",
+                    max / (1024 * 1024)
+                )
+            })),
+        )
+            .into_response(),
+        Err(e) => {
+            warn!(game = %game.id, error = %e, "games: cannot unpack archive ROM");
+            StatusCode::NOT_FOUND.into_response()
+        }
+    }
 }
 
 #[get("/moonfin/games/{lib}/bios/{token}")]
@@ -1240,6 +1289,342 @@ mod tests {
                 "/Moonfin/Games/{lib}/Rom/..%2F..%2Fetc%2Fpasswd?ApiKey={}",
                 h.token
             ))
+            .expect_failure()
+            .await
+            .assert_status_not_found();
+    }
+
+    fn zip_bytes(entries: &[(&str, &[u8])]) -> Vec<u8> {
+        use std::io::Write;
+        let mut w = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        let opts = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Deflated);
+        for (name, data) in entries {
+            w.start_file(*name, opts)
+                .unwrap();
+            w.write_all(data)
+                .unwrap();
+        }
+        w.finish()
+            .unwrap()
+            .into_inner()
+    }
+
+    /// Harness with an extra games root holding archives.
+    async fn archive_harness(
+        build: impl FnOnce(&std::path::Path),
+        tweak: impl FnOnce(&mut Config),
+    ) -> (Harness, tempfile::TempDir) {
+        let extra = tempfile::tempdir().unwrap();
+        build(extra.path());
+        let root = extra
+            .path()
+            .to_string_lossy()
+            .into_owned();
+        let h = harness_with(true, move |c| {
+            c.games_roots
+                .push(root);
+            tweak(c);
+        })
+        .await;
+        (h, extra)
+    }
+
+    fn rom_url(h: &Harness, id: &str, name: &str) -> String {
+        format!(
+            "/Moonfin/Games/{}/Rom/{id}/{name}?ApiKey={}",
+            h.lib, h.token
+        )
+    }
+
+    fn extracted_dir(h: &Harness, id: &str) -> std::path::PathBuf {
+        h.data
+            .path()
+            .join("games/extracted")
+            .join(id)
+    }
+
+    #[tokio::test]
+    async fn single_rom_zip_is_unpacked_and_cached() {
+        let inner: Vec<u8> = (0..200u8).collect();
+        let (h, _extra) = archive_harness(
+            |r| {
+                std::fs::create_dir_all(r.join("SNES/Hack Pack")).unwrap();
+                std::fs::write(
+                    r.join("SNES/Hack Pack/pack.zip"),
+                    zip_bytes(&[
+                        ("readme.txt", &[b'r'; 900]),
+                        ("sub/Hack Game.sfc", &inner),
+                    ]),
+                )
+                .unwrap();
+            },
+            |_| {},
+        )
+        .await;
+        let lib = h
+            .lib
+            .clone();
+        let list =
+            get_json(&h, &format!("/Moonfin/Games/{lib}/Games?system=snes")).await;
+        let id = id_of(&list, "Hack Pack");
+        // Like Moonbase, the list keeps the archive's name; the detail names
+        // what the ROM endpoint actually sends.
+        assert_eq!(
+            list.as_array()
+                .unwrap()
+                .iter()
+                .find(|g| g["id"] == id.as_str())
+                .unwrap()["fileName"],
+            "pack.zip"
+        );
+        let detail = get_json(&h, &format!("/Moonfin/Games/{lib}/Games/{id}")).await;
+        assert_eq!(detail["fileName"], "Hack Game.sfc");
+        assert_eq!(detail["sizeBytes"], 200);
+        assert_eq!(detail["core"], "snes");
+        assert!(
+            !extracted_dir(&h, &id).exists(),
+            "nothing is unpacked before the first ROM request"
+        );
+
+        let url = rom_url(&h, &id, "Hack%20Game.sfc");
+        let full = h
+            .server
+            .get(&url)
+            .await;
+        assert_eq!(
+            full.as_bytes()
+                .as_ref(),
+            inner.as_slice()
+        );
+        assert_eq!(
+            full.header(header::CONTENT_TYPE),
+            "application/octet-stream"
+        );
+        let disp = full
+            .header(header::CONTENT_DISPOSITION)
+            .to_str()
+            .unwrap()
+            .to_string();
+        assert!(disp.contains("filename=\"Hack Game.sfc\""), "{disp}");
+        let cached = extracted_dir(&h, &id).join("Hack Game.sfc");
+        assert_eq!(std::fs::read(&cached).unwrap(), inner);
+        let stamp = std::fs::metadata(&cached)
+            .unwrap()
+            .modified()
+            .unwrap();
+
+        let part = h
+            .server
+            .get(&url)
+            .add_header(header::RANGE, http::HeaderValue::from_static("bytes=10-19"))
+            .await;
+        assert_eq!(part.status_code(), http::StatusCode::PARTIAL_CONTENT);
+        assert_eq!(
+            part.as_bytes()
+                .as_ref(),
+            &inner[10..=19]
+        );
+        assert_eq!(part.header(header::CONTENT_RANGE), "bytes 10-19/200");
+        let head = h
+            .server
+            .method(http::Method::HEAD, &url)
+            .await;
+        assert_eq!(head.status_code(), http::StatusCode::OK);
+        assert_eq!(head.header(header::CONTENT_LENGTH), "200");
+
+        // Later requests are served from the cache, not re-extracted.
+        assert_eq!(
+            std::fs::metadata(&cached)
+                .unwrap()
+                .modified()
+                .unwrap(),
+            stamp
+        );
+    }
+
+    #[tokio::test]
+    async fn multi_rom_zip_serves_first_known_rom() {
+        let (h, _extra) = archive_harness(
+            |r| {
+                std::fs::create_dir_all(r.join("GBA")).unwrap();
+                std::fs::write(
+                    r.join("GBA/Duo.zip"),
+                    zip_bytes(&[
+                        ("notes.nfo", b"info"),
+                        ("First.gba", b"first!"),
+                        ("Second.gba", b"second-and-longer"),
+                    ]),
+                )
+                .unwrap();
+            },
+            |_| {},
+        )
+        .await;
+        let lib = h
+            .lib
+            .clone();
+        let list =
+            get_json(&h, &format!("/Moonfin/Games/{lib}/Games?system=gba")).await;
+        let id = id_of(&list, "Duo");
+        let detail = get_json(&h, &format!("/Moonfin/Games/{lib}/Games/{id}")).await;
+        assert_eq!(detail["fileName"], "First.gba");
+        assert_eq!(detail["sizeBytes"], 6);
+        let rom = h
+            .server
+            .get(&rom_url(&h, &id, "First.gba"))
+            .await;
+        assert_eq!(
+            rom.as_bytes()
+                .as_ref(),
+            b"first!"
+        );
+    }
+
+    #[tokio::test]
+    async fn sevenz_rom_is_unpacked() {
+        let (h, _extra) = archive_harness(
+            |r| {
+                std::fs::create_dir_all(r.join("GBA")).unwrap();
+                let mut w = sevenz_rust2::ArchiveWriter::create(r.join("GBA/Kirby.7z"))
+                    .unwrap();
+                w.push_archive_entry(
+                    sevenz_rust2::ArchiveEntry::new_file("Kirby.gba"),
+                    Some(b"kirby-rom-data".as_slice()),
+                )
+                .unwrap();
+                w.finish()
+                    .unwrap();
+            },
+            |_| {},
+        )
+        .await;
+        let lib = h
+            .lib
+            .clone();
+        let list =
+            get_json(&h, &format!("/Moonfin/Games/{lib}/Games?system=gba")).await;
+        let id = id_of(&list, "Kirby");
+        let detail = get_json(&h, &format!("/Moonfin/Games/{lib}/Games/{id}")).await;
+        assert_eq!(detail["fileName"], "Kirby.gba");
+        assert_eq!(detail["sizeBytes"], 14);
+        let rom = h
+            .server
+            .get(&rom_url(&h, &id, "Kirby.gba"))
+            .await;
+        assert_eq!(
+            rom.as_bytes()
+                .as_ref(),
+            b"kirby-rom-data"
+        );
+    }
+
+    #[tokio::test]
+    async fn arcade_zip_is_served_raw() {
+        let zip = zip_bytes(&[("pacman.6e", &[1u8; 64]), ("pacman.6f", &[2u8; 64])]);
+        let expected = zip.clone();
+        let (h, _extra) = archive_harness(
+            move |r| {
+                std::fs::create_dir_all(r.join("Arcade")).unwrap();
+                std::fs::write(r.join("Arcade/pacman.zip"), &zip).unwrap();
+            },
+            |_| {},
+        )
+        .await;
+        let lib = h
+            .lib
+            .clone();
+        let list =
+            get_json(&h, &format!("/Moonfin/Games/{lib}/Games?system=arcade")).await;
+        let id = id_of(&list, "pacman");
+        let detail = get_json(&h, &format!("/Moonfin/Games/{lib}/Games/{id}")).await;
+        assert_eq!(detail["fileName"], "pacman.zip");
+        assert_eq!(detail["sizeBytes"], expected.len());
+        let rom = h
+            .server
+            .get(&rom_url(&h, &id, "pacman.zip"))
+            .await;
+        assert_eq!(
+            rom.as_bytes()
+                .as_ref(),
+            expected.as_slice()
+        );
+        assert!(!extracted_dir(&h, &id).exists());
+    }
+
+    #[tokio::test]
+    async fn corrupt_archive_is_listed_and_served_as_is() {
+        let (h, _extra) = archive_harness(
+            |r| {
+                std::fs::create_dir_all(r.join("SNES")).unwrap();
+                std::fs::write(r.join("SNES/Broken.zip"), b"definitely not a zip")
+                    .unwrap();
+            },
+            |_| {},
+        )
+        .await;
+        let lib = h
+            .lib
+            .clone();
+        let list =
+            get_json(&h, &format!("/Moonfin/Games/{lib}/Games?system=snes")).await;
+        let id = id_of(&list, "Broken");
+        let detail = get_json(&h, &format!("/Moonfin/Games/{lib}/Games/{id}")).await;
+        assert_eq!(detail["fileName"], "Broken.zip");
+        assert_eq!(detail["sizeBytes"], 20);
+        let rom = h
+            .server
+            .get(&rom_url(&h, &id, "Broken.zip"))
+            .await;
+        assert_eq!(
+            rom.as_bytes()
+                .as_ref(),
+            b"definitely not a zip"
+        );
+    }
+
+    #[tokio::test]
+    async fn archive_that_goes_bad_after_scan_is_404_and_oversize_is_413() {
+        let (h, extra) = archive_harness(
+            |r| {
+                std::fs::create_dir_all(r.join("SNES")).unwrap();
+                std::fs::write(
+                    r.join("SNES/Fine.zip"),
+                    zip_bytes(&[("fine.sfc", &[9u8; 100])]),
+                )
+                .unwrap();
+                std::fs::write(
+                    r.join("SNES/Big.zip"),
+                    zip_bytes(&[("big.sfc", &[9u8; 5000])]),
+                )
+                .unwrap();
+            },
+            |c| c.games_archive_max_extract_bytes = 1000,
+        )
+        .await;
+        let lib = h
+            .lib
+            .clone();
+        let list =
+            get_json(&h, &format!("/Moonfin/Games/{lib}/Games?system=snes")).await;
+        let big = id_of(&list, "Big");
+        h.server
+            .get(&rom_url(&h, &big, "big.sfc"))
+            .expect_failure()
+            .await
+            .assert_status(http::StatusCode::PAYLOAD_TOO_LARGE);
+        assert!(!extracted_dir(&h, &big).exists());
+
+        let fine = id_of(&list, "Fine");
+        std::fs::write(
+            extra
+                .path()
+                .join("SNES/Fine.zip"),
+            b"now corrupt and a different size",
+        )
+        .unwrap();
+        h.server
+            .get(&rom_url(&h, &fine, "fine.sfc"))
             .expect_failure()
             .await
             .assert_status_not_found();

@@ -164,8 +164,7 @@ const SYSTEM_NAME_TO_CORE: &[(&str, Core)] = &[
 ];
 
 const BIOS_EXTENSIONS: &[&str] = &["bin", "bios", "rom", "img", "sys", "bs"];
-// TODO(games spike): archives are served as a single opaque file; extraction
-// of the inner ROM (needed for non-arcade cores) is not implemented yet.
+// Archives for non-arcade cores are unpacked on demand (see `archive`).
 const ARCHIVE_EXTENSIONS: &[&str] = &["zip", "7z"];
 
 fn extension_lower(path: &Path) -> Option<String> {

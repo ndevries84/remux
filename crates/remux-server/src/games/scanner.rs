@@ -24,7 +24,10 @@ use serde::Serialize;
 use tracing::{debug, warn};
 use uuid::Uuid;
 
-use super::resolver::{self, Core};
+use super::{
+    archive::{self, ArchiveRom},
+    resolver::{self, Core},
+};
 
 #[derive(Debug, Clone, Serialize)]
 pub struct Game {
@@ -37,6 +40,35 @@ pub struct Game {
     #[serde(skip)]
     pub path: PathBuf,
     pub size_bytes: u64,
+    /// The single ROM inside a `.zip`/`.7z` for a non-arcade core. The server
+    /// unpacks it on demand, so this is what clients actually receive.
+    /// `None` for plain ROMs, arcade archives (served intact) and archives
+    /// that could not be inspected or hold no ROM (served as-is).
+    #[serde(skip)]
+    pub inner_rom: Option<ArchiveRom>,
+}
+
+impl Game {
+    /// File name the ROM endpoint serves (the inner ROM's for unpacked archives).
+    pub fn served_file_name(&self) -> &str {
+        self.inner_rom
+            .as_ref()
+            .map_or(
+                self.file_name
+                    .as_str(),
+                |r| {
+                    r.name
+                        .as_str()
+                },
+            )
+    }
+
+    /// Size of what the ROM endpoint serves.
+    pub fn served_size_bytes(&self) -> u64 {
+        self.inner_rom
+            .as_ref()
+            .map_or(self.size_bytes, |r| r.size)
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -191,6 +223,23 @@ struct RawGame {
     path: PathBuf,
     size: u64,
     title: String,
+    inner_rom: Option<ArchiveRom>,
+}
+
+/// Cheap archive listing (no extraction) for archives that will be unpacked,
+/// i.e. any archive outside the arcade family. Failures are not fatal: the
+/// game stays listed and its archive is served as-is.
+fn inspect_archive(path: &Path, name_core: Option<Core>) -> Option<ArchiveRom> {
+    if !resolver::is_archive(path) || name_core.is_some_and(Core::is_arcade_family) {
+        return None;
+    }
+    match archive::inspect(path) {
+        Ok(rom) => rom,
+        Err(e) => {
+            warn!(path = %path.display(), error = %e, "games: cannot inspect archive");
+            None
+        }
+    }
 }
 
 fn discover_roms(
@@ -220,7 +269,13 @@ fn discover_roms(
             .filter(|p| playable(p))
             .find_map(|p| safe_file(root, &p));
         if let Some((path, size)) = rom {
-            out.push(RawGame { path, size, title });
+            let inner_rom = inspect_archive(&path, name_core);
+            out.push(RawGame {
+                path,
+                size,
+                title,
+                inner_rom,
+            });
         }
     }
 
@@ -237,7 +292,13 @@ fn discover_roms(
                         .into_owned()
                 })
                 .unwrap_or_default();
-            out.push(RawGame { path, size, title });
+            let inner_rom = inspect_archive(&path, name_core);
+            out.push(RawGame {
+                path,
+                size,
+                title,
+                inner_rom,
+            });
         }
     }
     out
@@ -290,9 +351,16 @@ pub fn scan(roots: &[PathBuf]) -> GamesSnapshot {
             if raw.is_empty() {
                 continue;
             }
-            let paths: Vec<&PathBuf> = raw
+            // An unpacked archive stands for the ROM inside it, so its
+            // extension can resolve an unrecognised system folder.
+            let paths: Vec<PathBuf> = raw
                 .iter()
-                .map(|r| &r.path)
+                .map(|r| match &r.inner_rom {
+                    Some(rom) => PathBuf::from(&rom.name),
+                    None => r
+                        .path
+                        .clone(),
+                })
                 .collect();
             let core = resolver::resolve_system_core(&system, &paths).core;
 
@@ -312,6 +380,7 @@ pub fn scan(roots: &[PathBuf]) -> GamesSnapshot {
                     file_name: file_name(&r.path),
                     path: r.path,
                     size_bytes: r.size,
+                    inner_rom: r.inner_rom,
                 });
             }
             let mut b = discover_bios(&root, &system_dir, root_index);
@@ -620,6 +689,71 @@ mod tests {
                 .iter()
                 .all(|g| g.system == "SNES")
         );
+    }
+
+    fn zip_at(path: &Path, entries: &[(&str, &[u8])]) {
+        use std::io::Write;
+        let mut w = zip::ZipWriter::new(fs::File::create(path).unwrap());
+        let opts = zip::write::SimpleFileOptions::default();
+        for (name, data) in entries {
+            w.start_file(*name, opts)
+                .unwrap();
+            w.write_all(data)
+                .unwrap();
+        }
+        w.finish()
+            .unwrap();
+    }
+
+    #[test]
+    fn archives_are_inspected_for_non_arcade_cores_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let r = dir.path();
+        create_dir_all(r.join("Mystery Box")).unwrap();
+        create_dir_all(r.join("Arcade")).unwrap();
+        create_dir_all(r.join("SNES")).unwrap();
+        // Unrecognised folder: the inner extension picks the core.
+        zip_at(
+            &r.join("Mystery Box/Advance Wars.zip"),
+            &[("readme.txt", b"hi"), ("aw.gba", b"gba-bytes")],
+        );
+        zip_at(&r.join("Arcade/pacman.zip"), &[("pacman.6e", b"x")]);
+        zip_at(&r.join("SNES/Empty.zip"), &[("readme.txt", b"")]);
+        write(r.join("SNES/Broken.zip"), b"nope").unwrap();
+
+        let snap = scan(&[r.to_path_buf()]);
+        let by = |t: &str| {
+            snap.games
+                .iter()
+                .find(|g| g.title == t)
+                .unwrap()
+        };
+
+        let aw = by("Advance Wars");
+        assert_eq!(aw.core, Core::Gba);
+        assert_eq!(aw.file_name, "Advance Wars.zip");
+        assert_eq!(
+            aw.inner_rom,
+            Some(ArchiveRom {
+                name: "aw.gba".into(),
+                size: 9
+            })
+        );
+        assert_eq!(aw.served_file_name(), "aw.gba");
+        assert_eq!(aw.served_size_bytes(), 9);
+
+        let pac = by("pacman");
+        assert_eq!(pac.core, Core::Arcade);
+        assert_eq!(pac.inner_rom, None);
+        assert_eq!(pac.served_file_name(), "pacman.zip");
+
+        for t in ["Empty", "Broken"] {
+            let g = by(t);
+            assert_eq!(g.core, Core::Snes);
+            assert_eq!(g.inner_rom, None, "{t}");
+            assert_eq!(g.served_file_name(), g.file_name);
+            assert_eq!(g.served_size_bytes(), g.size_bytes);
+        }
     }
 
     #[test]

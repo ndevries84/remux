@@ -491,6 +491,7 @@ mod tests {
             file_name: file_name.into(),
             path: PathBuf::new(),
             size_bytes: 0,
+            inner_rom: None,
         }
     }
 

@@ -694,6 +694,10 @@ pub struct Config {
     /// comma-separated list (`GAMES_ROOTS=/roms,/more-roms`).
     #[serde(default)]
     pub games_roots: Vec<String>,
+    /// Largest ROM, in bytes, the server will unpack from a `.zip`/`.7z`
+    /// archive (non-arcade cores). Bigger ROMs answer 413.
+    #[serde(default = "default_games_archive_max_extract_bytes")]
+    pub games_archive_max_extract_bytes: u64,
     /// Display name of the synthetic Games view.
     #[serde(default = "default_games_library_name")]
     pub games_library_name: String,
@@ -764,6 +768,10 @@ fn default_mdblist_base_url() -> String {
 
 fn default_mdblist_cache_ttl_hours() -> u64 {
     24 * 7
+}
+
+fn default_games_archive_max_extract_bytes() -> u64 {
+    games::archive::DEFAULT_MAX_EXTRACT_BYTES
 }
 
 fn default_games_saves_max_bytes_per_user() -> u64 {
@@ -950,6 +958,7 @@ impl Default for Config {
             games_enabled: false,
             games_roots: Vec::new(),
             games_library_name: default_games_library_name(),
+            games_archive_max_extract_bytes: default_games_archive_max_extract_bytes(),
             games_saves_max_bytes_per_user: default_games_saves_max_bytes_per_user(),
             games_saves_max_files_per_user: default_games_saves_max_files_per_user(),
             games_thumbnails_enabled: default_games_thumbnails_enabled(),
