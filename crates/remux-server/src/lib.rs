@@ -398,6 +398,7 @@ pub async fn init_app(
         signals,
         started_at: Utc::now(),
         games: games::GamesIndex::default(),
+        moonfin_settings: api::moonfin_settings::SettingsHub::default(),
     };
     ctx.signals
         .register(services::media_tracker::MediaTrackerSubscriber { ctx: ctx.clone() });
@@ -511,6 +512,8 @@ pub struct AppContext {
     pub started_at: chrono::DateTime<chrono::Utc>,
     /// Lazily-scanned index of retro games (see [`games`]).
     pub games: games::GamesIndex,
+    /// Moonfin settings-sync state (SSE fan-out, admin defaults cache).
+    pub moonfin_settings: api::moonfin_settings::SettingsHub,
 }
 
 impl AppContext {

@@ -1,6 +1,741 @@
 //! Moonfin `Ping` and settings sync (`/Moonfin/Settings/...`).
 //!
-//! Contract tests only for now; the handlers do not exist yet.
+//! Wire behaviour follows Moonbase's `MoonfinController` as used by the
+//! Moonfin client (see `plugin_sync_service.dart`). Per-user, per-profile
+//! settings are stored as schemaless JSON objects (`moonfin_settings`
+//! table), so keys added by newer clients round-trip untouched.
+//!
+//! * Profiles: `global`, `desktop`, `mobile`, `tv` (case-insensitive).
+//! * Save merges incoming top-level keys into the stored profile (nulls and
+//!   blank API keys never overwrite; values are replaced whole).
+//! * Resolve layers `[device, global, admin defaults]`, first non-null value
+//!   per key wins. A user with nothing stored gets `200 {}` (not 404), or
+//!   the admin defaults, so the client's first-sign-in sync can initialise.
+//! * `/moonfin/settings/stream` is a per-user SSE feed that emits
+//!   `settingsUpdated` only when a save actually changed stored settings.
+//!
+//! Routes are registered under lowercase paths; `rewrite_request_uri`
+//! lowercases the Moonfin client's mixed-case URLs.
+
+use std::{
+    collections::HashMap,
+    convert::Infallible,
+    sync::{Arc, OnceLock},
+    time::Duration,
+};
+
+use axum::{
+    Json,
+    body::Body,
+    extract::{Path, State},
+    http::{HeaderName, Request, StatusCode, header},
+    response::{IntoResponse, Response},
+};
+use bytes::Bytes;
+use dashmap::DashMap;
+use remux_macros::{delete, get, post};
+use serde_json::{Map, Value, json};
+use sqlx::SqlitePool;
+use tokio::sync::broadcast;
+use tracing::{error, warn};
+use uuid::Uuid;
+
+use crate::{AppState, Config, db::auth::AuthSession};
+
+/// Largest accepted profile-save body (real profiles are ~10-30 KB).
+const MAX_SAVE_BYTES: usize = 1024 * 1024;
+/// SSE heartbeat; the client treats 75 s of silence as a dead stream.
+const HEARTBEAT: Duration = Duration::from_secs(30);
+
+const VALID_PROFILES: [&str; 4] = ["global", "desktop", "mobile", "tv"];
+
+type Profile = Map<String, Value>;
+
+// ---------------------------------------------------------------------------
+// Shared state
+// ---------------------------------------------------------------------------
+
+/// Process-wide Moonfin settings state held in [`crate::AppContext`].
+#[derive(Clone, Default)]
+pub struct SettingsHub {
+    inner: Arc<HubInner>,
+}
+
+#[derive(Default)]
+struct HubInner {
+    /// One broadcast channel per user with at least one open stream.
+    streams: DashMap<Uuid, broadcast::Sender<()>>,
+    /// Serializes read-modify-write saves (low volume, so one lock is fine).
+    write_lock: tokio::sync::Mutex<()>,
+    /// Admin defaults file, read once on first use.
+    defaults: OnceLock<Option<Profile>>,
+}
+
+impl SettingsHub {
+    /// Admin default settings (the lowest resolve layer). A missing or
+    /// invalid file means no defaults; the problem is logged once.
+    fn defaults(&self, config: &Config) -> Option<&Profile> {
+        self.inner
+            .defaults
+            .get_or_init(|| {
+                let path = config
+                    .moonfin_default_settings_path
+                    .as_deref()?;
+                let loaded = std::fs::read_to_string(path)
+                    .map_err(|e| e.to_string())
+                    .and_then(|s| match serde_json::from_str::<Value>(&s) {
+                        Ok(Value::Object(map)) => Ok(map),
+                        Ok(_) => Err("expected a JSON object".to_string()),
+                        Err(e) => Err(e.to_string()),
+                    });
+                match loaded {
+                    Ok(map) => Some(map),
+                    Err(e) => {
+                        warn!(
+                            path,
+                            err = %e,
+                            "ignoring Moonfin default settings file"
+                        );
+                        None
+                    }
+                }
+            })
+            .as_ref()
+    }
+
+    /// Opens a settings stream for `user`.
+    fn subscribe(&self, user: Uuid) -> StreamGuard {
+        let rx = self
+            .inner
+            .streams
+            .entry(user)
+            .or_insert_with(|| broadcast::channel(16).0)
+            .subscribe();
+        StreamGuard {
+            hub: self.clone(),
+            user,
+            rx: Some(rx),
+        }
+    }
+
+    fn notify(&self, user: Uuid) {
+        if let Some(tx) = self
+            .inner
+            .streams
+            .get(&user)
+        {
+            // No receivers is fine: nobody is listening.
+            let _ = tx.send(());
+        }
+    }
+}
+
+/// Holds a stream's receiver and drops the user's channel once the last
+/// stream for that user disconnects.
+struct StreamGuard {
+    hub: SettingsHub,
+    user: Uuid,
+    rx: Option<broadcast::Receiver<()>>,
+}
+
+impl Drop for StreamGuard {
+    fn drop(&mut self) {
+        self.rx
+            .take();
+        self.hub
+            .inner
+            .streams
+            .remove_if(&self.user, |_, tx| tx.receiver_count() == 0);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Pure helpers
+// ---------------------------------------------------------------------------
+
+fn error_response(status: StatusCode, message: impl Into<String>) -> Response {
+    (status, Json(json!({ "Error": message.into() }))).into_response()
+}
+
+fn internal_error(err: impl std::fmt::Display) -> Response {
+    error!(%err, "moonfin settings storage error");
+    error_response(StatusCode::INTERNAL_SERVER_ERROR, "Internal error")
+}
+
+/// Lowercased profile name if it is one of the four valid profiles.
+fn parse_profile(raw: &str) -> Option<String> {
+    let lower = raw.to_ascii_lowercase();
+    VALID_PROFILES
+        .contains(&lower.as_str())
+        .then_some(lower)
+}
+
+fn now_ms() -> i64 {
+    chrono::Utc::now().timestamp_millis()
+}
+
+/// Merges `incoming` into `stored` (top-level keys, whole-value replace).
+fn merge_profile(stored: &mut Profile, incoming: &Profile) {
+    let present = |k: &str| {
+        incoming
+            .get(k)
+            .is_some_and(|v| !v.is_null())
+    };
+    // A row order pushed without sections means the sections were removed.
+    if !present("homeSections") && present("homeRowOrder") {
+        stored.remove("homeSections");
+    }
+    for (key, value) in incoming {
+        if value.is_null() {
+            continue;
+        }
+        if key.contains("ApiKey")
+            && let Some(s) = value.as_str()
+            && (s
+                .trim()
+                .is_empty()
+                || s == "null")
+        {
+            continue;
+        }
+        stored.insert(key.clone(), value.clone());
+    }
+}
+
+/// Row order derived from home sections: enabled, non-dynamic, typed
+/// sections sorted by `order` (missing sorts last).
+fn derive_row_order(sections: &Value) -> Option<Value> {
+    let mut rows: Vec<(f64, &str)> = sections
+        .as_array()?
+        .iter()
+        .filter_map(|s| {
+            let s = s.as_object()?;
+            let kind = s
+                .get("kind")
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            if kind.eq_ignore_ascii_case("pluginDynamic") {
+                return None;
+            }
+            if s.get("enabled") == Some(&Value::Bool(false)) {
+                return None;
+            }
+            let ty = s
+                .get("type")
+                .and_then(Value::as_str)?;
+            if ty
+                .trim()
+                .is_empty()
+                || ty.eq_ignore_ascii_case("none")
+            {
+                return None;
+            }
+            let order = s
+                .get("order")
+                .and_then(Value::as_f64)
+                .unwrap_or(f64::MAX);
+            Some((order, ty))
+        })
+        .collect();
+    rows.sort_by(|a, b| {
+        a.0.total_cmp(&b.0)
+    });
+    if rows.is_empty() {
+        return None;
+    }
+    Some(Value::Array(
+        rows.into_iter()
+            .map(|(_, ty)| Value::String(ty.to_string()))
+            .collect(),
+    ))
+}
+
+/// Resolves a profile from its layers, highest precedence first.
+fn resolve(layers: &[&Profile]) -> Profile {
+    let mut out = Profile::new();
+    for layer in layers {
+        for (key, value) in layer.iter() {
+            if !value.is_null() && !out.contains_key(key) {
+                out.insert(key.clone(), value.clone());
+            }
+        }
+    }
+
+    // The home layout is taken as a pair from a single layer.
+    out.remove("homeSections");
+    out.remove("homeRowOrder");
+    let has = |layer: &Profile, k: &str| {
+        layer
+            .get(k)
+            .is_some_and(|v| !v.is_null())
+    };
+    if let Some(layer) = layers
+        .iter()
+        .find(|l| has(l, "homeSections") || has(l, "homeRowOrder"))
+    {
+        let sections = layer
+            .get("homeSections")
+            .filter(|v| !v.is_null());
+        let order = layer
+            .get("homeRowOrder")
+            .filter(|v| !v.is_null())
+            .cloned()
+            .or_else(|| sections.and_then(derive_row_order));
+        if let Some(s) = sections {
+            out.insert("homeSections".into(), s.clone());
+        }
+        if let Some(o) = order {
+            out.insert("homeRowOrder".into(), o);
+        }
+    }
+
+    // The client names this source differently from Moonbase's stored value.
+    if let Some(Value::Array(sources)) = out.get_mut("mdblistRatingSources") {
+        for s in sources.iter_mut() {
+            if s.as_str()
+                .is_some_and(|v| v.eq_ignore_ascii_case("rtAudience"))
+            {
+                *s = Value::String("tomatoes_audience".into());
+            }
+        }
+    }
+    out
+}
+
+// ---------------------------------------------------------------------------
+// Storage
+// ---------------------------------------------------------------------------
+
+fn parse_stored(data: &str) -> Profile {
+    match serde_json::from_str::<Value>(data) {
+        Ok(Value::Object(map)) => map,
+        _ => Profile::new(),
+    }
+}
+
+async fn load_profiles(
+    db: &SqlitePool,
+    user: Uuid,
+) -> Result<HashMap<String, (Profile, i64, Option<String>)>, sqlx::Error> {
+    let rows: Vec<(String, String, i64, Option<String>)> = sqlx::query_as(
+        "SELECT profile, data, updated_at, updated_by FROM moonfin_settings \
+         WHERE user_id = ?1",
+    )
+    .bind(user)
+    .fetch_all(db)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .map(|(p, d, at, by)| (p, (parse_stored(&d), at, by)))
+        .collect())
+}
+
+// ---------------------------------------------------------------------------
+// Ping
+// ---------------------------------------------------------------------------
+
+#[get("/moonfin/ping")]
+pub async fn moonfin_ping(_session: AuthSession) -> Response {
+    Json(json!({
+        "installed": true,
+        "version": env!("CARGO_PKG_VERSION"),
+        "settingsSyncEnabled": true,
+        "serverName": "Remux",
+        "seerrEnabled": false,
+        "seerrUrl": null,
+        "mdblistAvailable": false,
+        "tmdbAvailable": false,
+        "tmdbThumbsSupported": false,
+        "messagesSupported": false,
+        "recommendationsSupported": false,
+    }))
+    .into_response()
+}
+
+// ---------------------------------------------------------------------------
+// Seerr stubs: the plugin is "installed" but Seerr is never configured, so
+// the client's probes return at once without attempting a sign-in.
+// ---------------------------------------------------------------------------
+
+#[get("/moonfin/seerr/config")]
+pub async fn moonfin_seerr_config(_session: AuthSession) -> Response {
+    Json(json!({ "enabled": false, "userEnabled": false })).into_response()
+}
+
+#[get("/moonfin/seerr/status")]
+pub async fn moonfin_seerr_status(_session: AuthSession) -> Response {
+    Json(json!({ "enabled": false, "authenticated": false })).into_response()
+}
+
+// ---------------------------------------------------------------------------
+// Resolve / read
+// ---------------------------------------------------------------------------
+
+#[get("/moonfin/settings/resolved/{profile}")]
+pub async fn moonfin_settings_resolved(
+    State(state): State<AppState>,
+    session: AuthSession,
+    Path(profile): Path<String>,
+) -> Response {
+    let Some(profile) = parse_profile(&profile) else {
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            format!(
+                "Invalid profile: {profile}. Valid profiles: global, desktop, mobile, tv"
+            ),
+        );
+    };
+    let stored = match load_profiles(
+        &state
+            .ctx
+            .db,
+        session
+            .user
+            .id,
+    )
+    .await
+    {
+        Ok(s) => s,
+        Err(e) => return internal_error(e),
+    };
+    let empty = Profile::new();
+    let mut layers: Vec<&Profile> = Vec::with_capacity(3);
+    if profile != "global"
+        && let Some((device, ..)) = stored.get(&profile)
+    {
+        layers.push(device);
+    }
+    if let Some((global, ..)) = stored.get("global") {
+        layers.push(global);
+    }
+    layers.push(
+        state
+            .ctx
+            .moonfin_settings
+            .defaults(
+                &state
+                    .ctx
+                    .config,
+            )
+            .unwrap_or(&empty),
+    );
+    Json(Value::Object(resolve(&layers))).into_response()
+}
+
+#[get("/moonfin/settings")]
+pub async fn moonfin_settings_get(
+    State(state): State<AppState>,
+    session: AuthSession,
+) -> Response {
+    let user = session
+        .user
+        .id;
+    let stored = match load_profiles(
+        &state
+            .ctx
+            .db,
+        user,
+    )
+    .await
+    {
+        Ok(s) => s,
+        Err(e) => return internal_error(e),
+    };
+    if stored.is_empty() {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(json!({
+                "Error": "No settings found for user",
+                "UserId": user.to_string(),
+            })),
+        )
+            .into_response();
+    }
+    let latest = stored
+        .values()
+        .max_by_key(|(_, at, _)| *at);
+    let mut envelope = json!({
+        "schemaVersion": 2,
+        "lastUpdated": latest.map(|(_, at, _)| *at).unwrap_or_default(),
+        "lastUpdatedBy": latest.and_then(|(_, _, by)| by.clone()),
+        "syncEnabled": true,
+    });
+    for name in VALID_PROFILES {
+        if let Some((profile, ..)) = stored.get(name) {
+            envelope[name] = Value::Object(profile.clone());
+        }
+    }
+    Json(envelope).into_response()
+}
+
+// ---------------------------------------------------------------------------
+// Save
+// ---------------------------------------------------------------------------
+
+/// Case-insensitive top-level key lookup (ASP.NET binding is case-insensitive).
+fn field<'a>(body: &'a Map<String, Value>, name: &str) -> Option<&'a Value> {
+    body.iter()
+        .find(|(k, _)| k.eq_ignore_ascii_case(name))
+        .map(|(_, v)| v)
+}
+
+#[post("/moonfin/settings/profile/{profile}")]
+pub async fn moonfin_settings_save(
+    State(state): State<AppState>,
+    session: AuthSession,
+    Path(profile): Path<String>,
+    req: Request<Body>,
+) -> Response {
+    let Some(profile) = parse_profile(&profile) else {
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            format!("Invalid profile: {profile}"),
+        );
+    };
+    let bytes = match axum::body::to_bytes(req.into_body(), MAX_SAVE_BYTES).await {
+        Ok(b) => b,
+        Err(_) => {
+            return error_response(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "Request body too large",
+            );
+        }
+    };
+    let Ok(Value::Object(body)) = serde_json::from_slice::<Value>(&bytes) else {
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            "Profile settings are required",
+        );
+    };
+    let incoming = match field(&body, "profile") {
+        Some(Value::Object(map)) => map,
+        Some(Value::Null) | None => {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                "Profile settings are required",
+            );
+        }
+        Some(_) => {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                "Profile settings must be a JSON object",
+            );
+        }
+    };
+    let client_id = field(&body, "clientId")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown");
+
+    let user = session
+        .user
+        .id;
+    let hub = &state
+        .ctx
+        .moonfin_settings;
+    let _write = hub
+        .inner
+        .write_lock
+        .lock()
+        .await;
+    let db = &state
+        .ctx
+        .db;
+    let result: Result<(bool, bool), sqlx::Error> = async {
+        let mut tx = db
+            .begin()
+            .await?;
+        let had_any: bool =
+            sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM moonfin_settings WHERE user_id = ?1)")
+                .bind(user)
+                .fetch_one(&mut *tx)
+                .await?;
+        let row: Option<String> = sqlx::query_scalar(
+            "SELECT data FROM moonfin_settings WHERE user_id = ?1 AND profile = ?2",
+        )
+        .bind(user)
+        .bind(&profile)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let before = row
+            .as_deref()
+            .map(parse_stored)
+            .unwrap_or_default();
+        let mut after = before.clone();
+        merge_profile(&mut after, incoming);
+        let changed = after != before;
+        if changed || row.is_none() {
+            sqlx::query(
+                "INSERT INTO moonfin_settings (user_id, profile, data, updated_at, updated_by) \
+                 VALUES (?1, ?2, ?3, ?4, ?5) \
+                 ON CONFLICT(user_id, profile) DO UPDATE SET \
+                 data = excluded.data, updated_at = excluded.updated_at, \
+                 updated_by = excluded.updated_by",
+            )
+            .bind(user)
+            .bind(&profile)
+            .bind(Value::Object(after).to_string())
+            .bind(now_ms())
+            .bind(client_id)
+            .execute(&mut *tx)
+            .await?;
+        }
+        tx.commit()
+            .await?;
+        Ok((!had_any, changed))
+    }
+    .await;
+    let (created, changed) = match result {
+        Ok(r) => r,
+        Err(e) => return internal_error(e),
+    };
+    if changed {
+        hub.notify(user);
+    }
+    Json(json!({
+        "Success": true,
+        "Created": created,
+        "UserId": user.to_string(),
+    }))
+    .into_response()
+}
+
+// ---------------------------------------------------------------------------
+// Delete (no SSE notification, matching Moonbase)
+// ---------------------------------------------------------------------------
+
+#[delete("/moonfin/settings")]
+pub async fn moonfin_settings_delete_all(
+    State(state): State<AppState>,
+    session: AuthSession,
+) -> Response {
+    let _write = state
+        .ctx
+        .moonfin_settings
+        .inner
+        .write_lock
+        .lock()
+        .await;
+    match sqlx::query("DELETE FROM moonfin_settings WHERE user_id = ?1")
+        .bind(
+            session
+                .user
+                .id,
+        )
+        .execute(
+            &state
+                .ctx
+                .db,
+        )
+        .await
+    {
+        Ok(_) => Json(json!({ "Success": true, "Message": "Settings deleted" }))
+            .into_response(),
+        Err(e) => internal_error(e),
+    }
+}
+
+#[delete("/moonfin/settings/profile/{profile}")]
+pub async fn moonfin_settings_delete_profile(
+    State(state): State<AppState>,
+    session: AuthSession,
+    Path(profile): Path<String>,
+) -> Response {
+    // `global` is rejected before validity, like Moonbase.
+    if profile.eq_ignore_ascii_case("global") {
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            "Cannot delete the global profile. Use DELETE /Settings to remove all settings.",
+        );
+    }
+    let Some(name) = parse_profile(&profile) else {
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            format!("Invalid profile: {profile}"),
+        );
+    };
+    let _write = state
+        .ctx
+        .moonfin_settings
+        .inner
+        .write_lock
+        .lock()
+        .await;
+    match sqlx::query(
+        "DELETE FROM moonfin_settings WHERE user_id = ?1 AND profile = ?2",
+    )
+    .bind(
+        session
+            .user
+            .id,
+    )
+    .bind(&name)
+    .execute(
+        &state
+            .ctx
+            .db,
+    )
+    .await
+    {
+        Ok(_) => Json(json!({
+            "Success": true,
+            "Message": format!("Profile '{name}' deleted"),
+        }))
+        .into_response(),
+        Err(e) => internal_error(e),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// SSE stream
+// ---------------------------------------------------------------------------
+
+#[get("/moonfin/settings/stream")]
+pub async fn moonfin_settings_stream(
+    State(state): State<AppState>,
+    session: AuthSession,
+) -> Response {
+    let mut guard = state
+        .ctx
+        .moonfin_settings
+        .subscribe(
+            session
+                .user
+                .id,
+        );
+    // Raw frames rather than `axum::response::Sse`, which writes comments as
+    // `: text` while the contract (and Moonbase) uses `:connected` exactly.
+    let stream = async_stream::stream! {
+        // Sent immediately so the client's open call completes at once.
+        yield Ok::<Bytes, Infallible>(Bytes::from_static(b":connected\n\n"));
+        loop {
+            let Some(rx) = guard.rx.as_mut() else { break };
+            tokio::select! {
+                msg = rx.recv() => match msg {
+                    // A lagged receiver missed events; one refresh covers them.
+                    Ok(()) | Err(broadcast::error::RecvError::Lagged(_)) => {
+                        yield Ok(Bytes::from_static(
+                            b"data: {\"type\":\"settingsUpdated\"}\n\n",
+                        ));
+                    }
+                    Err(broadcast::error::RecvError::Closed) => break,
+                },
+                // Silence for a full interval: keep the connection alive.
+                _ = tokio::time::sleep(HEARTBEAT) => {
+                    yield Ok(Bytes::from_static(b":heartbeat\n\n"));
+                }
+            }
+        }
+    };
+    (
+        [
+            (header::CONTENT_TYPE, "text/event-stream; charset=utf-8"),
+            (header::CACHE_CONTROL, "no-cache"),
+            (HeaderName::from_static("x-accel-buffering"), "no"),
+        ],
+        Body::from_stream(stream),
+    )
+        .into_response()
+}
 
 #[cfg(test)]
 mod tests {
