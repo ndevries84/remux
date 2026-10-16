@@ -21,6 +21,7 @@ pub mod lyrics;
 pub mod metadata;
 pub mod moonfin_emulator;
 pub mod moonfin_games;
+pub mod moonfin_settings;
 pub mod movies;
 pub mod music;
 pub mod networking;

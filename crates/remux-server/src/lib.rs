@@ -694,6 +694,11 @@ pub struct Config {
     /// Per-user cap on the number of stored game save files.
     #[serde(default = "default_games_saves_max_files_per_user")]
     pub games_saves_max_files_per_user: u32,
+    /// Optional JSON file holding admin default Moonfin settings (a flat
+    /// profile object). It is the lowest-precedence layer when resolving a
+    /// user's settings. A missing or invalid file means no defaults.
+    #[serde(default)]
+    pub moonfin_default_settings_path: Option<String>,
 }
 
 fn default_games_saves_max_bytes_per_user() -> u64 {
@@ -863,6 +868,7 @@ impl Default for Config {
             games_library_name: default_games_library_name(),
             games_saves_max_bytes_per_user: default_games_saves_max_bytes_per_user(),
             games_saves_max_files_per_user: default_games_saves_max_files_per_user(),
+            moonfin_default_settings_path: None,
         }
         .resolve()
     }
