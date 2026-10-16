@@ -827,9 +827,24 @@ impl Default for Config {
 
 pub fn rewrite_request_uri<B>(mut req: http::Request<B>) -> http::Request<B> {
     let uri = req.uri();
-    let path = uri
-        .path()
-        .replace("/emby", "");
+    // Moonfin plugin routes: only a leading `/emby` is stripped (later
+    // occurrences, e.g. inside ROM file names, must survive) and every path is
+    // normalised per-segment, never treated as a case-preserving static file.
+    let raw_path = uri.path();
+    let moonfin_rest = raw_path
+        .strip_prefix("/emby")
+        .filter(|rest| rest.starts_with('/'))
+        .unwrap_or(raw_path);
+    let is_moonfin = moonfin_rest
+        .trim_start_matches('/')
+        .split('/')
+        .next()
+        .is_some_and(|seg| seg.eq_ignore_ascii_case("moonfin"));
+    let path = if is_moonfin {
+        moonfin_rest.to_string()
+    } else {
+        raw_path.replace("/emby", "")
+    };
 
     // Trim trailing slashes, but keep "/" for root, and preserve the trailing slash
     // on SPA mount prefixes (/web/, /admin/, /jellyfin/, /remux/) so WebClientService and
@@ -891,7 +906,7 @@ pub fn rewrite_request_uri<B>(mut req: http::Request<B>) -> http::Request<B> {
 
     let new_path = if path == "/" || is_remux_web {
         path
-    } else if is_file_like && !api_file_like {
+    } else if is_file_like && !api_file_like && !is_moonfin {
         // Static file — preserve original casing.
         path
     } else if api_file_like {
@@ -1123,6 +1138,78 @@ mod rewrite_uri_tests {
         assert_eq!(
             rewrite("/remux/library/Some-Name/"),
             "/remux/library/Some-Name"
+        );
+    }
+
+    fn rewrite_pq(path: &str) -> String {
+        let req = http::Request::builder()
+            .method("GET")
+            .uri(path)
+            .body(())
+            .unwrap();
+        rewrite_request_uri(req)
+            .uri()
+            .path_and_query()
+            .map(|pq| pq.to_string())
+            .unwrap_or_default()
+    }
+
+    #[test]
+    fn moonfin_routes_are_lowercased_per_segment() {
+        assert_eq!(
+            rewrite_pq("/Moonfin/Games/Libraries"),
+            "/moonfin/games/libraries"
+        );
+        assert_eq!(
+            rewrite_pq("/emby/Moonfin/Games/Libraries"),
+            "/moonfin/games/libraries"
+        );
+        assert_eq!(
+            rewrite_pq("/Moonfin/Games/Saves/lr-fceumm-6a2f9c"),
+            "/moonfin/games/saves/lr-fceumm-6a2f9c"
+        );
+    }
+
+    #[test]
+    fn moonfin_file_like_paths_keep_filename_case() {
+        assert_eq!(
+            rewrite_pq("/Moonfin/EmulatorJS/player.html?core=fceumm&rom=x"),
+            "/moonfin/emulatorjs/player.html?core=fceumm&rom=x"
+        );
+        assert_eq!(
+            rewrite_pq("/Moonfin/EmulatorJS/data/cores/fceumm-wasm.data"),
+            "/moonfin/emulatorjs/data/cores/fceumm-wasm.data"
+        );
+        assert_eq!(
+            rewrite_pq("/Moonfin/Games/lib-id/Rom/Tetris.zip"),
+            "/moonfin/games/lib-id/rom/Tetris.zip"
+        );
+    }
+
+    #[test]
+    fn moonfin_rom_path_preserves_encoded_name_and_query() {
+        assert_eq!(
+            rewrite_pq(
+                "/Moonfin/Games/0b7c1e2a-9f3d-5a6b-8c7d-112233445566/Rom/6a2f9c/Super%20Mario%20Bros%20%28U%29.zip?ApiKey=AbC123"
+            ),
+            "/moonfin/games/0b7c1e2a-9f3d-5a6b-8c7d-112233445566/rom/6a2f9c/Super%20Mario%20Bros%20%28U%29.zip?ApiKey=AbC123"
+        );
+    }
+
+    #[test]
+    fn moonfin_only_strips_leading_emby() {
+        assert_eq!(
+            rewrite_pq("/Moonfin/Games/lib-id/Rom/6a2f9c/emby_quest.zip"),
+            "/moonfin/games/lib-id/rom/6a2f9c/emby_quest.zip"
+        );
+    }
+
+    #[test]
+    fn non_moonfin_file_like_paths_unchanged() {
+        assert_eq!(rewrite_pq("/web/Main.Foo.js"), "/web/Main.Foo.js");
+        assert_eq!(
+            rewrite_pq("/Web/Assets/App.js?V=1"),
+            "/Web/Assets/App.js?V=1"
         );
     }
 
