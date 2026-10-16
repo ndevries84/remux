@@ -1,0 +1,1109 @@
+//! Moonfin/Moonbase-compatible MDBList ratings proxy
+//! (`GET /moonfin/mdblist/ratings`).
+//!
+//! Wire behaviour follows Moonbase's `MdbListController.GetRatings` as called
+//! by the Moonfin client (`mdblist_repository.dart`): the client resolves the
+//! TMDb id itself and sends `type` (`movie` | `show`), `tmdbId` and its device
+//! `profile`. The reply is always `200 {success, error, ratings[]}` for
+//! anything the client should treat as "no ratings" (missing key, upstream
+//! failure); only malformed requests get a `400`. A `404` would make the
+//! client believe the route is absent and stop asking for five minutes.
+//!
+//! The API key stays server-side: the user's own `mdblistApiKey` (from their
+//! synced settings) wins, then the server-wide `MDBLIST_API_KEY`. Upstream
+//! ratings are cached unfiltered in SQLite (`mdblist_ratings_cache`, so a
+//! restart doesn't re-spend MDBList's 1,000 requests/day free quota) and
+//! filtered per request by the user's selected rating sources.
+//!
+//! MDBList API: <https://api.mdblist.com/> (title lookup
+//! `GET /tmdb/{movie|show}/{id}?apikey=...`; a `429` carries `Retry-After`).
+
+use std::{
+    sync::Arc,
+    time::{Duration, Instant},
+};
+
+use axum::{
+    Json,
+    extract::{Query, State},
+    http::StatusCode,
+    response::{IntoResponse, Response},
+};
+use dashmap::DashMap;
+use remux_macros::get;
+use serde::{Deserialize, Serialize};
+use serde_json::{Value, json};
+use sqlx::SqlitePool;
+use strum_macros::{Display, EnumString};
+use tracing::warn;
+
+use crate::{
+    AppState, Config, api::moonfin_settings::resolved_profile, db::auth::AuthSession,
+};
+
+/// Rating sources returned when the user has not chosen any.
+const DEFAULT_SOURCES: [&str; 4] = ["imdb", "tmdb", "tomatoes", "metacritic"];
+/// How long a failed lookup (bad key, rate limit, outage) is remembered.
+const NEGATIVE_TTL: Duration = Duration::from_secs(10 * 60);
+/// Longest `Retry-After` worth sleeping through for an in-request retry.
+const MAX_INLINE_RETRY: Duration = Duration::from_secs(2);
+/// Longest a 429 can keep us off the upstream API.
+const MAX_RATE_LIMIT_GATE: Duration = Duration::from_secs(10 * 60);
+
+const RATE_LIMIT_MESSAGE: &str = "MDBList rate limit reached. Try again later.";
+const NO_KEY_MESSAGE: &str = "No MDBList API key configured. Add your key in Moonfin Settings, or ask your server admin to set a server-wide key.";
+
+// ---------------------------------------------------------------------------
+// Types
+// ---------------------------------------------------------------------------
+
+/// MDBList media type; the lowercase form is also the upstream path segment.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Display, EnumString)]
+#[strum(serialize_all = "lowercase", ascii_case_insensitive)]
+enum MediaType {
+    Movie,
+    Show,
+}
+
+/// One rating as MDBList reports it and as Moonbase relays it.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct Rating {
+    source: Option<String>,
+    value: Option<f64>,
+    score: Option<f64>,
+    votes: Option<i64>,
+    url: Option<String>,
+}
+
+#[derive(Serialize)]
+struct RatingsResponse {
+    success: bool,
+    error: Option<String>,
+    ratings: Vec<Rating>,
+}
+
+impl RatingsResponse {
+    fn ok(ratings: Vec<Rating>) -> Self {
+        Self {
+            success: true,
+            error: None,
+            ratings,
+        }
+    }
+
+    fn failed(error: impl Into<String>) -> Self {
+        Self {
+            success: false,
+            error: Some(error.into()),
+            ratings: Vec::new(),
+        }
+    }
+}
+
+#[derive(Deserialize)]
+pub struct RatingsQuery {
+    #[serde(rename = "type", alias = "Type")]
+    kind: Option<String>,
+    #[serde(rename = "tmdbId", alias = "tmdbid", alias = "TmdbId")]
+    tmdb_id: Option<String>,
+    #[serde(alias = "Profile")]
+    profile: Option<String>,
+}
+
+// ---------------------------------------------------------------------------
+// Pure helpers
+// ---------------------------------------------------------------------------
+
+fn bad_request(message: &str) -> Response {
+    (StatusCode::BAD_REQUEST, Json(json!({ "Error": message }))).into_response()
+}
+
+/// Device profile name; anything unknown reads the global settings.
+fn normalize_profile(raw: Option<&str>) -> &'static str {
+    match raw
+        .map(|p| {
+            p.trim()
+                .to_ascii_lowercase()
+        })
+        .as_deref()
+    {
+        Some("desktop") => "desktop",
+        Some("mobile") => "mobile",
+        Some("tv") => "tv",
+        _ => "global",
+    }
+}
+
+/// Leniently reads MDBList's `ratings` array (numbers may arrive as strings,
+/// `url` may be `false`).
+fn parse_upstream(body: &Value) -> Vec<Rating> {
+    let number = |v: Option<&Value>| match v? {
+        Value::Number(n) => n.as_f64(),
+        Value::String(s) => s
+            .trim()
+            .parse()
+            .ok(),
+        _ => None,
+    };
+    body.get("ratings")
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|item| {
+                    let item = item.as_object()?;
+                    Some(Rating {
+                        source: item
+                            .get("source")
+                            .and_then(Value::as_str)
+                            .map(str::to_string),
+                        value: number(item.get("value")),
+                        score: number(item.get("score")),
+                        votes: number(item.get("votes")).map(|v| v as i64),
+                        url: item
+                            .get("url")
+                            .and_then(Value::as_str)
+                            .map(str::to_string),
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Picks and orders ratings by the user's selected sources (Moonbase's
+/// `FilterAndOrderRatings`). Ratings keep the name the user asked for.
+fn filter_and_order(all: &[Rating], selected: Option<&[String]>) -> Vec<Rating> {
+    let defaults: Vec<String> = DEFAULT_SOURCES
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+    let sources = match selected {
+        Some(s) if !s.is_empty() => s,
+        _ => &defaults,
+    };
+    let mut out = Vec::new();
+    for source in sources {
+        // RT audience scores arrive from MDBList as "popcorn".
+        let lookup = if source.eq_ignore_ascii_case("rtAudience")
+            || source.eq_ignore_ascii_case("tomatoes_audience")
+        {
+            "popcorn"
+        } else {
+            source.as_str()
+        };
+        // Later duplicates win, as in Moonbase's dictionary build.
+        let Some(found) = all
+            .iter()
+            .rev()
+            .find(|r| {
+                r.source
+                    .as_deref()
+                    .is_some_and(|s| !s.is_empty() && s.eq_ignore_ascii_case(lookup))
+            })
+        else {
+            continue;
+        };
+        let mut rating = found.clone();
+        rating.source = Some(source.clone());
+        // Letterboxd's value is on an ambiguous 0-10 scale; native is 0-5.
+        if source.eq_ignore_ascii_case("letterboxd") {
+            if let Some(score) = rating.score {
+                rating.value = Some((score / 20.0 * 10.0).round() / 10.0);
+            } else if let Some(v) = rating.value {
+                rating.value = Some(if v > 5.0 {
+                    (v / 2.0 * 10.0).round() / 10.0
+                } else {
+                    v
+                });
+            }
+        }
+        out.push(rating);
+    }
+    out
+}
+
+fn retry_after(resp: &reqwest::Response) -> Option<Duration> {
+    resp.headers()
+        .get(reqwest::header::RETRY_AFTER)?
+        .to_str()
+        .ok()?
+        .trim()
+        .parse()
+        .ok()
+        .map(Duration::from_secs)
+}
+
+// ---------------------------------------------------------------------------
+// Service
+// ---------------------------------------------------------------------------
+
+/// Process-wide proxy state held in [`crate::AppContext`]. Cheap to clone.
+#[derive(Clone)]
+pub struct MdbListService {
+    inner: Arc<Inner>,
+}
+
+struct Inner {
+    client: reqwest::Client,
+    /// One lock per cache key so concurrent lookups share a single fetch.
+    in_flight: DashMap<String, Arc<tokio::sync::Mutex<()>>>,
+    /// Cache key -> user-facing error from a recent failed lookup.
+    failures: moka::sync::Cache<String, String>,
+    /// API key -> when upstream 429s stop applying. Held in memory only.
+    rate_limited: DashMap<String, Instant>,
+}
+
+impl Default for MdbListService {
+    fn default() -> Self {
+        // No redirects: the API key travels in the query string and must
+        // never follow a redirect to another host.
+        let client = reqwest::Client::builder()
+            .user_agent(concat!("Remux/", env!("CARGO_PKG_VERSION")))
+            .connect_timeout(Duration::from_secs(5))
+            .timeout(Duration::from_secs(15))
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .expect("failed to build MDBList client");
+        Self {
+            inner: Arc::new(Inner {
+                client,
+                in_flight: DashMap::new(),
+                failures: moka::sync::Cache::builder()
+                    .max_capacity(10_000)
+                    .time_to_live(NEGATIVE_TTL)
+                    .build(),
+                rate_limited: DashMap::new(),
+            }),
+        }
+    }
+}
+
+enum Fetch {
+    Ratings(Vec<Rating>),
+    Failed {
+        message: String,
+        rate_limit: Option<Duration>,
+    },
+}
+
+impl MdbListService {
+    /// Unfiltered ratings for a title: cache, then upstream. `Err` carries
+    /// the user-facing message (never containing the key).
+    async fn ratings(
+        &self,
+        db: &SqlitePool,
+        config: &Config,
+        api_key: &str,
+        media: MediaType,
+        tmdb_id: u64,
+    ) -> Result<Vec<Rating>, String> {
+        let cache_key = format!("{media}:{tmdb_id}");
+        let ttl = Duration::from_secs(
+            config
+                .mdblist_cache_ttl_hours
+                .saturating_mul(3600),
+        );
+        if let Some(hit) = cache_get(db, &cache_key, ttl).await {
+            return Ok(hit);
+        }
+        if let Some(err) = self.known_failure(&cache_key, api_key) {
+            return Err(err);
+        }
+
+        let lock = self
+            .inner
+            .in_flight
+            .entry(cache_key.clone())
+            .or_default()
+            .clone();
+        let result = {
+            let _guard = lock
+                .lock()
+                .await;
+            // A concurrent lookup may have finished while we waited.
+            if let Some(hit) = cache_get(db, &cache_key, ttl).await {
+                Ok(hit)
+            } else if let Some(err) = self.known_failure(&cache_key, api_key) {
+                Err(err)
+            } else {
+                match self
+                    .fetch(config, api_key, media, tmdb_id)
+                    .await
+                {
+                    Fetch::Ratings(ratings) => {
+                        cache_put(db, &cache_key, &ratings, ttl).await;
+                        Ok(ratings)
+                    }
+                    Fetch::Failed {
+                        message,
+                        rate_limit,
+                    } => {
+                        if let Some(wait) = rate_limit {
+                            self.inner
+                                .rate_limited
+                                .insert(api_key.to_string(), Instant::now() + wait);
+                        }
+                        self.inner
+                            .failures
+                            .insert(cache_key.clone(), message.clone());
+                        Err(message)
+                    }
+                }
+            }
+        };
+        drop(lock);
+        self.inner
+            .in_flight
+            .remove_if(&cache_key, |_, l| Arc::strong_count(l) == 1);
+        result
+    }
+
+    fn known_failure(&self, cache_key: &str, api_key: &str) -> Option<String> {
+        if let Some(err) = self
+            .inner
+            .failures
+            .get(cache_key)
+        {
+            return Some(err);
+        }
+        let gated = self
+            .inner
+            .rate_limited
+            .get(api_key)
+            .is_some_and(|until| Instant::now() < *until);
+        gated.then(|| RATE_LIMIT_MESSAGE.to_string())
+    }
+
+    async fn fetch(
+        &self,
+        config: &Config,
+        api_key: &str,
+        media: MediaType,
+        tmdb_id: u64,
+    ) -> Fetch {
+        let Ok(mut url) = reqwest::Url::parse(&format!(
+            "{}/tmdb/{media}/{tmdb_id}",
+            config
+                .mdblist_base_url
+                .trim_end_matches('/')
+        )) else {
+            return Fetch::Failed {
+                message: "MDBList is not configured correctly".into(),
+                rate_limit: None,
+            };
+        };
+        url.query_pairs_mut()
+            .append_pair("apikey", api_key);
+        for attempt in 0..2 {
+            let resp = match self
+                .inner
+                .client
+                .get(url.clone())
+                .send()
+                .await
+            {
+                Ok(r) => r,
+                Err(e) => {
+                    // `without_url`: the URL carries the API key.
+                    warn!(err = %e.without_url(), "MDBList request failed");
+                    return Fetch::Failed {
+                        message: "Failed to fetch from MDBList".into(),
+                        rate_limit: None,
+                    };
+                }
+            };
+            let status = resp.status();
+            if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+                let wait = retry_after(&resp);
+                if attempt == 0
+                    && let Some(wait) = wait.filter(|w| *w <= MAX_INLINE_RETRY)
+                {
+                    tokio::time::sleep(wait).await;
+                    continue;
+                }
+                let gate = wait
+                    .unwrap_or(Duration::from_secs(60))
+                    .clamp(Duration::from_secs(1), MAX_RATE_LIMIT_GATE);
+                warn!(?gate, "MDBList rate limit reached");
+                return Fetch::Failed {
+                    message: RATE_LIMIT_MESSAGE.into(),
+                    rate_limit: Some(gate),
+                };
+            }
+            if !status.is_success() {
+                warn!(status = status.as_u16(), "MDBList returned an error status");
+                return Fetch::Failed {
+                    message: format!("MDBList returned status {}", status.as_u16()),
+                    rate_limit: None,
+                };
+            }
+            return match resp
+                .json::<Value>()
+                .await
+            {
+                Ok(body) => Fetch::Ratings(parse_upstream(&body)),
+                Err(e) => {
+                    warn!(err = %e.without_url(), "MDBList returned an unreadable body");
+                    Fetch::Failed {
+                        message: "Failed to fetch from MDBList".into(),
+                        rate_limit: None,
+                    }
+                }
+            };
+        }
+        unreachable!("the retry loop always returns on its second pass")
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Cache (SQLite)
+// ---------------------------------------------------------------------------
+
+async fn cache_get(db: &SqlitePool, key: &str, ttl: Duration) -> Option<Vec<Rating>> {
+    let min_fetched = chrono::Utc::now().timestamp() - ttl.as_secs() as i64;
+    let row: Option<(String,)> = sqlx::query_as(
+        "SELECT ratings FROM mdblist_ratings_cache \
+         WHERE cache_key = ?1 AND fetched_at > ?2",
+    )
+    .bind(key)
+    .bind(min_fetched)
+    .fetch_optional(db)
+    .await
+    .inspect_err(|e| warn!(err = %e, "MDBList cache read failed"))
+    .ok()?;
+    serde_json::from_str(&row?.0).ok()
+}
+
+async fn cache_put(db: &SqlitePool, key: &str, ratings: &[Rating], ttl: Duration) {
+    let Ok(json) = serde_json::to_string(ratings) else {
+        return;
+    };
+    let now = chrono::Utc::now().timestamp();
+    let result = sqlx::query(
+        "INSERT INTO mdblist_ratings_cache (cache_key, ratings, fetched_at) \
+         VALUES (?1, ?2, ?3) \
+         ON CONFLICT(cache_key) DO UPDATE SET ratings = ?2, fetched_at = ?3",
+    )
+    .bind(key)
+    .bind(json)
+    .bind(now)
+    .execute(db)
+    .await;
+    // Entries past twice the TTL can never be served again.
+    let pruned = sqlx::query("DELETE FROM mdblist_ratings_cache WHERE fetched_at < ?1")
+        .bind(now - (ttl.as_secs() as i64).saturating_mul(2))
+        .execute(db)
+        .await;
+    for err in [result.err(), pruned.err()]
+        .into_iter()
+        .flatten()
+    {
+        warn!(err = %err, "MDBList cache write failed");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Handler
+// ---------------------------------------------------------------------------
+
+#[get("/moonfin/mdblist/ratings")]
+pub async fn moonfin_mdblist_ratings(
+    State(state): State<AppState>,
+    session: AuthSession,
+    Query(q): Query<RatingsQuery>,
+) -> Response {
+    let (Some(kind), Some(tmdb_id)) = (
+        q.kind
+            .as_deref()
+            .filter(|s| {
+                !s.trim()
+                    .is_empty()
+            }),
+        q.tmdb_id
+            .as_deref()
+            .filter(|s| {
+                !s.trim()
+                    .is_empty()
+            }),
+    ) else {
+        return bad_request("Missing required parameters: type, tmdbId");
+    };
+    let Ok(media) = kind
+        .trim()
+        .parse::<MediaType>()
+    else {
+        return bad_request("Invalid type. Expected: movie or show");
+    };
+    let Ok(tmdb_id) = tmdb_id
+        .trim()
+        .parse::<u64>()
+    else {
+        return bad_request("Invalid tmdbId. Expected a number");
+    };
+
+    // The caller's profile supplies their own key and chosen sources.
+    let profile = match resolved_profile(
+        &state,
+        session
+            .user
+            .id,
+        normalize_profile(
+            q.profile
+                .as_deref(),
+        ),
+    )
+    .await
+    {
+        Ok(p) => p,
+        Err(e) => {
+            warn!(err = %e, "MDBList could not load user settings");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "Error": "Internal error" })),
+            )
+                .into_response();
+        }
+    };
+    let config = &state
+        .ctx
+        .config;
+    let api_key = profile
+        .get("mdblistApiKey")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|k| !k.is_empty())
+        .or_else(|| config.mdblist_key());
+    let Some(api_key) = api_key else {
+        return Json(RatingsResponse::failed(NO_KEY_MESSAGE)).into_response();
+    };
+
+    match state
+        .ctx
+        .mdblist
+        .ratings(
+            &state
+                .ctx
+                .db,
+            config,
+            api_key,
+            media,
+            tmdb_id,
+        )
+        .await
+    {
+        Ok(all) => {
+            let sources: Option<Vec<String>> = profile
+                .get("mdblistRatingSources")
+                .and_then(Value::as_array)
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|s| {
+                            s.as_str()
+                                .map(str::to_string)
+                        })
+                        .collect()
+                });
+            Json(RatingsResponse::ok(filter_and_order(
+                &all,
+                sources.as_deref(),
+            )))
+            .into_response()
+        }
+        Err(message) => Json(RatingsResponse::failed(message)).into_response(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        Secret, init_app_with_ctx,
+        integration_test::{AUTH_HEADER, TestGuard, auth_header_with_token},
+        rewrite_request_uri,
+    };
+    use axum::Router;
+    use axum_test::{TestResponse, TestServer};
+    use http::header;
+    use httpmock::prelude::*;
+    use tower::{Layer, util::MapRequestLayer};
+
+    /// Fake key; never a real credential.
+    const KEY: &str = "fake-server-key-123";
+
+    struct Harness {
+        server: TestServer,
+        _guard: TestGuard,
+        token: String,
+        _data: tempfile::TempDir,
+    }
+
+    impl Harness {
+        async fn get(&self, path: &str) -> TestResponse {
+            self.server
+                .get(path)
+                .add_header(
+                    header::AUTHORIZATION,
+                    http::HeaderValue::from_str(&auth_header_with_token(&self.token))
+                        .unwrap(),
+                )
+                .await
+        }
+
+        async fn json(&self, path: &str) -> Value {
+            let resp = self
+                .get(path)
+                .await;
+            resp.assert_status_ok();
+            resp.json::<Value>()
+        }
+
+        async fn push(&self, settings: Value) {
+            self.server
+                .post("/Moonfin/Settings/Profile/global")
+                .add_header(
+                    header::AUTHORIZATION,
+                    http::HeaderValue::from_str(&auth_header_with_token(&self.token))
+                        .unwrap(),
+                )
+                .json(&json!({ "profile": settings, "clientId": "test" }))
+                .await
+                .assert_status_ok();
+        }
+    }
+
+    async fn harness(key: Option<&str>, base_url: String) -> Harness {
+        let data = tempfile::tempdir().unwrap();
+        let config = Config {
+            database_url: Some("sqlite::memory:".into()),
+            torrent_http_port: None,
+            torrent_peer_port: None,
+            disable_dht: true,
+            data_dir: data
+                .path()
+                .to_path_buf(),
+            mdblist_api_key: key.map(Secret::new),
+            mdblist_base_url: base_url,
+            ..Default::default()
+        };
+        let (router, ctx) = init_app_with_ctx(config)
+            .await
+            .unwrap();
+        let app = Router::new()
+            .fallback_service(MapRequestLayer::new(rewrite_request_uri).layer(router));
+        let server = TestServer::builder()
+            .mock_transport()
+            .build(app)
+            .unwrap();
+        server
+            .post("/Startup/User")
+            .json(&json!({ "Name": "test", "Password": "test" }))
+            .await;
+        server
+            .post("/Startup/Complete")
+            .await;
+        let token = server
+            .post("/Users/AuthenticateByName")
+            .add_header(
+                header::AUTHORIZATION,
+                http::HeaderValue::from_static(AUTH_HEADER),
+            )
+            .json(&json!({ "Username": "test", "Pw": "test" }))
+            .await
+            .json::<Value>()["AccessToken"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        Harness {
+            server,
+            _guard: TestGuard(ctx),
+            token,
+            _data: data,
+        }
+    }
+
+    fn upstream_body() -> Value {
+        json!({
+            "title": "The Matrix",
+            "type": "movie",
+            "ratings": [
+                { "source": "imdb", "value": 8.7, "score": 87, "votes": 2100000,
+                  "url": "https://www.imdb.com/title/tt0133093" },
+                { "source": "tmdb", "value": 82, "score": 82, "votes": 25000, "url": false },
+                { "source": "tomatoes", "value": 83, "score": 83, "votes": null, "url": null },
+                { "source": "popcorn", "value": 85, "score": 85, "votes": 250000 },
+                { "source": "letterboxd", "value": 8.2, "score": 82, "votes": 1500000 },
+                { "source": "metacritic", "value": 73, "score": 73, "votes": 35 },
+            ]
+        })
+    }
+
+    const URL_603: &str = "/Moonfin/MdbList/Ratings?type=movie&tmdbId=603&profile=tv";
+
+    #[tokio::test]
+    async fn returns_default_sources_in_moonbase_shape_and_hides_key() {
+        let mock = MockServer::start();
+        let m = mock.mock(|when, then| {
+            when.method(GET)
+                .path("/tmdb/movie/603")
+                .query_param("apikey", KEY);
+            then.status(200)
+                .json_body(upstream_body());
+        });
+        let h = harness(Some(KEY), mock.base_url()).await;
+
+        let resp = h
+            .get(URL_603)
+            .await;
+        resp.assert_status_ok();
+        let text = resp.text();
+        assert!(!text.contains(KEY));
+        let body: Value = serde_json::from_str(&text).unwrap();
+
+        assert_eq!(body["success"], true);
+        assert_eq!(body["error"], Value::Null);
+        let sources: Vec<&str> = body["ratings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| {
+                r["source"]
+                    .as_str()
+                    .unwrap()
+            })
+            .collect();
+        assert_eq!(sources, ["imdb", "tmdb", "tomatoes", "metacritic"]);
+        assert_eq!(
+            body["ratings"][0],
+            json!({
+                "source": "imdb", "value": 8.7, "score": 87.0,
+                "votes": 2100000, "url": "https://www.imdb.com/title/tt0133093"
+            })
+        );
+        // `url: false` upstream is relayed as null.
+        assert_eq!(body["ratings"][1]["url"], Value::Null);
+        m.assert_hits(1);
+    }
+
+    #[tokio::test]
+    async fn second_lookup_is_served_from_cache_for_any_profile_and_sources() {
+        let mock = MockServer::start();
+        let m = mock.mock(|when, then| {
+            when.method(GET)
+                .path("/tmdb/movie/603");
+            then.status(200)
+                .json_body(upstream_body());
+        });
+        let h = harness(Some(KEY), mock.base_url()).await;
+
+        h.json(URL_603)
+            .await;
+        h.push(json!({ "mdblistRatingSources": ["rtAudience", "letterboxd"] }))
+            .await;
+        let body = h
+            .json("/Moonfin/MdbList/Ratings?type=Movie&tmdbId=603")
+            .await;
+
+        m.assert_hits(1);
+        assert_eq!(body["success"], true);
+        let ratings = body["ratings"]
+            .as_array()
+            .unwrap();
+        assert_eq!(ratings[0]["source"], "tomatoes_audience");
+        assert_eq!(ratings[0]["value"], 85.0);
+        assert_eq!(ratings[1]["source"], "letterboxd");
+        // Letterboxd is rescaled from the 0-100 score to its native 0-5.
+        assert_eq!(ratings[1]["value"], 4.1);
+    }
+
+    #[tokio::test]
+    async fn fetched_ratings_are_persisted_in_sqlite() {
+        // Persisted so a restart does not re-spend the daily request quota.
+        let mock = MockServer::start();
+        let m = mock.mock(|when, then| {
+            when.method(GET)
+                .path("/tmdb/show/1396");
+            then.status(200)
+                .json_body(upstream_body());
+        });
+        let h = harness(Some(KEY), mock.base_url()).await;
+        let url = "/Moonfin/MdbList/Ratings?type=show&tmdbId=1396";
+        h.json(url)
+            .await;
+        let row: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM mdblist_ratings_cache")
+            .fetch_one(
+                &h._guard
+                    .0
+                    .db,
+            )
+            .await
+            .unwrap();
+        assert_eq!(row.0, 1);
+        m.assert_hits(1);
+    }
+
+    #[tokio::test]
+    async fn missing_key_answers_failure_without_calling_upstream() {
+        let mock = MockServer::start();
+        let m = mock.mock(|when, then| {
+            when.method(GET);
+            then.status(200)
+                .json_body(upstream_body());
+        });
+        let h = harness(None, mock.base_url()).await;
+
+        let body = h
+            .json(URL_603)
+            .await;
+        assert_eq!(body["success"], false);
+        assert!(
+            body["error"]
+                .as_str()
+                .unwrap()
+                .contains("No MDBList API key")
+        );
+        assert_eq!(body["ratings"], json!([]));
+        m.assert_hits(0);
+    }
+
+    #[tokio::test]
+    async fn users_own_key_wins_over_server_key() {
+        let mock = MockServer::start();
+        let own = mock.mock(|when, then| {
+            when.method(GET)
+                .path("/tmdb/movie/603")
+                .query_param("apikey", "fake-user-key");
+            then.status(200)
+                .json_body(upstream_body());
+        });
+        let h = harness(Some(KEY), mock.base_url()).await;
+        h.push(json!({ "mdblistApiKey": "fake-user-key" }))
+            .await;
+
+        let resp = h
+            .get(URL_603)
+            .await;
+        let text = resp.text();
+        assert!(!text.contains("fake-user-key") && !text.contains(KEY));
+        own.assert_hits(1);
+    }
+
+    #[tokio::test]
+    async fn user_key_alone_works_without_a_server_key() {
+        let mock = MockServer::start();
+        let m = mock.mock(|when, then| {
+            when.method(GET)
+                .path("/tmdb/movie/603")
+                .query_param("apikey", "fake-user-key");
+            then.status(200)
+                .json_body(upstream_body());
+        });
+        let h = harness(None, mock.base_url()).await;
+        h.push(json!({ "mdblistApiKey": "fake-user-key" }))
+            .await;
+        assert_eq!(
+            h.json(URL_603)
+                .await["success"],
+            true
+        );
+        m.assert_hits(1);
+    }
+
+    #[tokio::test]
+    async fn rejects_bad_requests_and_anonymous_callers() {
+        let mock = MockServer::start();
+        let m = mock.mock(|when, then| {
+            when.method(GET);
+            then.status(200)
+                .json_body(upstream_body());
+        });
+        let h = harness(Some(KEY), mock.base_url()).await;
+
+        for path in [
+            "/Moonfin/MdbList/Ratings",
+            "/Moonfin/MdbList/Ratings?type=movie",
+            "/Moonfin/MdbList/Ratings?tmdbId=603",
+            "/Moonfin/MdbList/Ratings?type=episode&tmdbId=603",
+            "/Moonfin/MdbList/Ratings?type=movie&tmdbId=tt0133093",
+            "/Moonfin/MdbList/Ratings?type=movie&tmdbId=../user",
+        ] {
+            let resp = h
+                .get(path)
+                .await;
+            resp.assert_status(StatusCode::BAD_REQUEST);
+            assert!(resp.json::<Value>()["Error"].is_string(), "{path}");
+        }
+        h.server
+            .get(URL_603)
+            .await
+            .assert_status(StatusCode::UNAUTHORIZED);
+        m.assert_hits(0);
+    }
+
+    #[tokio::test]
+    async fn unknown_title_and_server_errors_fail_softly_and_are_remembered() {
+        let mock = MockServer::start();
+        let not_found = mock.mock(|when, then| {
+            when.method(GET)
+                .path("/tmdb/movie/1");
+            then.status(404);
+        });
+        let broken = mock.mock(|when, then| {
+            when.method(GET)
+                .path("/tmdb/movie/2");
+            then.status(500)
+                .body(format!("upstream exploded for apikey={KEY}"));
+        });
+        let h = harness(Some(KEY), mock.base_url()).await;
+
+        for (id, status, mock_hits) in [(1, 404, &not_found), (2, 500, &broken)] {
+            let url = format!("/Moonfin/MdbList/Ratings?type=movie&tmdbId={id}");
+            for _ in 0..2 {
+                let resp = h
+                    .get(&url)
+                    .await;
+                resp.assert_status_ok();
+                let text = resp.text();
+                assert!(!text.contains(KEY));
+                let body: Value = serde_json::from_str(&text).unwrap();
+                assert_eq!(body["success"], false);
+                assert_eq!(body["error"], format!("MDBList returned status {status}"));
+            }
+            // The failure is remembered, so the repeat never reached upstream.
+            mock_hits.assert_hits(1);
+        }
+    }
+
+    #[tokio::test]
+    async fn rate_limit_backs_off_all_lookups_with_that_key() {
+        let mock = MockServer::start();
+        let limited = mock.mock(|when, then| {
+            when.method(GET)
+                .path("/tmdb/movie/1");
+            then.status(429)
+                .header("Retry-After", "120");
+        });
+        let other = mock.mock(|when, then| {
+            when.method(GET)
+                .path("/tmdb/movie/2");
+            then.status(200)
+                .json_body(upstream_body());
+        });
+        let h = harness(Some(KEY), mock.base_url()).await;
+
+        let body = h
+            .json("/Moonfin/MdbList/Ratings?type=movie&tmdbId=1")
+            .await;
+        assert_eq!(body["success"], false);
+        assert_eq!(body["error"], RATE_LIMIT_MESSAGE);
+        // A different title is not even attempted while the key is gated.
+        let body = h
+            .json("/Moonfin/MdbList/Ratings?type=movie&tmdbId=2")
+            .await;
+        assert_eq!(body["error"], RATE_LIMIT_MESSAGE);
+        limited.assert_hits(1);
+        other.assert_hits(0);
+    }
+
+    #[tokio::test]
+    async fn short_retry_after_is_retried_once_inline() {
+        let mock = MockServer::start();
+        let limited = mock.mock(|when, then| {
+            when.method(GET)
+                .path("/tmdb/movie/1");
+            then.status(429)
+                .header("Retry-After", "0");
+        });
+        let h = harness(Some(KEY), mock.base_url()).await;
+        let body = h
+            .json("/Moonfin/MdbList/Ratings?type=movie&tmdbId=1")
+            .await;
+        assert_eq!(body["error"], RATE_LIMIT_MESSAGE);
+        limited.assert_hits(2);
+    }
+
+    #[tokio::test]
+    async fn unreachable_upstream_never_leaks_the_key() {
+        let closed = {
+            let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            format!(
+                "http://{}",
+                l.local_addr()
+                    .unwrap()
+            )
+        };
+        let h = harness(Some(KEY), closed).await;
+        let resp = h
+            .get(URL_603)
+            .await;
+        resp.assert_status_ok();
+        let text = resp.text();
+        assert!(!text.contains(KEY), "{text}");
+        let body: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(body["success"], false);
+        assert_eq!(body["error"], "Failed to fetch from MDBList");
+    }
+
+    #[tokio::test]
+    async fn concurrent_lookups_share_one_upstream_call() {
+        let mock = MockServer::start();
+        let m = mock.mock(|when, then| {
+            when.method(GET)
+                .path("/tmdb/movie/603");
+            then.status(200)
+                .delay(Duration::from_millis(300))
+                .json_body(upstream_body());
+        });
+        let h = harness(Some(KEY), mock.base_url()).await;
+        let (a, b, c) = tokio::join!(h.get(URL_603), h.get(URL_603), h.get(URL_603));
+        for r in [a, b, c] {
+            assert_eq!(r.json::<Value>()["success"], true);
+        }
+        m.assert_hits(1);
+    }
+
+    #[tokio::test]
+    async fn ping_reports_mdblist_only_when_a_server_key_is_configured() {
+        let with = harness(Some(KEY), "http://127.0.0.1:1".into()).await;
+        assert_eq!(
+            with.json("/Moonfin/Ping")
+                .await["mdblistAvailable"],
+            true
+        );
+        let blank = harness(Some("   "), "http://127.0.0.1:1".into()).await;
+        assert_eq!(
+            blank
+                .json("/Moonfin/Ping")
+                .await["mdblistAvailable"],
+            false
+        );
+    }
+
+    #[test]
+    fn config_never_prints_the_key() {
+        let config = Config {
+            mdblist_api_key: Some(Secret::new(KEY)),
+            ..Default::default()
+        };
+        assert!(
+            !serde_json::to_string_pretty(&config)
+                .unwrap()
+                .contains(KEY)
+        );
+        assert!(!format!("{config:?}").contains(KEY));
+    }
+
+    #[test]
+    fn filter_falls_back_to_defaults_and_skips_missing_sources() {
+        let all = parse_upstream(&upstream_body());
+        let out = filter_and_order(&all, Some(&["trakt".into(), "metacritic".into()]));
+        assert_eq!(out.len(), 1);
+        assert_eq!(
+            out[0]
+                .source
+                .as_deref(),
+            Some("metacritic")
+        );
+        assert_eq!(filter_and_order(&all, Some(&[])).len(), 4);
+    }
+}

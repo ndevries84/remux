@@ -400,6 +400,7 @@ pub async fn init_app(
         games: games::GamesIndex::default(),
         game_thumbs: games::thumbs::ThumbService::default(),
         moonfin_settings: api::moonfin_settings::SettingsHub::default(),
+        mdblist: api::moonfin_mdblist::MdbListService::default(),
     };
     ctx.signals
         .register(services::media_tracker::MediaTrackerSubscriber { ctx: ctx.clone() });
@@ -517,6 +518,8 @@ pub struct AppContext {
     pub game_thumbs: games::thumbs::ThumbService,
     /// Moonfin settings-sync state (SSE fan-out, admin defaults cache).
     pub moonfin_settings: api::moonfin_settings::SettingsHub,
+    /// MDBList ratings proxy state (HTTP client, in-flight and failure memory).
+    pub mdblist: api::moonfin_mdblist::MdbListService,
 }
 
 impl AppContext {
@@ -713,6 +716,54 @@ pub struct Config {
     /// user's settings. A missing or invalid file means no defaults.
     #[serde(default)]
     pub moonfin_default_settings_path: Option<String>,
+    /// Server-wide MDBList API key (`MDBLIST_API_KEY`). Powers the Moonfin
+    /// ratings proxy for every user; users may also supply their own key in
+    /// their synced settings. Never logged or serialized.
+    #[serde(default)]
+    pub mdblist_api_key: Option<Secret>,
+    /// Origin of the MDBList API (overridable for tests).
+    #[serde(default = "default_mdblist_base_url")]
+    pub mdblist_base_url: String,
+    /// How long fetched MDBList ratings stay fresh, in hours (Moonbase: 7 days).
+    #[serde(default = "default_mdblist_cache_ttl_hours")]
+    pub mdblist_cache_ttl_hours: u64,
+}
+
+/// A credential that never reveals itself through `Debug` or `Serialize`
+/// (the startup banner logs the whole [`Config`]).
+#[derive(Clone, Deserialize)]
+#[serde(transparent)]
+pub struct Secret(String);
+
+impl Secret {
+    pub fn new(value: impl Into<String>) -> Self {
+        Self(value.into())
+    }
+
+    /// The secret value; only hand this to the service it authenticates with.
+    pub fn expose(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Debug for Secret {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Secret(<redacted>)")
+    }
+}
+
+impl Serialize for Secret {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str("<redacted>")
+    }
+}
+
+fn default_mdblist_base_url() -> String {
+    "https://api.mdblist.com".to_string()
+}
+
+fn default_mdblist_cache_ttl_hours() -> u64 {
+    24 * 7
 }
 
 fn default_games_saves_max_bytes_per_user() -> u64 {
@@ -862,6 +913,17 @@ impl Config {
     }
 }
 
+impl Config {
+    /// The configured server-wide MDBList key, if non-blank.
+    pub fn mdblist_key(&self) -> Option<&str> {
+        self.mdblist_api_key
+            .as_ref()
+            .map(Secret::expose)
+            .map(str::trim)
+            .filter(|k| !k.is_empty())
+    }
+}
+
 impl Default for Config {
     fn default() -> Self {
         Self {
@@ -893,6 +955,9 @@ impl Default for Config {
             games_thumbnails_enabled: default_games_thumbnails_enabled(),
             games_thumbnails_base_url: default_games_thumbnails_base_url(),
             moonfin_default_settings_path: None,
+            mdblist_api_key: None,
+            mdblist_base_url: default_mdblist_base_url(),
+            mdblist_cache_ttl_hours: default_mdblist_cache_ttl_hours(),
         }
         .resolve()
     }

@@ -199,4 +199,22 @@ mod tests {
             "https://thumbnails.libretro.com"
         );
     }
+
+    #[test]
+    fn mdblist_key_loads_from_env_and_is_unset_by_default() {
+        let env = config::Environment::default().source(Some({
+            let mut env = config::Map::new();
+            env.insert("MDBLIST_API_KEY".into(), "fake-key".into());
+            env
+        }));
+        let config = load_config(env).unwrap();
+        assert_eq!(config.mdblist_key(), Some("fake-key"));
+        assert_eq!(config.mdblist_base_url, "https://api.mdblist.com");
+
+        let config = load_config(
+            config::Environment::default().source(Some(config::Map::new())),
+        )
+        .unwrap();
+        assert_eq!(config.mdblist_key(), None);
+    }
 }

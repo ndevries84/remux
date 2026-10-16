@@ -335,7 +335,10 @@ async fn load_profiles(
 // ---------------------------------------------------------------------------
 
 #[get("/moonfin/ping")]
-pub async fn moonfin_ping(_session: AuthSession) -> Response {
+pub async fn moonfin_ping(
+    State(state): State<AppState>,
+    _session: AuthSession,
+) -> Response {
     Json(json!({
         "installed": true,
         "version": env!("CARGO_PKG_VERSION"),
@@ -343,7 +346,7 @@ pub async fn moonfin_ping(_session: AuthSession) -> Response {
         "serverName": "Remux",
         "seerrEnabled": false,
         "seerrUrl": null,
-        "mdblistAvailable": false,
+        "mdblistAvailable": state.ctx.config.mdblist_key().is_some(),
         "tmdbAvailable": false,
         "tmdbThumbsSupported": false,
         "messagesSupported": false,
@@ -385,23 +388,38 @@ pub async fn moonfin_settings_resolved(
             ),
         );
     };
-    let stored = match load_profiles(
-        &state
-            .ctx
-            .db,
+    match resolved_profile(
+        &state,
         session
             .user
             .id,
+        &profile,
     )
     .await
     {
-        Ok(s) => s,
-        Err(e) => return internal_error(e),
-    };
+        Ok(resolved) => Json(Value::Object(resolved)).into_response(),
+        Err(e) => internal_error(e),
+    }
+}
+
+/// Resolves `profile` (already validated lowercase) for `user` from
+/// `[device, global, admin defaults]`.
+pub(crate) async fn resolved_profile(
+    state: &AppState,
+    user: Uuid,
+    profile: &str,
+) -> Result<Profile, sqlx::Error> {
+    let stored = load_profiles(
+        &state
+            .ctx
+            .db,
+        user,
+    )
+    .await?;
     let empty = Profile::new();
     let mut layers: Vec<&Profile> = Vec::with_capacity(3);
     if profile != "global"
-        && let Some((device, ..)) = stored.get(&profile)
+        && let Some((device, ..)) = stored.get(profile)
     {
         layers.push(device);
     }
@@ -419,7 +437,7 @@ pub async fn moonfin_settings_resolved(
             )
             .unwrap_or(&empty),
     );
-    Json(Value::Object(resolve(&layers))).into_response()
+    Ok(resolve(&layers))
 }
 
 #[get("/moonfin/settings")]
