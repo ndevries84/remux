@@ -736,7 +736,8 @@ mod tests {
             aw.inner_rom,
             Some(ArchiveRom {
                 name: "aw.gba".into(),
-                size: 9
+                size: 9,
+                crc32: Some(crc32fast::hash(b"gba-bytes")),
             })
         );
         assert_eq!(aw.served_file_name(), "aw.gba");

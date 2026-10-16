@@ -67,6 +67,9 @@ pub enum ArchiveError {
 pub struct ArchiveRom {
     pub name: String,
     pub size: u64,
+    /// CRC-32 of the ROM as recorded in the archive index (no decompression
+    /// needed to read it). `None` when the archive does not record one.
+    pub crc32: Option<u32>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -98,6 +101,8 @@ struct Candidate {
     /// Sanitized base name.
     name: String,
     size: u64,
+    /// CRC-32 recorded in the archive index.
+    crc32: Option<u32>,
 }
 
 /// Last path segment of an entry name (either separator), or `None` when the
@@ -175,6 +180,7 @@ fn select_zip(path: &Path) -> Result<Option<Candidate>, ArchiveError> {
                 .to_string(),
             name,
             size: f.size(),
+            crc32: Some(f.crc32()),
         });
     }
     Ok(choose(candidates))
@@ -197,6 +203,9 @@ fn select_7z(path: &Path) -> Result<Option<Candidate>, ArchiveError> {
                     .to_string(),
                 name: entry_basename(f.name())?,
                 size: f.size(),
+                crc32: f
+                    .has_crc
+                    .then_some(f.crc as u32),
             })
         })
         .collect::<Vec<_>>();
@@ -209,6 +218,7 @@ pub fn inspect(archive: &Path) -> Result<Option<ArchiveRom>, ArchiveError> {
     Ok(select(archive)?.map(|c| ArchiveRom {
         name: c.name,
         size: c.size,
+        crc32: c.crc32,
     }))
 }
 
@@ -286,6 +296,7 @@ pub fn extract_rom(
     Ok(ArchiveRom {
         name: cand.name,
         size: written,
+        crc32: cand.crc32,
     })
 }
 
@@ -494,7 +505,8 @@ mod tests {
             rom,
             ArchiveRom {
                 name: "First.sfc".into(),
-                size: 9
+                size: 9,
+                crc32: Some(crc32fast::hash(b"first-rom")),
             }
         );
     }

@@ -399,6 +399,7 @@ pub async fn init_app(
         started_at: Utc::now(),
         games: games::GamesIndex::default(),
         game_thumbs: games::thumbs::ThumbService::default(),
+        game_meta: games::meta::MetaService::default(),
         moonfin_settings: api::moonfin_settings::SettingsHub::default(),
         mdblist: api::moonfin_mdblist::MdbListService::default(),
     };
@@ -516,6 +517,8 @@ pub struct AppContext {
     pub games: games::GamesIndex,
     /// Libretro box-art fetcher/cache for the games endpoints.
     pub game_thumbs: games::thumbs::ThumbService,
+    /// libretro-database metadata lookups for game details.
+    pub game_meta: games::meta::MetaService,
     /// Moonfin settings-sync state (SSE fan-out, admin defaults cache).
     pub moonfin_settings: api::moonfin_settings::SettingsHub,
     /// MDBList ratings proxy state (HTTP client, in-flight and failure memory).
@@ -715,6 +718,28 @@ pub struct Config {
     /// (`<base>/<Platform>/Named_Boxarts/<Name>.png`).
     #[serde(default = "default_games_thumbnails_base_url")]
     pub games_thumbnails_base_url: String,
+    /// Fill game detail (genre, developer, publisher, franchise, region,
+    /// year, players) from the libretro database, downloaded per system and
+    /// cached. Set to false to never make these outbound requests.
+    #[serde(default = "default_games_metadata_enabled")]
+    pub games_metadata_enabled: bool,
+    /// Origin of the libretro database `.rdb` files
+    /// (`<base>/<Platform>.rdb`), or a local directory holding them. The
+    /// `raw.githubusercontent.com/libretro/libretro-database/master/rdb`
+    /// origin is a fresher alternative to the default CDN.
+    #[serde(default = "default_games_metadata_rdb_base_url")]
+    pub games_metadata_rdb_base_url: String,
+    /// Days before a cached `.rdb` is revalidated upstream (ETag /
+    /// Last-Modified, so an unchanged file is not downloaded again).
+    #[serde(default = "default_games_metadata_refresh_days")]
+    pub games_metadata_refresh_days: u32,
+    /// Seconds to wait after a failed database download before trying again.
+    #[serde(default = "default_games_metadata_retry_secs")]
+    pub games_metadata_retry_secs: u64,
+    /// Largest ROM (bytes) hashed for CRC matching; bigger files (disc
+    /// images) are matched by name only.
+    #[serde(default = "default_games_metadata_max_hash_bytes")]
+    pub games_metadata_max_hash_bytes: u64,
     /// Optional JSON file holding admin default Moonfin settings (a flat
     /// profile object). It is the lowest-precedence layer when resolving a
     /// user's settings. A missing or invalid file means no defaults.
@@ -788,6 +813,26 @@ fn default_games_thumbnails_enabled() -> bool {
 
 fn default_games_thumbnails_base_url() -> String {
     "https://thumbnails.libretro.com".to_string()
+}
+
+fn default_games_metadata_enabled() -> bool {
+    true
+}
+
+fn default_games_metadata_rdb_base_url() -> String {
+    "https://cdn.jsdelivr.net/gh/libretro/libretro-database@master/rdb".to_string()
+}
+
+fn default_games_metadata_refresh_days() -> u32 {
+    30
+}
+
+fn default_games_metadata_retry_secs() -> u64 {
+    300
+}
+
+fn default_games_metadata_max_hash_bytes() -> u64 {
+    64 * 1024 * 1024
 }
 
 fn default_games_library_name() -> String {
@@ -963,6 +1008,11 @@ impl Default for Config {
             games_saves_max_files_per_user: default_games_saves_max_files_per_user(),
             games_thumbnails_enabled: default_games_thumbnails_enabled(),
             games_thumbnails_base_url: default_games_thumbnails_base_url(),
+            games_metadata_enabled: default_games_metadata_enabled(),
+            games_metadata_rdb_base_url: default_games_metadata_rdb_base_url(),
+            games_metadata_refresh_days: default_games_metadata_refresh_days(),
+            games_metadata_retry_secs: default_games_metadata_retry_secs(),
+            games_metadata_max_hash_bytes: default_games_metadata_max_hash_bytes(),
             moonfin_default_settings_path: None,
             mdblist_api_key: None,
             mdblist_base_url: default_mdblist_base_url(),

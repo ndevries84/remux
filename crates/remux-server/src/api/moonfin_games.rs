@@ -95,6 +95,22 @@ struct GameDetailDto {
     backend_override_supported: bool,
     size_bytes: u64,
     bios: Vec<BiosDto>,
+    // Metadata from the libretro databases; each field is left out until it
+    // is known (the client treats absent and empty alike).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    genre: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    developer: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    publisher: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    franchise: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    region: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    year: Option<u16>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    players: Option<u8>,
 }
 
 impl From<&Game> for GameSummaryDto {
@@ -135,17 +151,21 @@ async fn snapshot_for(state: &AppState, lib: &str) -> Option<Arc<GamesSnapshot>>
     if !lib_matches(state, lib) {
         return None;
     }
-    Some(
-        state
-            .ctx
-            .games
-            .snapshot(
-                &state
-                    .ctx
-                    .config,
-            )
-            .await,
-    )
+    let cfg = &state
+        .ctx
+        .config;
+    let snap = state
+        .ctx
+        .games
+        .snapshot(cfg)
+        .await;
+    // Get the metadata databases for these systems on their way (once per
+    // scan, in the background) so a game opened later already finds them.
+    state
+        .ctx
+        .game_meta
+        .prewarm(cfg, &snap);
+    Some(snap)
 }
 
 // ---------------------------------------------------------------------------
@@ -272,11 +292,28 @@ pub async fn games_detail(
     summary.file_name = game
         .served_file_name()
         .to_string();
+    let meta = state
+        .ctx
+        .game_meta
+        .get(
+            &state
+                .ctx
+                .config,
+            game,
+        )
+        .await;
     Json(GameDetailDto {
         summary,
         backend_override_supported: false,
         size_bytes: game.served_size_bytes(),
         bios,
+        genre: meta.genre,
+        developer: meta.developer,
+        publisher: meta.publisher,
+        franchise: meta.franchise,
+        region: meta.region,
+        year: meta.year,
+        players: meta.players,
     })
     .into_response()
 }
@@ -955,6 +992,9 @@ mod tests {
                 r.to_string_lossy()
                     .into_owned(),
             ],
+            // Never reach the real libretro CDN from tests; metadata tests
+            // opt in with their own mock base URL.
+            games_metadata_enabled: false,
             ..Default::default()
         };
         tweak(&mut config);
@@ -2358,5 +2398,464 @@ mod tests {
         assert_eq!(SaveKind::from_query(Some("SRAM")), SaveKind::Sram);
         assert_eq!(SaveKind::from_query(Some("settings")), SaveKind::Settings);
         assert_eq!(SaveKind::from_query(Some("../x")), SaveKind::State);
+    }
+
+    // -----------------------------------------------------------------------
+    // Game metadata from the libretro databases
+    // -----------------------------------------------------------------------
+
+    use games::rdb::test_support::{Rec, build as build_rdb};
+
+    const NES_RDB_PATH: &str = "/Nintendo%20-%20Nintendo%20Entertainment%20System.rdb";
+    const NES_RDB_FILE: &str =
+        "games/meta/rdb/Nintendo - Nintendo Entertainment System.rdb";
+
+    async fn meta_harness(
+        base: String,
+        tweak: impl FnOnce(&mut Config) + Send + 'static,
+    ) -> Harness {
+        harness_with(true, move |c| {
+            c.games_metadata_enabled = true;
+            c.games_metadata_rdb_base_url = base;
+            tweak(c);
+        })
+        .await
+    }
+
+    fn nes_dir(h: &Harness) -> std::path::PathBuf {
+        h._roms
+            .path()
+            .join("NES")
+    }
+
+    async fn game_id(h: &Harness, title: &str) -> String {
+        let list = get_json(h, &format!("/Moonfin/Games/{}/Games", h.lib)).await;
+        id_of(&list, title)
+    }
+
+    async fn detail(h: &Harness, id: &str) -> Value {
+        let resp = h
+            .server
+            .get(&format!("/Moonfin/Games/{}/Games/{id}", h.lib))
+            .add_header(header::AUTHORIZATION, h.auth())
+            .await;
+        resp.assert_status_ok();
+        resp.json::<Value>()
+    }
+
+    /// Detail polled until `key` appears (the lookup finishes in the
+    /// background after a first, possibly bare, answer).
+    async fn detail_until(h: &Harness, id: &str, key: &str) -> Value {
+        let mut last = Value::Null;
+        for _ in 0..200 {
+            last = detail(h, id).await;
+            if last
+                .get(key)
+                .is_some()
+            {
+                return last;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        panic!("detail never gained {key:?}: {last}");
+    }
+
+    const META_KEYS: [&str; 9] = [
+        "genre",
+        "developer",
+        "publisher",
+        "franchise",
+        "region",
+        "year",
+        "players",
+        "overview",
+        "rating",
+    ];
+
+    fn assert_no_meta(v: &Value) {
+        for k in META_KEYS {
+            assert!(
+                v.get(k)
+                    .is_none(),
+                "unexpected {k}: {v}"
+            );
+        }
+    }
+
+    fn rdb_mock<'a>(
+        mock: &'a httpmock::MockServer,
+        body: Vec<u8>,
+    ) -> httpmock::Mock<'a> {
+        mock.mock(|when, then| {
+            when.method(httpmock::Method::GET)
+                .path(NES_RDB_PATH);
+            then.status(200)
+                .header("etag", "\"abc\"")
+                .body(body);
+        })
+    }
+
+    fn mario_record() -> Rec {
+        Rec::named("Super Mario (USA)")
+            .crc(crc32fast::hash(ROM_BYTES))
+            .genre("Platform")
+            .developer("Nintendo R&D4")
+            .publisher("Nintendo")
+            .franchise("Mario")
+            .region("USA")
+            .year(1985)
+            .users(2)
+    }
+
+    #[tokio::test]
+    async fn metadata_fills_detail_from_crc_and_caches_the_database() {
+        let mock = httpmock::MockServer::start_async().await;
+        let hit = rdb_mock(&mock, build_rdb(&[mario_record()]));
+        let h = meta_harness(mock.base_url(), |_| {}).await;
+        let id = game_id(&h, "Super Mario (U)").await;
+
+        let d = detail_until(&h, &id, "genre").await;
+        assert_eq!(d["genre"], "Platform");
+        assert_eq!(d["developer"], "Nintendo R&D4");
+        assert_eq!(d["publisher"], "Nintendo");
+        assert_eq!(d["franchise"], "Mario");
+        assert_eq!(d["region"], "USA");
+        assert_eq!(d["year"], json!(1985));
+        assert_eq!(d["players"], json!(2));
+        // Existing fields are intact; overview/rating stay out of phase A.
+        assert_eq!(d["id"], id);
+        assert!(d["sizeBytes"].is_number());
+        assert!(
+            d.get("overview")
+                .is_none()
+                && d.get("rating")
+                    .is_none()
+        );
+
+        // The list never carries metadata.
+        let list = get_json(&h, &format!("/Moonfin/Games/{}/Games", h.lib)).await;
+        for g in list
+            .as_array()
+            .unwrap()
+        {
+            assert_no_meta(g);
+        }
+        // A game the database does not know has the fields omitted, not null.
+        let zelda = game_id(&h, "Zelda").await;
+        assert_no_meta(&detail(&h, &zelda).await);
+
+        // Downloaded once, cached with its validator; later requests are free.
+        hit.assert_hits(1);
+        assert!(
+            h.data
+                .path()
+                .join(NES_RDB_FILE)
+                .is_file()
+        );
+        assert_eq!(
+            std::fs::read_to_string(
+                h.data
+                    .path()
+                    .join(format!("{NES_RDB_FILE}.etag"))
+            )
+            .unwrap(),
+            "\"abc\""
+        );
+        detail(&h, &id).await;
+        hit.assert_hits(1);
+    }
+
+    #[tokio::test]
+    async fn records_sharing_a_crc_merge_regardless_of_order() {
+        let crc = crc32fast::hash(ROM_BYTES);
+        let rich = Rec::named("Super Mario (USA)")
+            .crc(crc)
+            .genre("Platform")
+            .developer("Nintendo")
+            .year(1985);
+        let bare = Rec::named("Super Mario (USA)")
+            .crc(crc)
+            .region("USA");
+        for recs in [[rich.clone(), bare.clone()], [bare, rich]] {
+            let mock = httpmock::MockServer::start_async().await;
+            rdb_mock(&mock, build_rdb(&recs));
+            let h = meta_harness(mock.base_url(), |_| {}).await;
+            let id = game_id(&h, "Super Mario (U)").await;
+            let d = detail_until(&h, &id, "genre").await;
+            assert_eq!(d["genre"], "Platform");
+            assert_eq!(d["developer"], "Nintendo");
+            assert_eq!(d["year"], json!(1985));
+            assert_eq!(d["region"], "USA");
+        }
+    }
+
+    #[tokio::test]
+    async fn nes_header_matches_the_headerless_record() {
+        let body = b"rom body that is not the whole file";
+        let mut file = b"NES\x1A".to_vec();
+        file.extend([0u8; 12]);
+        file.extend(body);
+        let mock = httpmock::MockServer::start_async().await;
+        rdb_mock(
+            &mock,
+            build_rdb(&[
+                Rec::named("Headered (Japan)")
+                    .crc(crc32fast::hash(body))
+                    .region("Japan"),
+                Rec::named("Other")
+                    .crc(1)
+                    .genre("Sports"),
+            ]),
+        );
+        let h = meta_harness(mock.base_url(), |_| {}).await;
+        std::fs::write(nes_dir(&h).join("Headered.nes"), &file).unwrap();
+        let id = game_id(&h, "Headered").await;
+        let d = detail_until(&h, &id, "region").await;
+        assert_eq!(d["region"], "Japan");
+        assert!(
+            d.get("genre")
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn zipped_rom_matches_by_archive_crc_without_extraction() {
+        let inner = b"inner rom bytes, never unpacked";
+        let mock = httpmock::MockServer::start_async().await;
+        rdb_mock(
+            &mock,
+            build_rdb(&[Rec::named("Zipped (USA)")
+                .crc(crc32fast::hash(inner))
+                .genre("Puzzle")]),
+        );
+        let h = meta_harness(mock.base_url(), |_| {}).await;
+        std::fs::write(
+            nes_dir(&h).join("Zipped.zip"),
+            zip_bytes(&[("inner.nes", inner)]),
+        )
+        .unwrap();
+        let id = game_id(&h, "Zipped").await;
+        let d = detail_until(&h, &id, "genre").await;
+        assert_eq!(d["genre"], "Puzzle");
+        assert_eq!(d["fileName"], "inner.nes");
+        assert!(!extracted_dir(&h, &id).exists());
+    }
+
+    #[tokio::test]
+    async fn name_fallback_exact_and_unambiguous_prefix_only() {
+        let mock = httpmock::MockServer::start_async().await;
+        rdb_mock(
+            &mock,
+            build_rdb(&[
+                Rec::named("Name Only (USA)")
+                    .crc(0x1234)
+                    .genre("Sports"),
+                Rec::named("Tetris (USA)")
+                    .crc(0x2345)
+                    .genre("Puzzle"),
+                Rec::named("Tetris (EUR)")
+                    .crc(0x3456)
+                    .genre("Puzzle"),
+                Rec::named("Super Mario Land (World)")
+                    .crc(0x4567)
+                    .genre("Platform"),
+            ]),
+        );
+        // A 4 byte hash cap means no CRC for these tiny files: names only.
+        let h = meta_harness(mock.base_url(), |c| c.games_metadata_max_hash_bytes = 4)
+            .await;
+        for f in ["Tetris.nes", "Super Mario Land.nes"] {
+            std::fs::write(nes_dir(&h).join(f), b"some rom bytes").unwrap();
+        }
+        let id = game_id(&h, "Super Mario Land").await;
+        assert_eq!(detail_until(&h, &id, "genre").await["genre"], "Platform");
+        // Two equally close games: nothing rather than a guess.
+        assert_no_meta(&detail(&h, &game_id(&h, "Tetris").await).await);
+    }
+
+    #[tokio::test]
+    async fn exact_name_matches_when_the_crc_is_unknown() {
+        let mock = httpmock::MockServer::start_async().await;
+        rdb_mock(
+            &mock,
+            build_rdb(&[Rec::named("Name Only (USA)")
+                .crc(0x1234)
+                .genre("Sports")]),
+        );
+        let h = meta_harness(mock.base_url(), |_| {}).await;
+        std::fs::write(nes_dir(&h).join("Name Only (USA).nes"), b"hacked rom data")
+            .unwrap();
+        let id = game_id(&h, "Name Only (USA)").await;
+        assert_eq!(detail_until(&h, &id, "genre").await["genre"], "Sports");
+    }
+
+    #[tokio::test]
+    async fn failed_downloads_leave_detail_bare_and_back_off() {
+        for broken in [
+            (500u16, Vec::new()),
+            (200, b"definitely not an rdb".to_vec()),
+        ] {
+            let mock = httpmock::MockServer::start_async().await;
+            let hit = mock.mock(|when, then| {
+                when.method(httpmock::Method::GET)
+                    .path(NES_RDB_PATH);
+                then.status(broken.0)
+                    .body(
+                        broken
+                            .1
+                            .clone(),
+                    );
+            });
+            let h = meta_harness(mock.base_url(), |c| c.games_metadata_retry_secs = 1)
+                .await;
+            let id = game_id(&h, "Super Mario (U)").await;
+
+            assert_no_meta(&detail(&h, &id).await);
+            assert_no_meta(&detail(&h, &id).await);
+            hit.assert_hits(1);
+            assert!(
+                !h.data
+                    .path()
+                    .join(NES_RDB_FILE)
+                    .exists()
+            );
+
+            tokio::time::sleep(std::time::Duration::from_millis(1200)).await;
+            assert_no_meta(&detail(&h, &id).await);
+            hit.assert_hits(2);
+        }
+    }
+
+    #[tokio::test]
+    async fn disabled_metadata_makes_no_requests() {
+        let mock = httpmock::MockServer::start_async().await;
+        let any = mock.mock(|when, then| {
+            when.method(httpmock::Method::GET);
+            then.status(200)
+                .body(build_rdb(&[mario_record()]));
+        });
+        let h =
+            meta_harness(mock.base_url(), |c| c.games_metadata_enabled = false).await;
+        let id = game_id(&h, "Super Mario (U)").await;
+        assert_no_meta(&detail(&h, &id).await);
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert_no_meta(&detail(&h, &id).await);
+        any.assert_hits(0);
+    }
+
+    fn seed_cached_rdb(h: &Harness, age_days: u64, etag: Option<&str>) -> Vec<u8> {
+        let path = h
+            .data
+            .path()
+            .join(NES_RDB_FILE);
+        std::fs::create_dir_all(
+            path.parent()
+                .unwrap(),
+        )
+        .unwrap();
+        let bytes = build_rdb(&[mario_record()]);
+        std::fs::write(&path, &bytes).unwrap();
+        if let Some(e) = etag {
+            std::fs::write(format!("{}.etag", path.display()), e).unwrap();
+        }
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(
+                std::time::SystemTime::now()
+                    - std::time::Duration::from_secs(age_days * 24 * 3600),
+            )
+            .unwrap();
+        bytes
+    }
+
+    #[tokio::test]
+    async fn stale_cache_revalidates_with_etag_and_keeps_the_file_on_304() {
+        let mock = httpmock::MockServer::start_async().await;
+        let hit = mock.mock(|when, then| {
+            when.method(httpmock::Method::GET)
+                .path(NES_RDB_PATH)
+                .header("if-none-match", "\"v1\"");
+            then.status(304);
+        });
+        let h = meta_harness(mock.base_url(), |_| {}).await;
+        let before = seed_cached_rdb(&h, 40, Some("\"v1\""));
+        let id = game_id(&h, "Super Mario (U)").await;
+
+        assert_eq!(detail_until(&h, &id, "genre").await["genre"], "Platform");
+        hit.assert_hits(1);
+        let path = h
+            .data
+            .path()
+            .join(NES_RDB_FILE);
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        // Revalidated: the freshness clock restarted.
+        let age = std::time::SystemTime::now()
+            .duration_since(
+                std::fs::metadata(&path)
+                    .unwrap()
+                    .modified()
+                    .unwrap(),
+            )
+            .unwrap();
+        assert!(age < std::time::Duration::from_secs(24 * 3600));
+        // And a later request does not ask again.
+        detail(&h, &id).await;
+        hit.assert_hits(1);
+    }
+
+    #[tokio::test]
+    async fn fresh_cache_needs_no_network() {
+        let mock = httpmock::MockServer::start_async().await;
+        let any = mock.mock(|when, then| {
+            when.method(httpmock::Method::GET)
+                .path(NES_RDB_PATH);
+            then.status(500);
+        });
+        let h = meta_harness(mock.base_url(), |_| {}).await;
+        seed_cached_rdb(&h, 1, Some("\"v1\""));
+        let id = game_id(&h, "Super Mario (U)").await;
+        assert_eq!(detail_until(&h, &id, "genre").await["genre"], "Platform");
+        any.assert_hits(0);
+    }
+
+    #[tokio::test]
+    async fn stale_cache_survives_an_unreachable_upstream() {
+        let mock = httpmock::MockServer::start_async().await;
+        let any = mock.mock(|when, then| {
+            when.method(httpmock::Method::GET)
+                .path(NES_RDB_PATH);
+            then.status(503);
+        });
+        let h = meta_harness(mock.base_url(), |_| {}).await;
+        seed_cached_rdb(&h, 90, None);
+        let id = game_id(&h, "Super Mario (U)").await;
+        assert_eq!(detail_until(&h, &id, "genre").await["genre"], "Platform");
+        any.assert_hits(1);
+    }
+
+    #[tokio::test]
+    async fn local_directory_base_is_read_in_place() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path()
+                .join("Nintendo - Nintendo Entertainment System.rdb"),
+            build_rdb(&[mario_record()]),
+        )
+        .unwrap();
+        let base = dir
+            .path()
+            .to_string_lossy()
+            .into_owned();
+        let h = meta_harness(base, |_| {}).await;
+        let id = game_id(&h, "Super Mario (U)").await;
+        assert_eq!(detail_until(&h, &id, "genre").await["genre"], "Platform");
+        assert!(
+            !h.data
+                .path()
+                .join(NES_RDB_FILE)
+                .exists()
+        );
     }
 }
