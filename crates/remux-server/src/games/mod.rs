@@ -37,6 +37,15 @@ pub fn games_view_id() -> Uuid {
     Uuid::new_v5(&Uuid::NAMESPACE_OID, b"remux-games-view")
 }
 
+/// The Games view id as clients see it: Jellyfin's dashless "simple" form,
+/// exactly what `/userviews` emits for the view's `Id`. Clients compare ids
+/// as exact strings, so everything that advertises the id must use this.
+pub fn games_view_id_string() -> String {
+    games_view_id()
+        .simple()
+        .to_string()
+}
+
 /// Synthetic Games view for `/userviews`.
 ///
 /// `CollectionType` is `boxsets`: Moonfin's home screen skips

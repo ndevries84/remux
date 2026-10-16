@@ -162,7 +162,7 @@ pub async fn games_libraries(
         .config;
     let libs: Vec<LibraryDto> = if games::is_active(cfg) {
         vec![LibraryDto {
-            id: games::games_view_id().to_string(),
+            id: games::games_view_id_string(),
             name: cfg
                 .games_library_name
                 .clone(),
@@ -847,7 +847,7 @@ mod tests {
             token: String::new(),
             _roms: roms,
             data,
-            lib: games::games_view_id().to_string(),
+            lib: games::games_view_id_string(),
         };
         h.token = h
             .login("test", "test")
@@ -879,6 +879,12 @@ mod tests {
         let h = harness(true).await;
         let body = get_json(&h, "/Moonfin/Games/Libraries").await;
         assert_eq!(body, json!([{ "id": h.lib, "name": "Games" }]));
+        assert_eq!(
+            h.lib,
+            games::games_view_id()
+                .simple()
+                .to_string()
+        );
 
         let off = harness(false).await;
         assert_eq!(get_json(&off, "/Moonfin/Games/Libraries").await, json!([]));
@@ -899,6 +905,40 @@ mod tests {
             .expect_failure()
             .await
             .assert_status_not_found();
+    }
+
+    #[tokio::test]
+    async fn library_id_string_equals_userviews_id() {
+        // Moonfin matches the two with an exact string compare.
+        let h = harness(true).await;
+        let libs = get_json(&h, "/Moonfin/Games/Libraries").await;
+        let lib_id = libs[0]["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let views = get_json(&h, "/UserViews").await;
+        let view_id = views["Items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|v| v["Name"] == "Games")
+            .expect("games view in /UserViews")["Id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert_eq!(lib_id, view_id);
+        // The hyphenated form still routes.
+        let hyphenated = games::games_view_id().to_string();
+        assert_eq!(
+            get_json(&h, &format!("/Moonfin/Games/{hyphenated}/Systems"))
+                .await
+                .as_array()
+                .map(|a| a.is_empty()),
+            get_json(&h, &format!("/Moonfin/Games/{}/Systems", h.lib))
+                .await
+                .as_array()
+                .map(|a| a.is_empty()),
+        );
     }
 
     #[tokio::test]
