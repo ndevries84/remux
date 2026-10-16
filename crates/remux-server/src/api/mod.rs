@@ -22,7 +22,10 @@ pub mod metadata;
 pub mod moonfin_emulator;
 pub mod moonfin_games;
 pub mod moonfin_mdblist;
+pub mod moonfin_ratings;
 pub mod moonfin_settings;
+#[cfg(test)]
+pub(crate) mod moonfin_test_support;
 pub mod movies;
 pub mod music;
 pub mod networking;

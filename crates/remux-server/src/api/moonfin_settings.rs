@@ -153,11 +153,14 @@ impl Drop for StreamGuard {
 // Pure helpers
 // ---------------------------------------------------------------------------
 
-fn error_response(status: StatusCode, message: impl Into<String>) -> Response {
+pub(crate) fn error_response(
+    status: StatusCode,
+    message: impl Into<String>,
+) -> Response {
     (status, Json(json!({ "Error": message.into() }))).into_response()
 }
 
-fn internal_error(err: impl std::fmt::Display) -> Response {
+pub(crate) fn internal_error(err: impl std::fmt::Display) -> Response {
     error!(%err, "moonfin settings storage error");
     error_response(StatusCode::INTERNAL_SERVER_ERROR, "Internal error")
 }
