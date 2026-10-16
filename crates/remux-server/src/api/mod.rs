@@ -19,6 +19,7 @@ pub mod localization;
 pub mod logs;
 pub mod lyrics;
 pub mod metadata;
+pub mod moonfin_emulator;
 pub mod moonfin_games;
 pub mod movies;
 pub mod music;
