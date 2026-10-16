@@ -193,5 +193,10 @@ mod tests {
                 .games_roots
                 .is_empty()
         );
+        assert!(config.games_thumbnails_enabled);
+        assert_eq!(
+            config.games_thumbnails_base_url,
+            "https://thumbnails.libretro.com"
+        );
     }
 }

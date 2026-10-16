@@ -4,6 +4,7 @@
 
 pub mod resolver;
 pub mod scanner;
+pub mod thumbs;
 
 use std::{
     path::PathBuf,

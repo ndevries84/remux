@@ -398,6 +398,7 @@ pub async fn init_app(
         signals,
         started_at: Utc::now(),
         games: games::GamesIndex::default(),
+        game_thumbs: games::thumbs::ThumbService::default(),
         moonfin_settings: api::moonfin_settings::SettingsHub::default(),
     };
     ctx.signals
@@ -512,6 +513,8 @@ pub struct AppContext {
     pub started_at: chrono::DateTime<chrono::Utc>,
     /// Lazily-scanned index of retro games (see [`games`]).
     pub games: games::GamesIndex,
+    /// Libretro box-art fetcher/cache for the games endpoints.
+    pub game_thumbs: games::thumbs::ThumbService,
     /// Moonfin settings-sync state (SSE fan-out, admin defaults cache).
     pub moonfin_settings: api::moonfin_settings::SettingsHub,
 }
@@ -697,6 +700,14 @@ pub struct Config {
     /// Per-user cap on the number of stored game save files.
     #[serde(default = "default_games_saves_max_files_per_user")]
     pub games_saves_max_files_per_user: u32,
+    /// Serve game box art/snaps/titles fetched (and cached) from the libretro
+    /// thumbnail server. Set to false to never make outbound requests.
+    #[serde(default = "default_games_thumbnails_enabled")]
+    pub games_thumbnails_enabled: bool,
+    /// Origin of the libretro-style thumbnail server
+    /// (`<base>/<Platform>/Named_Boxarts/<Name>.png`).
+    #[serde(default = "default_games_thumbnails_base_url")]
+    pub games_thumbnails_base_url: String,
     /// Optional JSON file holding admin default Moonfin settings (a flat
     /// profile object). It is the lowest-precedence layer when resolving a
     /// user's settings. A missing or invalid file means no defaults.
@@ -710,6 +721,14 @@ fn default_games_saves_max_bytes_per_user() -> u64 {
 
 fn default_games_saves_max_files_per_user() -> u32 {
     2000
+}
+
+fn default_games_thumbnails_enabled() -> bool {
+    true
+}
+
+fn default_games_thumbnails_base_url() -> String {
+    "https://thumbnails.libretro.com".to_string()
 }
 
 fn default_games_library_name() -> String {
@@ -871,6 +890,8 @@ impl Default for Config {
             games_library_name: default_games_library_name(),
             games_saves_max_bytes_per_user: default_games_saves_max_bytes_per_user(),
             games_saves_max_files_per_user: default_games_saves_max_files_per_user(),
+            games_thumbnails_enabled: default_games_thumbnails_enabled(),
+            games_thumbnails_base_url: default_games_thumbnails_base_url(),
             moonfin_default_settings_path: None,
         }
         .resolve()

@@ -274,14 +274,99 @@ pub async fn games_detail(
     .into_response()
 }
 
-/// Artwork is not implemented; the client treats a 404 as "no art" (Moonbase
-/// itself answers 404 for missing artwork).
+#[query]
+pub struct ThumbQuery {
+    #[serde(default, rename = "type")]
+    pub kind: Option<String>,
+}
+
+/// Box art / snap / title screen for a game, fetched from the libretro
+/// thumbnail server and cached (see [`games::thumbs`]).
+///
+/// The Moonfin client (legacy artwork adapter) latches a 404 as "no art" for
+/// the screen's lifetime and any other failure as transient until the route is
+/// re-entered, with no Retry-After handling; `CachedNetworkImage` just shows
+/// the placeholder. So a fetch is awaited for a short budget (a normal first
+/// load returns the image directly) and only then falls back to
+/// `503` + `Retry-After`; the detached fetch keeps filling the cache.
 #[get("/moonfin/games/{lib}/thumb/{game_id}")]
 pub async fn games_thumb(
+    State(state): State<AppState>,
     _session: AuthSession,
-    Path((_lib, _game_id)): Path<(String, String)>,
-) -> StatusCode {
-    StatusCode::NOT_FOUND
+    Path((lib, game_id)): Path<(String, String)>,
+    Query(q): Query<ThumbQuery>,
+    req: Request<Body>,
+) -> Response {
+    let cfg = &state
+        .ctx
+        .config;
+    if !cfg.games_thumbnails_enabled {
+        return not_found(false);
+    }
+    let Some(snap) = snapshot_for(&state, &lib).await else {
+        return not_found(false);
+    };
+    let Some(game) = snap.game(&game_id) else {
+        return not_found(false);
+    };
+    let kind = games::thumbs::ThumbKind::parse_lenient(
+        q.kind
+            .as_deref(),
+    );
+    match state
+        .ctx
+        .game_thumbs
+        .get(cfg, game, kind)
+        .await
+    {
+        games::thumbs::ThumbResult::Found(path) => {
+            let mut resp = match ServeFile::new(path)
+                .oneshot(req)
+                .await
+            {
+                Ok(r) => r.map(Body::new),
+                Err(never) => match never {},
+            };
+            if resp
+                .status()
+                .is_success()
+            {
+                let h = resp.headers_mut();
+                h.insert(header::CONTENT_TYPE, HeaderValue::from_static("image/png"));
+                h.insert(
+                    header::CACHE_CONTROL,
+                    HeaderValue::from_static("private, max-age=86400"),
+                );
+            }
+            resp
+        }
+        games::thumbs::ThumbResult::Missing => not_found(true),
+        games::thumbs::ThumbResult::Retry(after) => {
+            let secs = after
+                .as_secs()
+                .max(1);
+            let mut resp = StatusCode::SERVICE_UNAVAILABLE.into_response();
+            let h = resp.headers_mut();
+            h.insert(header::RETRY_AFTER, HeaderValue::from(secs));
+            h.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+            resp
+        }
+    }
+}
+
+/// 404 for artwork. Confirmed absence may be cached briefly by clients.
+fn not_found(confirmed: bool) -> Response {
+    let mut resp = StatusCode::NOT_FOUND.into_response();
+    resp.headers_mut()
+        .insert(
+            header::CACHE_CONTROL,
+            HeaderValue::from_static(if confirmed {
+                "private, max-age=300"
+            } else {
+                "no-store"
+            }),
+        );
+    resp
 }
 
 // ---------------------------------------------------------------------------
@@ -1219,6 +1304,274 @@ mod tests {
                 "installed": false, "downloading": false, "state": "idle",
                 "error": null, "filesInstalled": 0,
             })
+        );
+    }
+
+    const MARIO_PATH: &str = "/Nintendo%20-%20Nintendo%20Entertainment%20System/Named_Boxarts/Super%20Mario%20%28U%29.png";
+
+    fn png_bytes() -> Vec<u8> {
+        let mut v = b"\x89PNG\r\n\x1a\n".to_vec();
+        v.extend_from_slice(b"fake image data");
+        v
+    }
+
+    async fn thumb_harness(mock: &httpmock::MockServer) -> Harness {
+        let base = mock.base_url();
+        harness_with(true, move |c| c.games_thumbnails_base_url = base).await
+    }
+
+    async fn thumb_get(h: &Harness, id: &str, query: &str) -> axum_test::TestResponse {
+        h.server
+            .get(&format!("/Moonfin/Games/{}/Thumb/{id}?{query}", h.lib))
+            .add_header(header::AUTHORIZATION, h.auth())
+            .await
+    }
+
+    async fn mario_id(h: &Harness) -> String {
+        let games = get_json(h, &format!("/Moonfin/Games/{}/Games", h.lib)).await;
+        id_of(&games, "Super Mario (U)")
+    }
+
+    #[tokio::test]
+    async fn thumb_hit_is_cached_and_not_refetched() {
+        let mock = httpmock::MockServer::start_async().await;
+        let hit = mock
+            .mock_async(|when, then| {
+                when.method(httpmock::Method::GET)
+                    .path(MARIO_PATH);
+                then.status(200)
+                    .header("content-type", "image/png")
+                    .body(png_bytes());
+            })
+            .await;
+        let h = thumb_harness(&mock).await;
+        let id = mario_id(&h).await;
+
+        for _ in 0..2 {
+            let resp = thumb_get(&h, &id, "type=boxart&artVersion=2").await;
+            resp.assert_status_ok();
+            assert_eq!(resp.header(header::CONTENT_TYPE), "image/png");
+            assert_eq!(resp.header(header::CACHE_CONTROL), "private, max-age=86400");
+            assert_eq!(
+                resp.as_bytes()
+                    .as_ref(),
+                png_bytes().as_slice()
+            );
+        }
+        hit.assert_hits_async(1)
+            .await;
+        assert!(
+            h.data
+                .path()
+                .join(format!("games/thumbs/nes/boxart/{id}.png"))
+                .is_file()
+        );
+    }
+
+    #[tokio::test]
+    async fn thumb_falls_back_to_short_name_and_kind_selects_folder() {
+        let mock = httpmock::MockServer::start_async().await;
+        let snap = mock
+            .mock_async(|when, then| {
+                when.method(httpmock::Method::GET)
+                    .path("/Nintendo%20-%20Nintendo%20Entertainment%20System/Named_Snaps/Super%20Mario.png");
+                then.status(200)
+                    .body(png_bytes());
+            })
+            .await;
+        let h = thumb_harness(&mock).await;
+        let id = mario_id(&h).await;
+        // "Super Mario (U)" 404s (no mock), "Super Mario" matches.
+        thumb_get(&h, &id, "type=snap")
+            .await
+            .assert_status_ok();
+        snap.assert_hits_async(1)
+            .await;
+        assert!(
+            h.data
+                .path()
+                .join(format!("games/thumbs/nes/snap/{id}.png"))
+                .is_file()
+        );
+    }
+
+    #[tokio::test]
+    async fn thumb_miss_is_404_and_negative_cached() {
+        let mock = httpmock::MockServer::start_async().await;
+        let any = mock
+            .mock_async(|when, then| {
+                when.method(httpmock::Method::GET);
+                then.status(404);
+            })
+            .await;
+        let h = thumb_harness(&mock).await;
+        let id = mario_id(&h).await;
+
+        thumb_get(&h, &id, "type=boxart")
+            .await
+            .assert_status_not_found();
+        // stem "Super Mario (U)" (== title) and short "Super Mario".
+        let first = any
+            .hits_async()
+            .await;
+        assert_eq!(first, 2);
+        assert!(
+            h.data
+                .path()
+                .join(format!("games/thumbs/nes/boxart/{id}.miss"))
+                .is_file()
+        );
+
+        thumb_get(&h, &id, "type=boxart")
+            .await
+            .assert_status_not_found();
+        assert_eq!(
+            any.hits_async()
+                .await,
+            first,
+            "miss marker prevents refetch"
+        );
+    }
+
+    #[tokio::test]
+    async fn thumb_upstream_error_is_503_and_not_negative_cached() {
+        let mock = httpmock::MockServer::start_async().await;
+        let any = mock
+            .mock_async(|when, then| {
+                when.method(httpmock::Method::GET);
+                then.status(500);
+            })
+            .await;
+        let h = thumb_harness(&mock).await;
+        let id = mario_id(&h).await;
+
+        let resp = thumb_get(&h, &id, "type=boxart").await;
+        assert_eq!(resp.status_code(), http::StatusCode::SERVICE_UNAVAILABLE);
+        assert!(
+            resp.header(header::RETRY_AFTER)
+                .to_str()
+                .unwrap()
+                .parse::<u64>()
+                .unwrap()
+                >= 1
+        );
+        let hits = any
+            .hits_async()
+            .await;
+        assert!(hits >= 1);
+        assert!(
+            !h.data
+                .path()
+                .join(format!("games/thumbs/nes/boxart/{id}.miss"))
+                .exists()
+        );
+        // Backoff: an immediate retry does not hit the failing upstream again.
+        let again = thumb_get(&h, &id, "type=boxart").await;
+        assert_eq!(again.status_code(), http::StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            any.hits_async()
+                .await,
+            hits
+        );
+    }
+
+    #[tokio::test]
+    async fn thumb_non_png_body_is_not_cached() {
+        let mock = httpmock::MockServer::start_async().await;
+        mock.mock_async(|when, then| {
+            when.method(httpmock::Method::GET);
+            then.status(200)
+                .body("<html>captive portal</html>");
+        })
+        .await;
+        let h = thumb_harness(&mock).await;
+        let id = mario_id(&h).await;
+        let resp = thumb_get(&h, &id, "type=boxart").await;
+        assert_eq!(resp.status_code(), http::StatusCode::SERVICE_UNAVAILABLE);
+        assert!(
+            !h.data
+                .path()
+                .join(format!("games/thumbs/nes/boxart/{id}.png"))
+                .exists()
+        );
+    }
+
+    #[tokio::test]
+    async fn thumb_concurrent_requests_share_one_fetch() {
+        let mock = httpmock::MockServer::start_async().await;
+        let hit = mock
+            .mock_async(|when, then| {
+                when.method(httpmock::Method::GET)
+                    .path(MARIO_PATH);
+                then.status(200)
+                    .delay(Duration::from_millis(300))
+                    .body(png_bytes());
+            })
+            .await;
+        let h = thumb_harness(&mock).await;
+        let id = mario_id(&h).await;
+        let (a, b, c) = tokio::join!(
+            thumb_get(&h, &id, "type=boxart"),
+            thumb_get(&h, &id, "type=boxart"),
+            thumb_get(&h, &id, "type=boxart"),
+        );
+        a.assert_status_ok();
+        b.assert_status_ok();
+        c.assert_status_ok();
+        hit.assert_hits_async(1)
+            .await;
+    }
+
+    #[tokio::test]
+    async fn thumb_unknown_game_auth_and_disabled() {
+        let mock = httpmock::MockServer::start_async().await;
+        let any = mock
+            .mock_async(|when, then| {
+                when.method(httpmock::Method::GET);
+                then.status(200)
+                    .body(png_bytes());
+            })
+            .await;
+        let h = thumb_harness(&mock).await;
+        let id = mario_id(&h).await;
+
+        thumb_get(&h, "nope", "type=boxart")
+            .await
+            .assert_status_not_found();
+        let wrong_lib = h
+            .server
+            .get(&format!("/Moonfin/Games/{}/Thumb/{id}", Uuid::new_v4()))
+            .add_header(header::AUTHORIZATION, h.auth())
+            .expect_failure()
+            .await;
+        wrong_lib.assert_status_not_found();
+        let anon = h
+            .server
+            .get(&format!("/Moonfin/Games/{}/Thumb/{id}", h.lib))
+            .expect_failure()
+            .await;
+        assert_eq!(anon.status_code(), http::StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            any.hits_async()
+                .await,
+            0
+        );
+
+        let base = mock.base_url();
+        let off = harness_with(true, move |c| {
+            c.games_thumbnails_base_url = base;
+            c.games_thumbnails_enabled = false;
+        })
+        .await;
+        let id = mario_id(&off).await;
+        thumb_get(&off, &id, "type=boxart")
+            .await
+            .assert_status_not_found();
+        assert_eq!(
+            any.hits_async()
+                .await,
+            0,
+            "disabled never goes upstream"
         );
     }
 
