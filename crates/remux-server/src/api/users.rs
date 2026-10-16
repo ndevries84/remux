@@ -1403,6 +1403,9 @@ pub async fn users_items_get(
     Path((user_id, id)): Path<(Uuid, Uuid)>,
     Query(q): Query<api::GetItemsQuery>,
 ) -> Result<impl IntoResponse> {
+    if let Some(view) = super::items::games_view_for(&state, id) {
+        return Ok(Json(view).into_response());
+    }
     return Ok(Json(
         item(
             state,
@@ -1763,6 +1766,18 @@ pub async fn userviews(
     // Inject a synthetic Live TV view if any enabled channels exist
     if has_channels {
         items.push(livetv_view_item());
+    }
+    if crate::games::is_active(
+        &state
+            .ctx
+            .config,
+    ) {
+        items.push(crate::games::games_view_item(
+            &state
+                .ctx
+                .config
+                .games_library_name,
+        ));
     }
 
     let count = items.len() as i64;

@@ -163,4 +163,35 @@ mod tests {
             std::net::IpAddr::from(std::net::Ipv4Addr::UNSPECIFIED)
         );
     }
+
+    #[test]
+    fn games_roots_parse_as_comma_separated_list() {
+        let env = config::Environment::default().source(Some({
+            let mut env = config::Map::new();
+            env.insert("GAMES_ENABLED".into(), "true".into());
+            env.insert("GAMES_ROOTS".into(), "/roms,/more roms".into());
+            env
+        }));
+
+        let config = load_config(env).unwrap();
+
+        assert!(config.games_enabled);
+        assert_eq!(config.games_roots, vec!["/roms", "/more roms"]);
+        assert_eq!(config.games_library_name, "Games");
+    }
+
+    #[test]
+    fn games_default_to_disabled_with_no_roots() {
+        let config = load_config(
+            config::Environment::default().source(Some(config::Map::new())),
+        )
+        .unwrap();
+
+        assert!(!config.games_enabled);
+        assert!(
+            config
+                .games_roots
+                .is_empty()
+        );
+    }
 }

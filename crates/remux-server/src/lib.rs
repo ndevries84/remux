@@ -58,6 +58,7 @@ pub use common::stable_media_uuid;
 pub mod db;
 #[cfg(feature = "desktop")]
 pub mod embedded_static;
+pub mod games;
 pub mod intro;
 mod iptv;
 pub mod localization;
@@ -218,7 +219,11 @@ pub fn load_config(
     env: config::Environment,
 ) -> std::result::Result<Config, config::ConfigError> {
     config::Config::builder()
-        .add_source(env.try_parsing(true))
+        .add_source(
+            env.try_parsing(true)
+                .list_separator(",")
+                .with_list_parse_key("games_roots"),
+        )
         .build()?
         .try_deserialize()
 }
@@ -392,6 +397,7 @@ pub async fn init_app(
         addons,
         signals,
         started_at: Utc::now(),
+        games: games::GamesIndex::default(),
     };
     ctx.signals
         .register(services::media_tracker::MediaTrackerSubscriber { ctx: ctx.clone() });
@@ -503,6 +509,8 @@ pub struct AppContext {
     pub signals: signals::Signals,
     /// When this server process started.
     pub started_at: chrono::DateTime<chrono::Utc>,
+    /// Lazily-scanned index of retro games (see [`games`]).
+    pub games: games::GamesIndex,
 }
 
 impl AppContext {
@@ -668,6 +676,22 @@ pub struct Config {
     /// tracing spans to. `None` (the default) disables tracing export
     /// entirely — normal log output is unaffected either way.
     pub otlp_endpoint: Option<String>,
+    /// Enables the retro-games feature (synthetic Games view and, later, the
+    /// `/moonfin/games` endpoints). Off by default.
+    #[serde(default)]
+    pub games_enabled: bool,
+    /// Root directories scanned for games, laid out as
+    /// `<root>/<System>/[<Game>/]<rom>`. As an environment variable this is a
+    /// comma-separated list (`GAMES_ROOTS=/roms,/more-roms`).
+    #[serde(default)]
+    pub games_roots: Vec<String>,
+    /// Display name of the synthetic Games view.
+    #[serde(default = "default_games_library_name")]
+    pub games_library_name: String,
+}
+
+fn default_games_library_name() -> String {
+    "Games".to_string()
 }
 
 fn default_jellyfin_version() -> String {
@@ -820,6 +844,9 @@ impl Default for Config {
             log_file_max_files: default_log_file_max_files(),
             log_file_retention_days: default_log_file_retention_days(),
             otlp_endpoint: None,
+            games_enabled: false,
+            games_roots: Vec::new(),
+            games_library_name: default_games_library_name(),
         }
         .resolve()
     }

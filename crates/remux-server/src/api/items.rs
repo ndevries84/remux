@@ -995,6 +995,11 @@ pub async fn items_flat(
     // Jellyfin ignores the MediaTypes query parameter for this request.
     // Without this, supplying a value (e.g. Video) would exclude Series collections.
     q.media_types = None;
+    if q.parent_id
+        .is_some_and(|p| games_view_for(&state, p).is_some())
+    {
+        return Ok(Json(Vec::<api::BaseItemDto>::new()));
+    }
     let client = session
         .device
         .jellyfin_client();
@@ -1084,6 +1089,19 @@ pub async fn items(
     }
 
     //trace!(?q);
+    if q.parent_id
+        .is_some_and(|p| games_view_for(&state, p).is_some())
+    {
+        // The synthetic Games view has no DB children.
+        return Ok(Json(api::BaseItemDtoQueryResult {
+            items: vec![],
+            total_record_count: 0,
+            start_index: q
+                .start_index
+                .unwrap_or(0),
+            ..Default::default()
+        }));
+    }
     let items = get_items(state.clone(), session.clone(), q.clone(), true)
         .await?
         .preload_playlist_runtimes(
@@ -2603,6 +2621,16 @@ async fn item_for_user(
 
 /// Jellyfin web requests `/Items/livetv` (literal string) when navigating to
 /// the Live TV section — handle it before the `{id}` UUID route.
+/// The synthetic Games view item when `id` is its id and the games feature is
+/// active; `None` otherwise (so a disabled feature leaves the id a plain 404).
+pub fn games_view_for(state: &AppState, id: Uuid) -> Option<api::BaseItemDto> {
+    let cfg = &state
+        .ctx
+        .config;
+    (id == crate::games::games_view_id() && crate::games::is_active(cfg))
+        .then(|| crate::games::games_view_item(&cfg.games_library_name))
+}
+
 #[get("/items/livetv")]
 pub async fn items_livetv(_session: auth::AuthSession) -> Result<impl IntoResponse> {
     Ok(Json(super::shows::livetv_view_item()))
@@ -2616,6 +2644,9 @@ pub async fn items_get(
     Path(id): Path<Uuid>,
     Query(q): Query<api::GetItemsQuery>,
 ) -> Result<impl IntoResponse> {
+    if let Some(view) = games_view_for(&state, id) {
+        return Ok(Json(view).into_response());
+    }
     return Ok(Json(
         item_for_user(
             state,
