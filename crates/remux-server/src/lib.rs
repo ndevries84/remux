@@ -688,6 +688,20 @@ pub struct Config {
     /// Display name of the synthetic Games view.
     #[serde(default = "default_games_library_name")]
     pub games_library_name: String,
+    /// Per-user cap on total bytes of stored game saves.
+    #[serde(default = "default_games_saves_max_bytes_per_user")]
+    pub games_saves_max_bytes_per_user: u64,
+    /// Per-user cap on the number of stored game save files.
+    #[serde(default = "default_games_saves_max_files_per_user")]
+    pub games_saves_max_files_per_user: u32,
+}
+
+fn default_games_saves_max_bytes_per_user() -> u64 {
+    512 * 1024 * 1024
+}
+
+fn default_games_saves_max_files_per_user() -> u32 {
+    2000
 }
 
 fn default_games_library_name() -> String {
@@ -847,6 +861,8 @@ impl Default for Config {
             games_enabled: false,
             games_roots: Vec::new(),
             games_library_name: default_games_library_name(),
+            games_saves_max_bytes_per_user: default_games_saves_max_bytes_per_user(),
+            games_saves_max_files_per_user: default_games_saves_max_files_per_user(),
         }
         .resolve()
     }
