@@ -353,7 +353,7 @@ pub async fn moonfin_ping(
         "tmdbAvailable": false,
         "tmdbThumbsSupported": false,
         "messagesSupported": false,
-        "recommendationsSupported": false,
+        "recommendationsSupported": true,
     }))
     .into_response()
 }
@@ -991,7 +991,7 @@ mod tests {
                 "tmdbAvailable": false,
                 "tmdbThumbsSupported": false,
                 "messagesSupported": false,
-                "recommendationsSupported": false,
+                "recommendationsSupported": true,
             })
         );
     }

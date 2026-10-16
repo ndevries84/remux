@@ -128,6 +128,17 @@ impl Harness {
 /// Saves a movie with a unique TMDB id (the canonical-id check rejects
 /// media without one) and returns its id in the dashless form `BaseItemDto.Id` serialises as.
 pub(crate) async fn seed_movie(ctx: &AppContext, title: &str, tmdb: i64) -> String {
+    seed_movie_full(ctx, title, tmdb, &[], None).await
+}
+
+/// [`seed_movie`] with genres and a certification age (parental rating).
+pub(crate) async fn seed_movie_full(
+    ctx: &AppContext,
+    title: &str,
+    tmdb: i64,
+    genres: &[&str],
+    certification_age: Option<i32>,
+) -> String {
     use crate::db;
     let external_ids = db::ExternalIds {
         tmdb: Some(tmdb),
@@ -143,12 +154,39 @@ pub(crate) async fn seed_movie(ctx: &AppContext, title: &str, tmdb: i64) -> Stri
         title: title.into(),
         kind: db::MediaKind::Movie,
         external_ids,
+        certification_age,
+        certification: certification_age.map(|a| format!("age-{a}")),
         ..Default::default()
     };
     media
         .save(&ctx.db)
         .await
         .unwrap();
+    if !genres.is_empty() {
+        let names: Vec<String> = genres
+            .iter()
+            .map(|g| g.to_string())
+            .collect();
+        let pairs = db::build_genre_relations_from_names(
+            media.id,
+            &names,
+            db::MediaKind::Genre,
+        );
+        let genre_rows: Vec<_> = pairs
+            .iter()
+            .map(|(_, m)| m.clone())
+            .collect();
+        let relations: Vec<_> = pairs
+            .into_iter()
+            .map(|(r, _)| r)
+            .collect();
+        db::Media::upsert(&ctx.db, &genre_rows)
+            .await
+            .unwrap();
+        db::MediaRelation::upsert(&ctx.db, &relations)
+            .await
+            .unwrap();
+    }
     media
         .id
         .simple()

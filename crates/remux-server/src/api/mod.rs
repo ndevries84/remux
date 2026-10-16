@@ -25,6 +25,7 @@ pub mod moonfin_games;
 pub mod moonfin_mdblist;
 pub mod moonfin_ratings;
 pub mod moonfin_settings;
+pub mod moonfin_similar;
 #[cfg(test)]
 pub(crate) mod moonfin_test_support;
 pub mod movies;
