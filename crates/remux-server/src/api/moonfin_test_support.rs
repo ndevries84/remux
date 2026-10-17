@@ -24,8 +24,13 @@ pub(crate) struct Harness {
 
 impl Harness {
     pub async fn new() -> Self {
+        Self::new_with(|_| {}).await
+    }
+
+    /// [`Harness::new`] with a chance to adjust the `Config` first.
+    pub async fn new_with(tweak: impl FnOnce(&mut Config)) -> Self {
         let data = tempfile::tempdir().unwrap();
-        let config = Config {
+        let mut config = Config {
             database_url: Some("sqlite::memory:".into()),
             torrent_http_port: None,
             torrent_peer_port: None,
@@ -35,6 +40,7 @@ impl Harness {
                 .to_path_buf(),
             ..Default::default()
         };
+        tweak(&mut config);
         let (router, ctx) = init_app_with_ctx(config)
             .await
             .unwrap();

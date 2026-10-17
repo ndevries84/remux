@@ -852,28 +852,7 @@ pub async fn games_bios(
 // Cores
 // ---------------------------------------------------------------------------
 
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct CoresStatusDto {
-    installed: bool,
-    downloading: bool,
-    state: &'static str,
-    error: Option<String>,
-    files_installed: u32,
-}
-
-/// Remux does not host EmulatorJS cores, so this is a constant "idle" status
-/// (the same state Moonbase reports before anything is installed).
-#[get("/moonfin/games/cores/status")]
-pub async fn games_cores_status(_session: AuthSession) -> Json<CoresStatusDto> {
-    Json(CoresStatusDto {
-        installed: false,
-        downloading: false,
-        state: "idle",
-        error: None,
-        files_installed: 0,
-    })
-}
+// Status, install and upload live in `moonfin_cores.rs`.
 
 // ---------------------------------------------------------------------------
 // Saves

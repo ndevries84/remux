@@ -20,6 +20,7 @@ pub mod logs;
 pub mod lyrics;
 pub mod metadata;
 pub mod moonfin_collections;
+pub mod moonfin_cores;
 pub mod moonfin_emulator;
 pub mod moonfin_games;
 pub mod moonfin_mdblist;

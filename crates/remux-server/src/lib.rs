@@ -210,6 +210,15 @@ pub async fn serve(config: Config, paths: FilesystemPaths) -> Result<()> {
 /// games are not active. Part of starting a server (not of building the app),
 /// so tests that arrange their library after boot are unaffected.
 pub fn spawn_games_warmup(ctx: &AppContext) {
+    // Clear leftovers of an install interrupted by a restart (cores are
+    // independent of the games feature flag).
+    let cleanup_ctx = ctx.clone();
+    tokio::spawn(async move {
+        cleanup_ctx
+            .cores
+            .cleanup_stale(&cleanup_ctx.config)
+            .await;
+    });
     if !games::is_active(&ctx.config) {
         return;
     }
@@ -422,6 +431,7 @@ pub async fn init_app(
         games: games::GamesIndex::default(),
         game_thumbs: games::thumbs::ThumbService::default(),
         game_meta: games::meta::MetaService::default(),
+        cores: games::cores::CoresService::default(),
         moonfin_settings: api::moonfin_settings::SettingsHub::default(),
         mdblist: api::moonfin_mdblist::MdbListService::default(),
     };
@@ -541,6 +551,8 @@ pub struct AppContext {
     pub game_thumbs: games::thumbs::ThumbService,
     /// libretro-database metadata lookups for game details.
     pub game_meta: games::meta::MetaService,
+    /// Install state of the server-hosted EmulatorJS bundle.
+    pub cores: games::cores::CoresService,
     /// Moonfin settings-sync state (SSE fan-out, admin defaults cache).
     pub moonfin_settings: api::moonfin_settings::SettingsHub,
     /// MDBList ratings proxy state (HTTP client, in-flight and failure memory).
@@ -776,6 +788,24 @@ pub struct Config {
     /// unchanged archive is not fetched again).
     #[serde(default = "default_games_launchbox_refresh_days")]
     pub games_launchbox_refresh_days: u32,
+    /// Override for the EmulatorJS bundle archive (7z or zip) the server
+    /// installs from `POST /Moonfin/Games/Cores/Install`. Defaults to the
+    /// pinned release. Requires `games_cores_sha256`; unset means the pinned
+    /// release is used.
+    #[serde(default)]
+    pub games_cores_url: Option<String>,
+    /// Expected SHA-256 (64 hex digits) of the `games_cores_url` archive.
+    #[serde(default)]
+    pub games_cores_sha256: Option<String>,
+    /// Expected byte length of the `games_cores_url` archive (optional).
+    #[serde(default)]
+    pub games_cores_size: Option<u64>,
+    /// Largest cores archive accepted, download or upload, in bytes.
+    #[serde(default = "default_games_cores_max_download_bytes")]
+    pub games_cores_max_download_bytes: u64,
+    /// Most bytes extracted from a cores archive (zip-bomb guard).
+    #[serde(default = "default_games_cores_max_extract_bytes")]
+    pub games_cores_max_extract_bytes: u64,
     /// Optional JSON file holding admin default Moonfin settings (a flat
     /// profile object). It is the lowest-precedence layer when resolving a
     /// user's settings. A missing or invalid file means no defaults.
@@ -894,6 +924,14 @@ fn default_games_launchbox_url() -> String {
 
 fn default_games_launchbox_refresh_days() -> u32 {
     30
+}
+
+fn default_games_cores_max_download_bytes() -> u64 {
+    400 * 1024 * 1024
+}
+
+fn default_games_cores_max_extract_bytes() -> u64 {
+    1024 * 1024 * 1024
 }
 
 fn default_games_library_name() -> String {
@@ -1077,6 +1115,11 @@ impl Default for Config {
             games_launchbox_enabled: false,
             games_launchbox_url: default_games_launchbox_url(),
             games_launchbox_refresh_days: default_games_launchbox_refresh_days(),
+            games_cores_url: None,
+            games_cores_sha256: None,
+            games_cores_size: None,
+            games_cores_max_download_bytes: default_games_cores_max_download_bytes(),
+            games_cores_max_extract_bytes: default_games_cores_max_extract_bytes(),
             moonfin_default_settings_path: None,
             moonfin_web_path: None,
             moonfin_web_default_server_url: None,

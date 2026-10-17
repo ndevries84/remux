@@ -24,7 +24,10 @@ use remux_macros::get;
 use tower::ServiceExt;
 use tower_http::services::ServeFile;
 
-use crate::{AppState, games::resolver::Core};
+use crate::{
+    AppState,
+    games::{self, resolver::Core},
+};
 
 const PLAYER_HTML: &str = include_str!("../../assets/moonfin/player.html");
 const BRIDGE_JS: &str = include_str!("../../assets/moonfin/moonfin-bridge.js");
@@ -39,7 +42,7 @@ const NONCE_PLACEHOLDER: &str = "__CSP_NONCE__";
 /// executed in this origin. To bump: pick a stable release at least two weeks
 /// old, confirm `https://cdn.emulatorjs.org/<version>/data/loader.js` exists,
 /// and re-verify `moonfin-bridge.js` (it reaches into EmulatorJS internals).
-const EMULATORJS_VERSION: &str = "4.2.3";
+pub(crate) const EMULATORJS_VERSION: &str = "4.2.3";
 const CDN_ORIGIN: &str = "https://cdn.emulatorjs.org";
 /// Self-hosted data URL, relative to `/moonfin/emulatorjs/player.html`.
 const SELF_HOSTED_DATA_URL: &str = "./data/";
@@ -53,18 +56,16 @@ struct PlayerQuery {
 }
 
 fn data_root(state: &AppState) -> PathBuf {
-    state
-        .ctx
-        .config
-        .data_dir
-        .join("games")
-        .join("emulatorjs")
-        .join("data")
+    games::cores::data_dir(
+        &state
+            .ctx
+            .config,
+    )
 }
 
 /// Joins `requested` under `root`, rejecting anything but plain path
 /// components (no `..`, absolute paths, drive prefixes or backslashes).
-pub(super) fn contained_path(root: &FsPath, requested: &str) -> Option<PathBuf> {
+pub(crate) fn contained_path(root: &FsPath, requested: &str) -> Option<PathBuf> {
     if requested.contains('\\') || requested.contains('\0') {
         return None;
     }
@@ -142,9 +143,9 @@ pub async fn emulator_player(
             Err(_) => return (StatusCode::BAD_REQUEST, "unknown core").into_response(),
         },
     };
-    let self_hosted = tokio::fs::try_exists(data_root(&state))
-        .await
-        .unwrap_or(false);
+    // A half-extracted or stale folder must not flip the player to a broken
+    // self-hosted mode: it needs the required files and a matching version.
+    let self_hosted = games::cores::data_installed(&data_root(&state)).await;
     let (data_url, script_origin) = if self_hosted {
         (SELF_HOSTED_DATA_URL.to_string(), "'self'")
     } else {
@@ -209,10 +210,7 @@ pub async fn emulator_bridge() -> Response {
 
 async fn serve_data(state: &AppState, requested: &str, req: Request<Body>) -> Response {
     let root = data_root(state);
-    if !tokio::fs::try_exists(&root)
-        .await
-        .unwrap_or(false)
-    {
+    if !games::cores::data_installed(&root).await {
         return StatusCode::NOT_FOUND.into_response();
     }
     let requested = if requested
@@ -417,7 +415,9 @@ mod tests {
             .path()
             .join("games/emulatorjs/data");
         std::fs::create_dir_all(root.join("cores")).unwrap();
-        std::fs::write(root.join("loader.js"), "// loader").unwrap();
+        for f in games::cores::REQUIRED_FILES {
+            std::fs::write(root.join(f), "// bundle").unwrap();
+        }
         std::fs::write(root.join("cores/x.wasm"), b"\0asm").unwrap();
         let (s, _g) = server(&data).await;
         let resp = s
@@ -443,6 +443,46 @@ mod tests {
             .await;
         r.assert_status_ok();
         assert_eq!(hdr(&r, "content-type").as_deref(), Some("application/wasm"));
+    }
+
+    #[tokio::test]
+    async fn partial_or_stale_install_keeps_the_cdn() {
+        let data = tempfile::tempdir().unwrap();
+        let root = data
+            .path()
+            .join("games/emulatorjs/data");
+        std::fs::create_dir_all(&root).unwrap();
+        // Only two of the three required files.
+        std::fs::write(root.join("loader.js"), "x").unwrap();
+        std::fs::write(root.join("emulator.min.js"), "x").unwrap();
+        let (s, _g) = server(&data).await;
+        let page = "/Moonfin/EmulatorJS/player.html?core=nes&rom=x";
+        let body = s
+            .get(page)
+            .await
+            .text();
+        assert!(body.contains("https://cdn.emulatorjs.org/4.2.3/data/"));
+        s.get("/Moonfin/EmulatorJS/data/loader.js")
+            .await
+            .assert_status_not_found();
+
+        // Complete, but marked as another EmulatorJS version: still stale.
+        std::fs::write(root.join("emulator.min.css"), "x").unwrap();
+        std::fs::write(root.join(games::cores::VERSION_MARKER), "4.0.0").unwrap();
+        let body = s
+            .get(page)
+            .await
+            .text();
+        assert!(body.contains("https://cdn.emulatorjs.org/4.2.3/data/"));
+
+        // Matching marker: self-hosted.
+        std::fs::write(root.join(games::cores::VERSION_MARKER), EMULATORJS_VERSION)
+            .unwrap();
+        let body = s
+            .get(page)
+            .await
+            .text();
+        assert!(body.contains("window.EJS_pathtodata = './data/'"));
     }
 
     #[tokio::test]
@@ -476,7 +516,9 @@ mod tests {
             .path()
             .join("games/emulatorjs/data");
         std::fs::create_dir_all(&root).unwrap();
-        std::fs::write(root.join("loader.js"), "x").unwrap();
+        for f in games::cores::REQUIRED_FILES {
+            std::fs::write(root.join(f), "x").unwrap();
+        }
         std::fs::write(
             data.path()
                 .join("games/secret.txt"),
