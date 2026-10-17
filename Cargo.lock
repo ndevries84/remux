@@ -7272,6 +7272,7 @@ dependencies = [
  "serde_urlencoded",
  "serde_with",
  "sevenz-rust2",
+ "sha2",
  "sqlx",
  "strum",
  "strum_macros",

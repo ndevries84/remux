@@ -28,6 +28,7 @@ pub mod moonfin_settings;
 pub mod moonfin_similar;
 #[cfg(test)]
 pub(crate) mod moonfin_test_support;
+pub mod moonfin_themes;
 pub mod moonfin_tmdb;
 pub mod moonfin_web;
 pub mod movies;
