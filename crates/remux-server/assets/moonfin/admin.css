@@ -1,0 +1,74 @@
+:root {
+  color-scheme: light dark;
+  --bg: #f5f6f8; --card: #fff; --fg: #1b1e24; --muted: #646b78;
+  --line: #d9dde4; --accent: #5b3fd0; --accent-fg: #fff;
+  --danger: #c62828; --ok: #1b7f3b; --warn: #a15c00; --code: #eef0f4;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #14161a; --card: #1d2026; --fg: #e6e8ec; --muted: #9aa1ad;
+    --line: #333844; --accent: #8b74ff; --accent-fg: #101114;
+    --danger: #ef6b6b; --ok: #5ad17f; --warn: #e0a23a; --code: #262a32;
+  }
+}
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--bg); color: var(--fg);
+  font: 15px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif; }
+.bar { display: flex; flex-wrap: wrap; gap: 8px 16px; align-items: center;
+  justify-content: space-between; padding: 12px 16px; background: var(--card);
+  border-bottom: 1px solid var(--line); }
+.bar h1 { margin: 0; font-size: 1.2rem; }
+.bar nav { display: flex; gap: 12px; align-items: center; }
+main { max-width: 1000px; margin: 0 auto; padding: 16px; }
+.card { background: var(--card); border: 1px solid var(--line); border-radius: 10px;
+  padding: 16px; margin-bottom: 16px; }
+h2 { margin: 0 0 8px; font-size: 1.1rem; }
+h3 { margin: 16px 0 8px; font-size: 1rem; }
+.head { display: flex; justify-content: space-between; align-items: center; gap: 8px; }
+.head h2, .head h3 { margin: 0; }
+.muted { color: var(--muted); font-size: 0.9rem; }
+.link, a { color: var(--accent); }
+code { background: var(--code); padding: 1px 4px; border-radius: 4px; }
+button, .file { font: inherit; }
+button { background: var(--card); color: var(--fg); border: 1px solid var(--line);
+  border-radius: 6px; padding: 6px 12px; cursor: pointer; min-height: 34px; }
+button:hover:not(:disabled) { border-color: var(--accent); }
+button:disabled { opacity: 0.5; cursor: default; }
+button.primary { background: var(--accent); color: var(--accent-fg); border-color: var(--accent); }
+button.danger { color: var(--danger); border-color: var(--danger); }
+input, textarea { font: inherit; color: var(--fg); background: var(--bg);
+  border: 1px solid var(--line); border-radius: 6px; padding: 6px 8px; max-width: 100%; }
+textarea { width: 100%; margin: 8px 0;
+  font: 13px/1.4 ui-monospace, SFMono-Regular, Menlo, monospace; }
+label { display: block; margin: 8px 0; }
+label input:not([type=file]) { display: block; width: 100%; max-width: 320px; margin-top: 4px; }
+.row { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin: 8px 0; }
+.scroll { overflow-x: auto; }
+table { width: 100%; border-collapse: collapse; font-size: 0.9rem; }
+th, td { text-align: left; padding: 6px 8px; border-bottom: 1px solid var(--line);
+  vertical-align: top; overflow-wrap: anywhere; }
+th { color: var(--muted); font-weight: 600; }
+tbody tr.click { cursor: pointer; }
+tbody tr.click:hover, tbody tr.sel { background: var(--bg); }
+.grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(220px, 1fr)); gap: 8px; }
+.tile { border: 1px solid var(--line); border-radius: 8px; padding: 8px 10px; }
+.tile .k { color: var(--muted); font-size: 0.8rem; }
+.tile .v { font-weight: 600; overflow-wrap: anywhere; }
+.yes { color: var(--ok); } .no { color: var(--muted); } .bad { color: var(--danger); }
+.errors { color: var(--danger); margin: 8px 0; padding-left: 20px; }
+.errors.ok { color: var(--ok); list-style: none; padding-left: 0; }
+.banner { padding: 10px 12px; border-radius: 8px; margin-bottom: 16px;
+  border: 1px solid var(--warn); color: var(--warn); }
+.banner.bad { border-color: var(--danger); color: var(--danger); }
+.detail { border-top: 1px solid var(--line); margin-top: 12px; padding-top: 8px; }
+details { margin: 6px 0; }
+summary { cursor: pointer; }
+pre { background: var(--code); padding: 8px; border-radius: 6px; overflow: auto;
+  max-height: 320px; font-size: 12px; margin: 6px 0; }
+.bar-progress { height: 8px; background: var(--code); border-radius: 4px; overflow: hidden; }
+.bar-progress > div { height: 100%; background: var(--accent); }
+dialog { background: var(--card); color: var(--fg); border: 1px solid var(--line);
+  border-radius: 10px; max-width: 420px; }
+dialog::backdrop { background: rgba(0, 0, 0, 0.5); }
+[hidden] { display: none !important; }
+@media (max-width: 600px) { main { padding: 12px; } .card { padding: 12px; } }

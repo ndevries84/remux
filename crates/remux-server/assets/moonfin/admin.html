@@ -1,0 +1,108 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light dark">
+<title>Moonfin admin</title>
+<link rel="stylesheet" href="/moonfin/admin/admin.css">
+<script src="/moonfin/admin/admin.js" defer></script>
+</head>
+<body>
+<header class="bar">
+  <h1>Moonfin admin</h1>
+  <nav>
+    <a href="/admin" class="link">Remux dashboard</a>
+    <button id="logout" type="button" hidden>Log out</button>
+  </nav>
+</header>
+
+<main>
+  <div id="banner" class="banner" role="status" hidden></div>
+
+  <section id="login" class="card" hidden>
+    <h2>Sign in</h2>
+    <p class="muted">Sign in with a Remux administrator account.</p>
+    <form id="login-form">
+      <label>Username <input id="login-user" autocomplete="username" required></label>
+      <label>Password <input id="login-pass" type="password" autocomplete="current-password"></label>
+      <button type="submit" class="primary">Sign in</button>
+    </form>
+  </section>
+
+  <div id="app" hidden>
+    <section class="card" id="status-section">
+      <div class="head"><h2>Status</h2><button id="status-refresh" type="button">Refresh</button></div>
+      <div id="status-body" class="grid"></div>
+      <h3>Cores</h3>
+      <div id="cores-body"></div>
+      <div class="row">
+        <button id="cores-install" type="button">Install cores</button>
+        <label class="file">Upload archive (.7z / .zip) <input id="cores-upload" type="file" accept=".7z,.zip"></label>
+      </div>
+      <p class="muted">Server settings are not edited here. They come from the server configuration (config file or environment): GAMES_ENABLED, GAMES_ROOTS, GAMES_METADATA_ENABLED, GAMES_LAUNCHBOX_ENABLED, MDBLIST_API_KEY, MOONFIN_WEB_PATH, MOONFIN_DEFAULT_SETTINGS_PATH, MOONFIN_WEB_DEFAULT_SERVER_URL, MOONFIN_WEB_FORCED_SERVER_URL.</p>
+    </section>
+
+    <section class="card" id="defaults-section">
+      <div class="head"><h2>Default client settings</h2></div>
+      <p class="muted">A JSON object applied to every user as the lowest layer. Users' own settings override these. The home rows (<code>homeSections</code> and <code>homeRowOrder</code>) are defaults that must be set together as a pair.</p>
+      <p id="blocked" class="muted" hidden></p>
+      <textarea id="defaults-text" spellcheck="false" rows="12" aria-label="Default settings JSON"></textarea>
+      <div class="row">
+        <button id="defaults-validate" type="button">Validate</button>
+        <button id="defaults-save" type="button" class="primary">Save</button>
+        <button id="defaults-revert" type="button">Revert</button>
+        <span id="defaults-meta" class="muted"></span>
+      </div>
+      <ul id="defaults-errors" class="errors" hidden></ul>
+      <div class="scroll">
+        <table id="defaults-table">
+          <thead><tr><th>Key</th><th>Value</th><th></th></tr></thead>
+          <tbody></tbody>
+        </table>
+      </div>
+    </section>
+
+    <section class="card" id="users-section">
+      <div class="head"><h2>Users</h2><button id="users-refresh" type="button">Refresh</button></div>
+      <div class="scroll">
+        <table id="users-table">
+          <thead><tr><th>User</th><th>Profiles</th><th>Moonfin devices</th></tr></thead>
+          <tbody></tbody>
+        </table>
+      </div>
+      <div id="user-detail" class="detail" hidden>
+        <div class="head"><h3 id="user-title"></h3><button id="user-close" type="button">Close</button></div>
+        <div id="user-profiles"></div>
+        <div class="row">
+          <button id="user-reset-all" type="button" class="danger">Reset all profiles</button>
+        </div>
+      </div>
+    </section>
+
+    <section class="card" id="themes-section">
+      <div class="head"><h2>Themes</h2><button id="themes-refresh" type="button">Refresh</button></div>
+      <div class="scroll">
+        <table id="themes-table">
+          <thead><tr><th>Name</th><th>Id</th><th>Size</th><th>Uploaded</th><th></th></tr></thead>
+          <tbody></tbody>
+        </table>
+      </div>
+      <h3>Add a theme</h3>
+      <label class="file">From a .json file <input id="theme-file" type="file" accept=".json,application/json"></label>
+      <textarea id="theme-text" spellcheck="false" rows="8" aria-label="Theme JSON" placeholder="Or paste theme JSON here"></textarea>
+      <div class="row"><button id="theme-upload" type="button" class="primary">Upload theme</button></div>
+      <ul id="theme-errors" class="errors" hidden></ul>
+    </section>
+  </div>
+</main>
+
+<dialog id="confirm">
+  <p id="confirm-text"></p>
+  <div class="row">
+    <button id="confirm-cancel" type="button">Cancel</button>
+    <button id="confirm-ok" type="button" class="danger">Confirm</button>
+  </div>
+</dialog>
+</body>
+</html>
