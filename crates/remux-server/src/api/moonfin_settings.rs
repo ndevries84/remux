@@ -78,6 +78,8 @@ pub struct SettingsHub {
 pub(crate) enum StreamEvent {
     /// Stored or default settings changed; the client re-resolves them.
     SettingsUpdated,
+    /// A theme was created, replaced or deleted; the client re-fetches them.
+    ThemesChanged,
 }
 
 impl StreamEvent {
@@ -86,6 +88,9 @@ impl StreamEvent {
         match self {
             Self::SettingsUpdated => {
                 Bytes::from_static(b"data: {\"type\":\"settingsUpdated\"}\n\n")
+            }
+            Self::ThemesChanged => {
+                Bytes::from_static(b"data: {\"type\":\"themesChanged\"}\n\n")
             }
         }
     }
@@ -2003,7 +2008,7 @@ mod tests {
     // Admin defaults in the database
     // ------------------------------------------------------------------
 
-    use crate::api::moonfin_test_support::Harness as Shared;
+    use crate::api::moonfin_test_support::{Harness as Shared, SseConn};
 
     fn profile(v: Value) -> super::Profile {
         v.as_object()
@@ -2263,96 +2268,6 @@ mod tests {
     // ------------------------------------------------------------------
     // SSE stream (SSE1-SSE3, SSE5, SSE6)
     // ------------------------------------------------------------------
-
-    /// Minimal raw-HTTP SSE reader over a real socket (the mock transport
-    /// buffers whole bodies, which an open stream never finishes).
-    struct SseConn {
-        stream: TcpStream,
-        seen: String,
-    }
-
-    impl SseConn {
-        async fn open(app: &Router, token: &str) -> SseConn {
-            let listener = TcpListener::bind("127.0.0.1:0")
-                .await
-                .unwrap();
-            let addr = listener
-                .local_addr()
-                .unwrap();
-            let app = app.clone();
-            tokio::spawn(async move {
-                axum::serve(
-                    listener,
-                    app.into_make_service_with_connect_info::<SocketAddr>(),
-                )
-                .await
-                .ok();
-            });
-            let mut stream = TcpStream::connect(addr)
-                .await
-                .unwrap();
-            let request = format!(
-                "GET /Moonfin/Settings/Stream HTTP/1.1\r\nHost: localhost\r\n\
-                 Accept: text/event-stream\r\nAuthorization: {}\r\n\r\n",
-                auth_header_with_token(token)
-            );
-            stream
-                .write_all(request.as_bytes())
-                .await
-                .unwrap();
-            SseConn {
-                stream,
-                seen: String::new(),
-            }
-        }
-
-        async fn read_some(&mut self, wait: Duration) {
-            let mut buf = [0u8; 4096];
-            if let Ok(Ok(n)) = tokio::time::timeout(
-                wait,
-                self.stream
-                    .read(&mut buf),
-            )
-            .await
-            {
-                self.seen
-                    .push_str(&String::from_utf8_lossy(&buf[..n]));
-            }
-        }
-
-        async fn wait_for(&mut self, needle: &str) {
-            let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-            while !self
-                .seen
-                .contains(needle)
-            {
-                assert!(
-                    tokio::time::Instant::now() < deadline,
-                    "timed out waiting for {needle:?}; saw {:?}",
-                    self.seen
-                );
-                self.read_some(Duration::from_millis(200))
-                    .await;
-            }
-        }
-
-        /// True if `needle` shows up within `wait`.
-        async fn appears_within(&mut self, needle: &str, wait: Duration) -> bool {
-            let deadline = tokio::time::Instant::now() + wait;
-            while tokio::time::Instant::now() < deadline {
-                if self
-                    .seen
-                    .contains(needle)
-                {
-                    return true;
-                }
-                self.read_some(Duration::from_millis(50))
-                    .await;
-            }
-            self.seen
-                .contains(needle)
-        }
-    }
 
     const EVENT: &str = r#"data: {"type":"settingsUpdated"}"#;
     const QUIET: Duration = Duration::from_millis(600);

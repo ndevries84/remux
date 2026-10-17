@@ -32,7 +32,11 @@ use serde::Serialize;
 use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
 
-use crate::{AppState, api::moonfin_settings::internal_error, db::auth::AuthSession};
+use crate::{
+    AppState,
+    api::moonfin_settings::{StreamEvent, internal_error},
+    db::auth::AuthSession,
+};
 
 /// Largest accepted theme body.
 const MAX_BODY_BYTES: usize = 256 * 1024;
@@ -644,6 +648,14 @@ pub async fn moonfin_admin_themes_list(
     }
 }
 
+/// Tells every open settings stream to re-fetch the theme list.
+fn notify_themes_changed(state: &AppState) {
+    state
+        .ctx
+        .moonfin_settings
+        .notify_all(StreamEvent::ThemesChanged);
+}
+
 #[post("/moonfin/admin/themes")]
 pub async fn moonfin_admin_themes_save(
     State(state): State<AppState>,
@@ -682,6 +694,20 @@ pub async fn moonfin_admin_themes_save(
     ) {
         let _ = write!(sha, "{byte:02x}");
     }
+    // A re-upload of identical content changes nothing, so it announces nothing.
+    let unchanged = sqlx::query_scalar::<_, String>(
+        "SELECT sha256 FROM moonfin_themes WHERE id = ?1",
+    )
+    .bind(&theme.id)
+    .fetch_optional(
+        &state
+            .ctx
+            .db,
+    )
+    .await
+    .ok()
+    .flatten()
+    .is_some_and(|existing| existing == sha);
     let row: Result<ThemeRow, _> = sqlx::query_as(
         "INSERT INTO moonfin_themes \
          (id, display_name, json, size_bytes, sha256, uploaded_at, uploaded_by) \
@@ -696,7 +722,7 @@ pub async fn moonfin_admin_themes_save(
     .bind(&theme.display_name)
     .bind(&theme.text)
     .bind(theme.text.len() as i64)
-    .bind(sha)
+    .bind(&sha)
     .bind(chrono::Utc::now().timestamp_millis())
     .bind(
         session
@@ -710,8 +736,13 @@ pub async fn moonfin_admin_themes_save(
     )
     .await;
     match row {
-        Ok(row) => Json(json!({ "success": true, "item": ThemeEntry::from(row) }))
-            .into_response(),
+        Ok(row) => {
+            if !unchanged {
+                notify_themes_changed(&state);
+            }
+            Json(json!({ "success": true, "item": ThemeEntry::from(row) }))
+                .into_response()
+        }
         Err(e) => internal_error(e),
     }
 }
@@ -735,6 +766,7 @@ pub async fn moonfin_admin_themes_delete(
         .await;
     match result {
         Ok(done) if done.rows_affected() > 0 => {
+            notify_themes_changed(&state);
             Json(json!({ "success": true })).into_response()
         }
         Ok(_) => not_found(),
@@ -1172,5 +1204,154 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(n, 1);
+    }
+
+    // ------------------------------------------------------------------
+    // Live updates over the settings stream
+    // ------------------------------------------------------------------
+
+    use crate::api::moonfin_test_support::SseConn;
+    use std::time::Duration;
+
+    const CHANGED: &str = r#"data: {"type":"themesChanged"}"#;
+    const QUIET: Duration = Duration::from_millis(600);
+
+    /// Two users with open, settled streams.
+    async fn two_streams(h: &Harness, other: &str) -> (SseConn, SseConn) {
+        let mut admin = SseConn::open(&h.app, &h.token).await;
+        let mut user = SseConn::open(&h.app, other).await;
+        admin
+            .wait_for(":connected")
+            .await;
+        user.wait_for(":connected")
+            .await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        (admin, user)
+    }
+
+    async fn assert_quiet(streams: &mut [&mut SseConn]) {
+        for sse in streams {
+            assert!(
+                !sse.appears_within(CHANGED, QUIET)
+                    .await,
+                "unexpected themesChanged: {:?}",
+                sse.seen
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn create_and_delete_push_themes_changed_to_every_stream() {
+        let h = Harness::new().await;
+        let other = h
+            .second_user()
+            .await;
+        let (mut admin, mut user) = two_streams(&h, &other).await;
+
+        h.post(&h.token, "/Moonfin/Admin/Themes", &theme("midnight-blue"))
+            .await
+            .assert_status_ok();
+        admin
+            .wait_for(CHANGED)
+            .await;
+        user.wait_for(CHANGED)
+            .await;
+
+        h.delete(&h.token, "/Moonfin/Admin/Themes/midnight-blue")
+            .await
+            .assert_status_ok();
+        for sse in [&mut admin, &mut user] {
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+            while sse
+                .seen
+                .matches(CHANGED)
+                .count()
+                < 2
+            {
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "no second event: {:?}",
+                    sse.seen
+                );
+                sse.appears_within("never-appears", Duration::from_millis(100))
+                    .await;
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn replacing_pushes_but_identical_content_does_not() {
+        let h = Harness::new().await;
+        h.post(&h.token, "/Moonfin/Admin/Themes", &theme("midnight-blue"))
+            .await
+            .assert_status_ok();
+        let other = h
+            .second_user()
+            .await;
+        let (mut admin, mut user) = two_streams(&h, &other).await;
+
+        h.post(&h.token, "/Moonfin/Admin/Themes", &theme("midnight-blue"))
+            .await
+            .assert_status_ok();
+        assert_quiet(&mut [&mut admin, &mut user]).await;
+
+        let mut updated = theme("midnight-blue");
+        updated["displayName"] = json!("Midnight Blue v2");
+        h.post(&h.token, "/Moonfin/Admin/Themes", &updated)
+            .await
+            .assert_status_ok();
+        admin
+            .wait_for(CHANGED)
+            .await;
+        user.wait_for(CHANGED)
+            .await;
+    }
+
+    #[tokio::test]
+    async fn failures_do_not_push() {
+        let h = Harness::new().await;
+        h.post(&h.token, "/Moonfin/Admin/Themes", &theme("midnight-blue"))
+            .await
+            .assert_status_ok();
+        let other = h
+            .second_user()
+            .await;
+        let (mut admin, mut user) = two_streams(&h, &other).await;
+
+        let mut bad = theme("bad-one");
+        bad["colors"] = json!("not an object");
+        h.post(&h.token, "/Moonfin/Admin/Themes", &bad)
+            .await
+            .assert_status(StatusCode::BAD_REQUEST);
+        h.post(&other, "/Moonfin/Admin/Themes", &theme("sneaky"))
+            .await
+            .assert_status(StatusCode::FORBIDDEN);
+        h.delete(&other, "/Moonfin/Admin/Themes/midnight-blue")
+            .await
+            .assert_status(StatusCode::FORBIDDEN);
+        h.delete(&h.token, "/Moonfin/Admin/Themes/no-such-theme")
+            .await
+            .assert_status(StatusCode::NOT_FOUND);
+        assert_quiet(&mut [&mut admin, &mut user]).await;
+    }
+
+    #[tokio::test]
+    async fn settings_updated_still_reaches_the_stream() {
+        let h = Harness::new().await;
+        let mut admin = SseConn::open(&h.app, &h.token).await;
+        admin
+            .wait_for(":connected")
+            .await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        h.post(
+            &h.token,
+            "/Moonfin/Settings/Profile/tv",
+            &json!({ "profile": { "posterSize": "small" }, "clientId": "t" }),
+        )
+        .await
+        .assert_status_ok();
+        admin
+            .wait_for(r#"data: {"type":"settingsUpdated"}"#)
+            .await;
     }
 }

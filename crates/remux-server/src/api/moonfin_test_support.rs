@@ -11,6 +11,11 @@ use axum::Router;
 use axum_test::{TestResponse, TestServer};
 use http::header;
 use serde_json::{Value, json};
+use std::{net::SocketAddr, time::Duration};
+use tokio::{
+    io::{AsyncReadExt, AsyncWriteExt},
+    net::{TcpListener, TcpStream},
+};
 use tower::{Layer, util::MapRequestLayer};
 
 pub(crate) struct Harness {
@@ -19,6 +24,8 @@ pub(crate) struct Harness {
     _guard: TestGuard,
     /// Admin ("test") access token.
     pub token: String,
+    /// The same router the mock `server` drives, for real-socket tests.
+    pub app: Router,
     _data: tempfile::TempDir,
 }
 
@@ -48,7 +55,7 @@ impl Harness {
             .fallback_service(MapRequestLayer::new(rewrite_request_uri).layer(router));
         let server = TestServer::builder()
             .mock_transport()
-            .build(app)
+            .build(app.clone())
             .unwrap();
         server
             .post("/Startup/User")
@@ -62,6 +69,7 @@ impl Harness {
             ctx: ctx.clone(),
             _guard: TestGuard(ctx),
             token: String::new(),
+            app,
             _data: data,
         };
         h.token = h
@@ -197,4 +205,94 @@ pub(crate) async fn seed_movie_full(
         .id
         .simple()
         .to_string()
+}
+
+/// Minimal raw-HTTP SSE reader over a real socket (the mock transport
+/// buffers whole bodies, which an open stream never finishes).
+pub(crate) struct SseConn {
+    stream: TcpStream,
+    pub seen: String,
+}
+
+impl SseConn {
+    pub async fn open(app: &Router, token: &str) -> SseConn {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .unwrap();
+        let addr = listener
+            .local_addr()
+            .unwrap();
+        let app = app.clone();
+        tokio::spawn(async move {
+            axum::serve(
+                listener,
+                app.into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .await
+            .ok();
+        });
+        let mut stream = TcpStream::connect(addr)
+            .await
+            .unwrap();
+        let request = format!(
+            "GET /Moonfin/Settings/Stream HTTP/1.1\r\nHost: localhost\r\n\
+             Accept: text/event-stream\r\nAuthorization: {}\r\n\r\n",
+            auth_header_with_token(token)
+        );
+        stream
+            .write_all(request.as_bytes())
+            .await
+            .unwrap();
+        SseConn {
+            stream,
+            seen: String::new(),
+        }
+    }
+
+    async fn read_some(&mut self, wait: Duration) {
+        let mut buf = [0u8; 4096];
+        if let Ok(Ok(n)) = tokio::time::timeout(
+            wait,
+            self.stream
+                .read(&mut buf),
+        )
+        .await
+        {
+            self.seen
+                .push_str(&String::from_utf8_lossy(&buf[..n]));
+        }
+    }
+
+    pub async fn wait_for(&mut self, needle: &str) {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while !self
+            .seen
+            .contains(needle)
+        {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "timed out waiting for {needle:?}; saw {:?}",
+                self.seen
+            );
+            self.read_some(Duration::from_millis(200))
+                .await;
+        }
+    }
+
+    /// True if `needle` shows up within `wait`.
+    pub async fn appears_within(&mut self, needle: &str, wait: Duration) -> bool {
+        let deadline = tokio::time::Instant::now() + wait;
+        while tokio::time::Instant::now() < deadline {
+            if self
+                .seen
+                .contains(needle)
+            {
+                return true;
+            }
+            self.read_some(Duration::from_millis(50))
+                .await;
+        }
+        self.seen
+            .contains(needle)
+    }
 }
