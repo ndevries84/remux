@@ -781,6 +781,23 @@ pub struct Config {
     /// user's settings. A missing or invalid file means no defaults.
     #[serde(default)]
     pub moonfin_default_settings_path: Option<String>,
+    /// Directory holding the extracted Moonfin web bundle served at
+    /// `/Moonfin/Web`. Defaults to `<data_dir>/moonfin-web` when unset. A
+    /// missing directory means the hosted web app answers 404.
+    #[serde(default)]
+    pub moonfin_web_path: Option<String>,
+    /// `defaultServerUrl` advertised by `/Moonfin/Web/config.json` (pre-fills
+    /// the Add Server box). Defaults to the request origin.
+    #[serde(default)]
+    pub moonfin_web_default_server_url: Option<String>,
+    /// `forcedServerUrl` advertised by `/Moonfin/Web/config.json`; locks the
+    /// hosted app to one server. A trailing `/web` or `/web/index.html` is
+    /// stripped.
+    #[serde(default)]
+    pub moonfin_web_forced_server_url: Option<String>,
+    /// `enableWebRtcScan` advertised by `/Moonfin/Web/config.json`.
+    #[serde(default)]
+    pub moonfin_web_enable_webrtc_scan: bool,
     /// Server-wide MDBList API key (`MDBLIST_API_KEY`). Powers the Moonfin
     /// ratings proxy for every user; users may also supply their own key in
     /// their synced settings. Never logged or serialized.
@@ -1061,6 +1078,10 @@ impl Default for Config {
             games_launchbox_url: default_games_launchbox_url(),
             games_launchbox_refresh_days: default_games_launchbox_refresh_days(),
             moonfin_default_settings_path: None,
+            moonfin_web_path: None,
+            moonfin_web_default_server_url: None,
+            moonfin_web_forced_server_url: None,
+            moonfin_web_enable_webrtc_scan: false,
             mdblist_api_key: None,
             mdblist_base_url: default_mdblist_base_url(),
             mdblist_cache_ttl_hours: default_mdblist_cache_ttl_hours(),

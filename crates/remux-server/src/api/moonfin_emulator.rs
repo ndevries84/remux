@@ -64,7 +64,7 @@ fn data_root(state: &AppState) -> PathBuf {
 
 /// Joins `requested` under `root`, rejecting anything but plain path
 /// components (no `..`, absolute paths, drive prefixes or backslashes).
-fn contained_path(root: &FsPath, requested: &str) -> Option<PathBuf> {
+pub(super) fn contained_path(root: &FsPath, requested: &str) -> Option<PathBuf> {
     if requested.contains('\\') || requested.contains('\0') {
         return None;
     }

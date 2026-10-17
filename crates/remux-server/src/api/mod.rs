@@ -29,6 +29,7 @@ pub mod moonfin_similar;
 #[cfg(test)]
 pub(crate) mod moonfin_test_support;
 pub mod moonfin_tmdb;
+pub mod moonfin_web;
 pub mod movies;
 pub mod music;
 pub mod networking;
