@@ -520,6 +520,16 @@ impl MetaService {
             return CrcState::Unavailable;
         }
 
+        // Already hashed (the warm-up did it): answer now. Going through the
+        // hash task even for a cache hit would make a warmed request wait on
+        // a task switch and, with no time budget, come back empty.
+        if let Some(crcs) = cached_crcs(&self.inner, &game.path) {
+            return CrcState::Known(
+                crcs.as_ref()
+                    .clone(),
+            );
+        }
+
         let path = game
             .path
             .clone();
@@ -564,6 +574,19 @@ impl MetaService {
 // ---------------------------------------------------------------------------
 // Hashing
 // ---------------------------------------------------------------------------
+
+/// The cached CRCs for `path`, if the file is unchanged since they were
+/// computed. One `stat`, no task switch.
+fn cached_crcs(inner: &Inner, path: &Path) -> Option<Arc<Vec<u32>>> {
+    let md = std::fs::metadata(path).ok()?;
+    let mtime = md
+        .modified()
+        .ok()?;
+    let (size, cached_mtime, crcs) = lock(&inner.crc_cache)
+        .get(path)
+        .cloned()?;
+    (size == md.len() && cached_mtime == mtime).then_some(crcs)
+}
 
 async fn hash_cached(
     inner: &Inner,
