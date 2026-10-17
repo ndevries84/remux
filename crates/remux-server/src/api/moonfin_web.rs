@@ -31,7 +31,7 @@ use crate::AppState;
 
 const MOUNT: &str = "/moonfin/web";
 
-fn web_root(state: &AppState) -> PathBuf {
+pub(crate) fn web_root(state: &AppState) -> PathBuf {
     match state
         .ctx
         .config

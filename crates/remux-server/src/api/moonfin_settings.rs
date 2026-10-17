@@ -39,14 +39,14 @@ use tokio::sync::broadcast;
 use tracing::{error, warn};
 use uuid::Uuid;
 
-use crate::{AppContext, AppState, db::auth::AuthSession};
+use crate::{AppContext, AppState, Config, db::auth::AuthSession};
 
 /// Largest accepted profile-save body (real profiles are ~10-30 KB).
-const MAX_SAVE_BYTES: usize = 1024 * 1024;
+pub(crate) const MAX_SAVE_BYTES: usize = 1024 * 1024;
 /// SSE heartbeat; the client treats 75 s of silence as a dead stream.
 const HEARTBEAT: Duration = Duration::from_secs(30);
 
-const VALID_PROFILES: [&str; 4] = ["global", "desktop", "mobile", "tv"];
+pub(crate) const VALID_PROFILES: [&str; 4] = ["global", "desktop", "mobile", "tv"];
 
 /// Keys the admin defaults may not carry, because Remux already owns the
 /// setting: they duplicate the Jellyfin user configuration (audio/subtitle
@@ -101,7 +101,7 @@ struct HubInner {
 
 impl SettingsHub {
     /// Opens a settings stream for `user`.
-    fn subscribe(&self, user: Uuid) -> StreamGuard {
+    pub(crate) fn subscribe(&self, user: Uuid) -> StreamGuard {
         let rx = self
             .inner
             .streams
@@ -149,10 +149,21 @@ impl SettingsHub {
 
 /// Holds a stream's receiver and drops the user's channel once the last
 /// stream for that user disconnects.
-struct StreamGuard {
+pub(crate) struct StreamGuard {
     hub: SettingsHub,
     user: Uuid,
     rx: Option<broadcast::Receiver<StreamEvent>>,
+}
+
+#[cfg(test)]
+impl StreamGuard {
+    /// The next queued event, without waiting.
+    pub(crate) fn try_event(&mut self) -> Option<StreamEvent> {
+        self.rx
+            .as_mut()?
+            .try_recv()
+            .ok()
+    }
 }
 
 impl Drop for StreamGuard {
@@ -183,7 +194,7 @@ pub(crate) fn internal_error(err: impl std::fmt::Display) -> Response {
 }
 
 /// Lowercased profile name if it is one of the four valid profiles.
-fn parse_profile(raw: &str) -> Option<String> {
+pub(crate) fn parse_profile(raw: &str) -> Option<String> {
     let lower = raw.to_ascii_lowercase();
     VALID_PROFILES
         .contains(&lower.as_str())
@@ -333,7 +344,7 @@ fn parse_stored(data: &str) -> Profile {
     }
 }
 
-async fn load_profiles(
+pub(crate) async fn load_profiles(
     db: &SqlitePool,
     user: Uuid,
 ) -> Result<HashMap<String, (Profile, i64, Option<String>)>, sqlx::Error> {
@@ -507,20 +518,29 @@ pub async fn moonfin_ping(
     State(state): State<AppState>,
     _session: AuthSession,
 ) -> Response {
-    Json(json!({
+    Json(ping_body(
+        &state
+            .ctx
+            .config,
+    ))
+    .into_response()
+}
+
+/// The `Ping` payload: which optional Moonfin features this server offers.
+pub(crate) fn ping_body(config: &Config) -> Value {
+    json!({
         "installed": true,
         "version": env!("CARGO_PKG_VERSION"),
         "settingsSyncEnabled": true,
         "serverName": "Remux",
         "seerrEnabled": false,
         "seerrUrl": null,
-        "mdblistAvailable": state.ctx.config.mdblist_key().is_some(),
+        "mdblistAvailable": config.mdblist_key().is_some(),
         "tmdbAvailable": false,
         "tmdbThumbsSupported": false,
         "messagesSupported": false,
         "recommendationsSupported": true,
-    }))
-    .into_response()
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -2141,26 +2161,16 @@ mod tests {
             .await
             .unwrap();
         for stream in [&mut stream_a, &mut stream_b] {
-            let event = stream
-                .rx
-                .as_mut()
-                .unwrap()
-                .try_recv()
-                .unwrap();
-            assert_eq!(event, super::StreamEvent::SettingsUpdated);
+            assert_eq!(
+                stream.try_event(),
+                Some(super::StreamEvent::SettingsUpdated)
+            );
         }
 
         super::save_defaults(&h.ctx, profile(json!({ "x": 1 })), admin)
             .await
             .unwrap();
-        assert!(
-            stream_a
-                .rx
-                .as_mut()
-                .unwrap()
-                .try_recv()
-                .is_err()
-        );
+        assert_eq!(stream_a.try_event(), None);
     }
 
     // ------------------------------------------------------------------

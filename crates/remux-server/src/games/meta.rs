@@ -192,6 +192,13 @@ impl Default for MetaService {
 }
 
 impl MetaService {
+    /// State of the LaunchBox index (meaningful when LaunchBox is enabled).
+    pub fn launchbox_status(&self) -> launchbox::LaunchBoxStatus {
+        self.inner
+            .launchbox
+            .status()
+    }
+
     /// Starts loading the databases of every system in `snap` (once per
     /// scan) so the first game opened already finds them ready. Never blocks.
     pub fn prewarm(&self, config: &Config, snap: &GamesSnapshot) {

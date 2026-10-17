@@ -934,6 +934,16 @@ struct Inner {
     settled: tokio::sync::Notify,
 }
 
+/// Coarse LaunchBox index state, for status displays.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LaunchBoxStatus {
+    /// An index is known (built, or found on disk by an earlier lookup).
+    pub indexed: bool,
+    /// A background download or refresh is running.
+    pub updating: bool,
+}
+
 /// LaunchBox lookups and the background build. Cheap to clone.
 #[derive(Clone)]
 pub struct LaunchBox {
@@ -954,6 +964,25 @@ impl Default for LaunchBox {
 }
 
 impl LaunchBox {
+    pub fn status(&self) -> LaunchBoxStatus {
+        LaunchBoxStatus {
+            indexed: matches!(
+                &*lock(
+                    &self
+                        .inner
+                        .stamp
+                ),
+                StampSlot::Known(Some(_))
+            ),
+            updating: lock(
+                &self
+                    .inner
+                    .schedule,
+            )
+            .running,
+        }
+    }
+
     /// Makes sure the data for `cores` is (being) built or refreshed. Cheap
     /// and non-blocking; the work runs in a single background task.
     pub fn prewarm(
