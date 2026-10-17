@@ -23,7 +23,7 @@ use axum::{
 use dashmap::DashMap;
 use futures_util::StreamExt;
 use remux_macros::{get, put, query};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use strum_macros::{Display, EnumString};
 use tokio::io::AsyncWriteExt;
 use tower::ServiceExt;
@@ -93,6 +93,19 @@ struct GameDetailDto {
     #[serde(flatten)]
     summary: GameSummaryDto,
     backend_override_supported: bool,
+    /// Present only when the user picked a player backend for this game.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    user_backend_override: Option<Backend>,
+    // Arcade-family games only: the client needs `availableCores` to offer
+    // (and send) a core choice at all.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    recommended_core: Option<games::resolver::Core>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    available_cores: Option<Vec<games::resolver::Core>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    core_compatibility_reason: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    user_core_override: Option<games::resolver::Core>,
     size_bytes: u64,
     bios: Vec<BiosDto>,
     // Metadata from the libretro databases (and LaunchBox, when enabled); each field is left out until it
@@ -262,17 +275,94 @@ pub async fn games_list(
     Json(list).into_response()
 }
 
-#[get("/moonfin/games/{lib}/games/{game_id}")]
-pub async fn games_detail(
-    State(state): State<AppState>,
-    _session: AuthSession,
-    Path((lib, game_id)): Path<(String, String)>,
-) -> Response {
-    let Some(snap) = snapshot_for(&state, &lib).await else {
-        return StatusCode::NOT_FOUND.into_response();
+/// Player backends a user may force for a game. Only EmulatorJS exists here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Display, EnumString, Serialize)]
+#[strum(serialize_all = "lowercase", ascii_case_insensitive)]
+#[serde(rename_all = "lowercase")]
+enum Backend {
+    EmulatorJs,
+}
+
+const NO_DAT_REASON: &str =
+    "No arcade DAT is installed on this server, so compatibility is not verified.";
+const CORE_UNAVAILABLE: &str = "The requested core is not available for this game.";
+const BACKEND_UNAVAILABLE: &str = "The requested game backend is not available.";
+
+/// The cores offered for an arcade-family game: its own first, then the other.
+fn arcade_cores(recommended: games::resolver::Core) -> Vec<games::resolver::Core> {
+    use games::resolver::Core;
+    let other = if recommended == Core::Mame {
+        Core::Arcade
+    } else {
+        Core::Mame
     };
-    let Some(game) = snap.game(&game_id) else {
-        return StatusCode::NOT_FOUND.into_response();
+    vec![recommended, other]
+}
+
+/// A user's stored choices for one game, already parsed and re-validated
+/// against what the game currently allows.
+#[derive(Default)]
+struct GameOverrides {
+    core: Option<games::resolver::Core>,
+    backend: Option<Backend>,
+}
+
+async fn load_overrides(
+    state: &AppState,
+    user_id: Uuid,
+    game: &Game,
+) -> Result<GameOverrides, sqlx::Error> {
+    let row: Option<(Option<String>, Option<String>)> = sqlx::query_as(
+        "SELECT core, backend FROM moonfin_game_overrides \
+         WHERE user_id = ?1 AND game_id = ?2",
+    )
+    .bind(user_id)
+    .bind(&game.id)
+    .fetch_optional(
+        &state
+            .ctx
+            .db,
+    )
+    .await?;
+    let (core, backend) = row.unwrap_or_default();
+    Ok(GameOverrides {
+        // Dropped silently when the game no longer qualifies (e.g. the file
+        // was re-sorted into another system folder).
+        core: core
+            .and_then(|c| {
+                c.parse()
+                    .ok()
+            })
+            .filter(|c| {
+                game.core
+                    .is_arcade_family()
+                    && arcade_cores(game.core).contains(c)
+            }),
+        backend: backend.and_then(|b| {
+            b.parse()
+                .ok()
+        }),
+    })
+}
+
+fn error_json(status: StatusCode, message: &str) -> Response {
+    (status, Json(serde_json::json!({ "error": message }))).into_response()
+}
+
+fn internal_error(e: sqlx::Error) -> Response {
+    warn!(error = %e, "games: override storage failed");
+    StatusCode::INTERNAL_SERVER_ERROR.into_response()
+}
+
+async fn build_detail(
+    state: &AppState,
+    snap: &GamesSnapshot,
+    game: &Game,
+    user_id: Uuid,
+) -> Response {
+    let overrides = match load_overrides(state, user_id, game).await {
+        Ok(o) => o,
+        Err(e) => return internal_error(e),
     };
     let bios = snap
         .bios
@@ -298,6 +388,13 @@ pub async fn games_detail(
     summary.file_name = game
         .served_file_name()
         .to_string();
+    // The effective core; the list endpoint keeps the system core.
+    if let Some(core) = overrides.core {
+        summary.core = core;
+    }
+    let arcade = game
+        .core
+        .is_arcade_family();
     let meta = state
         .ctx
         .game_meta
@@ -310,7 +407,12 @@ pub async fn games_detail(
         .await;
     Json(GameDetailDto {
         summary,
-        backend_override_supported: false,
+        backend_override_supported: true,
+        user_backend_override: overrides.backend,
+        recommended_core: arcade.then_some(game.core),
+        available_cores: arcade.then(|| arcade_cores(game.core)),
+        core_compatibility_reason: arcade.then_some(NO_DAT_REASON),
+        user_core_override: overrides.core,
         size_bytes: game.served_size_bytes(),
         bios,
         genre: meta.genre,
@@ -326,6 +428,176 @@ pub async fn games_detail(
             .map(|r| r.as_f64()),
     })
     .into_response()
+}
+
+#[get("/moonfin/games/{lib}/games/{game_id}")]
+pub async fn games_detail(
+    State(state): State<AppState>,
+    session: AuthSession,
+    Path((lib, game_id)): Path<(String, String)>,
+) -> Response {
+    let Some(snap) = snapshot_for(&state, &lib).await else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let Some(game) = snap.game(&game_id) else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    build_detail(
+        &state,
+        &snap,
+        game,
+        session
+            .user
+            .id,
+    )
+    .await
+}
+
+#[derive(Deserialize)]
+struct CoreOverrideBody {
+    #[serde(default)]
+    core: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct BackendOverrideBody {
+    #[serde(default)]
+    backend: Option<String>,
+}
+
+/// Writes one override column (`core` or `backend`) for a user and game, then
+/// drops the row if both columns ended up empty.
+async fn store_override(
+    state: &AppState,
+    user_id: Uuid,
+    game_id: &str,
+    column: &'static str,
+    value: Option<&str>,
+) -> Result<(), sqlx::Error> {
+    debug_assert!(matches!(column, "core" | "backend"));
+    let mut tx = state
+        .ctx
+        .db
+        .begin()
+        .await?;
+    sqlx::query(&format!(
+        "INSERT INTO moonfin_game_overrides (user_id, game_id, {column}, updated_at) \
+         VALUES (?1, ?2, ?3, ?4) \
+         ON CONFLICT (user_id, game_id) DO UPDATE SET \
+         {column} = excluded.{column}, updated_at = excluded.updated_at"
+    ))
+    .bind(user_id)
+    .bind(game_id)
+    .bind(value)
+    .bind(chrono::Utc::now().timestamp_millis())
+    .execute(&mut *tx)
+    .await?;
+    sqlx::query(
+        "DELETE FROM moonfin_game_overrides \
+         WHERE user_id = ?1 AND game_id = ?2 AND core IS NULL AND backend IS NULL",
+    )
+    .bind(user_id)
+    .bind(game_id)
+    .execute(&mut *tx)
+    .await?;
+    tx.commit()
+        .await
+}
+
+/// Arcade-only: choose between FBNeo (`arcade`) and MAME (`mame`).
+#[put("/moonfin/games/{lib}/games/{game_id}/core")]
+pub async fn games_set_core(
+    State(state): State<AppState>,
+    session: AuthSession,
+    Path((lib, game_id)): Path<(String, String)>,
+    Json(body): Json<CoreOverrideBody>,
+) -> Response {
+    let Some(snap) = snapshot_for(&state, &lib).await else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let Some(game) = snap.game(&game_id) else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    // Like Moonbase, a core choice only exists for arcade archives.
+    if !game
+        .core
+        .is_arcade_family()
+    {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    let requested = body
+        .core
+        .as_deref()
+        .map(str::trim)
+        .filter(|c| !c.is_empty());
+    let core = match requested {
+        None => None,
+        Some(c) => match c.parse::<games::resolver::Core>() {
+            Ok(core) if arcade_cores(game.core).contains(&core) => Some(core),
+            _ => return error_json(StatusCode::BAD_REQUEST, CORE_UNAVAILABLE),
+        },
+    };
+    let user_id = session
+        .user
+        .id;
+    if let Err(e) = store_override(
+        &state,
+        user_id,
+        &game.id,
+        "core",
+        core.map(|c| c.to_string())
+            .as_deref(),
+    )
+    .await
+    {
+        return internal_error(e);
+    }
+    build_detail(&state, &snap, game, user_id).await
+}
+
+/// Selects the player: only `emulatorjs` (or null/blank to clear).
+#[put("/moonfin/games/{lib}/games/{game_id}/backend")]
+pub async fn games_set_backend(
+    State(state): State<AppState>,
+    session: AuthSession,
+    Path((lib, game_id)): Path<(String, String)>,
+    Json(body): Json<BackendOverrideBody>,
+) -> Response {
+    let Some(snap) = snapshot_for(&state, &lib).await else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let Some(game) = snap.game(&game_id) else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let requested = body
+        .backend
+        .as_deref()
+        .map(str::trim)
+        .filter(|b| !b.is_empty());
+    let backend = match requested {
+        None => None,
+        Some(b) => match b.parse::<Backend>() {
+            Ok(backend) => Some(backend),
+            Err(_) => return error_json(StatusCode::BAD_REQUEST, BACKEND_UNAVAILABLE),
+        },
+    };
+    let user_id = session
+        .user
+        .id;
+    if let Err(e) = store_override(
+        &state,
+        user_id,
+        &game.id,
+        "backend",
+        backend
+            .map(|b| b.to_string())
+            .as_deref(),
+    )
+    .await
+    {
+        return internal_error(e);
+    }
+    build_detail(&state, &snap, game, user_id).await
 }
 
 #[query]
@@ -1203,7 +1475,7 @@ mod tests {
             json!({
                 "id": mario_id, "title": "Super Mario (U)", "system": "NES",
                 "core": "nes", "fileName": "Super Mario (U).nes",
-                "backendOverrideSupported": false,
+                "backendOverrideSupported": true,
                 "sizeBytes": ROM_BYTES.len(),
                 "bios": [],
             })
@@ -3406,5 +3678,383 @@ mod tests {
         assert_eq!(d["rating"], json!(4.25));
         // A local source is read in place, never copied or deleted.
         assert!(zip.is_file());
+    }
+
+    // ---- per-game emulator overrides --------------------------------------
+
+    async fn override_harness() -> Harness {
+        let zip = zip_bytes(&[("pacman.6e", &[1u8; 64])]);
+        let (h, extra) = archive_harness(
+            move |r| {
+                std::fs::create_dir_all(r.join("Arcade")).unwrap();
+                std::fs::write(r.join("Arcade/pacman.zip"), &zip).unwrap();
+            },
+            |_| {},
+        )
+        .await;
+        // Keep the extra root alive for the harness' lifetime.
+        std::mem::forget(extra);
+        h
+    }
+
+    fn game_path(h: &Harness, id: &str, tail: &str) -> String {
+        format!("/Moonfin/Games/{}/Games/{id}{tail}", h.lib)
+    }
+
+    async fn put_json(
+        h: &Harness,
+        token: &str,
+        path: &str,
+        body: &Value,
+    ) -> axum_test::TestResponse {
+        h.server
+            .put(path)
+            .add_header(
+                header::AUTHORIZATION,
+                http::HeaderValue::from_str(&auth_header_with_token(token)).unwrap(),
+            )
+            .json(body)
+            .await
+    }
+
+    async fn detail_for(h: &Harness, token: &str, id: &str) -> Value {
+        h.server
+            .get(&game_path(h, id, ""))
+            .add_header(
+                header::AUTHORIZATION,
+                http::HeaderValue::from_str(&auth_header_with_token(token)).unwrap(),
+            )
+            .await
+            .json::<Value>()
+    }
+
+    async fn ids(h: &Harness) -> (String, String) {
+        let list = get_json(h, &format!("/Moonfin/Games/{}/Games", h.lib)).await;
+        (id_of(&list, "pacman"), id_of(&list, "Super Mario (U)"))
+    }
+
+    #[tokio::test]
+    async fn arcade_detail_offers_core_choice_and_other_systems_do_not() {
+        let h = override_harness().await;
+        let (arcade, nes) = ids(&h).await;
+        let d = detail_for(&h, &h.token, &arcade).await;
+        assert_eq!(d["core"], "arcade");
+        assert_eq!(d["recommendedCore"], "arcade");
+        assert_eq!(d["availableCores"], json!(["arcade", "mame"]));
+        assert!(d["coreCompatibilityReason"].is_string());
+        assert_eq!(d["backendOverrideSupported"], true);
+        assert!(
+            d.get("userCoreOverride")
+                .is_none()
+        );
+        assert!(
+            d.get("userBackendOverride")
+                .is_none()
+        );
+
+        let d = detail_for(&h, &h.token, &nes).await;
+        assert_eq!(d["core"], "nes");
+        assert_eq!(d["backendOverrideSupported"], true);
+        for key in [
+            "availableCores",
+            "recommendedCore",
+            "coreCompatibilityReason",
+            "userCoreOverride",
+            "userBackendOverride",
+        ] {
+            assert!(
+                d.get(key)
+                    .is_none(),
+                "{key} must be absent"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn core_override_set_clear_and_effective_core() {
+        let h = override_harness().await;
+        let (id, _) = ids(&h).await;
+        let path = game_path(&h, &id, "/Core");
+
+        let r = put_json(&h, &h.token, &path, &json!({ "core": "mame" })).await;
+        r.assert_status_ok();
+        let d = r.json::<Value>();
+        assert_eq!(d["core"], "mame");
+        assert_eq!(d["userCoreOverride"], "mame");
+        assert_eq!(d["recommendedCore"], "arcade");
+        assert_eq!(d["availableCores"], json!(["arcade", "mame"]));
+        assert_eq!(detail_for(&h, &h.token, &id).await, d);
+
+        // The list keeps the system core, and the override passes the player
+        // allowlist and still streams the zip.
+        let list = get_json(&h, &format!("/Moonfin/Games/{}/Games", h.lib)).await;
+        let item = list
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|g| g["id"] == id.as_str())
+            .unwrap();
+        assert_eq!(item["core"], "arcade");
+        h.server
+            .get("/Moonfin/EmulatorJS/player.html?core=mame")
+            .await
+            .assert_status_ok();
+        let rom = h
+            .server
+            .get(&rom_url(&h, &id, "pacman.zip"))
+            .await;
+        rom.assert_status_ok();
+
+        // Clearing with null restores the default; so does a blank string.
+        let d = put_json(&h, &h.token, &path, &json!({ "core": null }))
+            .await
+            .json::<Value>();
+        assert_eq!(d["core"], "arcade");
+        assert!(
+            d.get("userCoreOverride")
+                .is_none()
+        );
+        put_json(&h, &h.token, &path, &json!({ "core": "MAME" })).await;
+        let d = put_json(&h, &h.token, &path, &json!({ "core": "" }))
+            .await
+            .json::<Value>();
+        assert_eq!(d["core"], "arcade");
+        let rows: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM moonfin_game_overrides")
+                .fetch_one(
+                    &h._guard
+                        .0
+                        .db,
+                )
+                .await
+                .unwrap();
+        assert_eq!(rows, 0);
+    }
+
+    #[tokio::test]
+    async fn core_override_validation() {
+        let h = override_harness().await;
+        let (arcade, nes) = ids(&h).await;
+        let path = game_path(&h, &arcade, "/Core");
+        for bad in ["nes", "fceumm", "snes", "bogus"] {
+            let r = put_json(&h, &h.token, &path, &json!({ "core": bad })).await;
+            r.assert_status(http::StatusCode::BAD_REQUEST);
+            assert_eq!(
+                r.json::<Value>(),
+                json!({ "error": "The requested core is not available for this game." })
+            );
+        }
+        assert!(
+            detail_for(&h, &h.token, &arcade)
+                .await
+                .get("userCoreOverride")
+                .is_none()
+        );
+        // Non-arcade game, unknown game and unknown library are 404.
+        put_json(
+            &h,
+            &h.token,
+            &game_path(&h, &nes, "/Core"),
+            &json!({ "core": "mame" }),
+        )
+        .await
+        .assert_status_not_found();
+        put_json(
+            &h,
+            &h.token,
+            &game_path(&h, &"0".repeat(32), "/Core"),
+            &json!({ "core": "mame" }),
+        )
+        .await
+        .assert_status_not_found();
+        put_json(
+            &h,
+            &h.token,
+            &format!("/Moonfin/Games/{}/Games/{arcade}/Core", Uuid::new_v4()),
+            &json!({ "core": "mame" }),
+        )
+        .await
+        .assert_status_not_found();
+    }
+
+    #[tokio::test]
+    async fn backend_override_set_clear_and_validation() {
+        let h = override_harness().await;
+        let (arcade, nes) = ids(&h).await;
+        for id in [&nes, &arcade] {
+            let path = game_path(&h, id, "/Backend");
+            let r = put_json(&h, &h.token, &path, &json!({ "backend": "EmulatorJS" }))
+                .await;
+            r.assert_status_ok();
+            let d = r.json::<Value>();
+            assert_eq!(d["userBackendOverride"], "emulatorjs");
+            assert_eq!(d["core"], detail_for(&h, &h.token, id).await["core"]);
+            assert_eq!(detail_for(&h, &h.token, id).await, d);
+
+            for clear in [json!({ "backend": null }), json!({ "backend": "" })] {
+                put_json(&h, &h.token, &path, &json!({ "backend": "emulatorjs" }))
+                    .await;
+                let d = put_json(&h, &h.token, &path, &clear)
+                    .await
+                    .json::<Value>();
+                assert!(
+                    d.get("userBackendOverride")
+                        .is_none()
+                );
+            }
+
+            let r =
+                put_json(&h, &h.token, &path, &json!({ "backend": "native" })).await;
+            r.assert_status(http::StatusCode::BAD_REQUEST);
+            assert_eq!(
+                r.json::<Value>(),
+                json!({ "error": "The requested game backend is not available." })
+            );
+        }
+        put_json(
+            &h,
+            &h.token,
+            &game_path(&h, &"0".repeat(32), "/Backend"),
+            &json!({ "backend": "emulatorjs" }),
+        )
+        .await
+        .assert_status_not_found();
+    }
+
+    #[tokio::test]
+    async fn core_and_backend_overrides_are_independent_and_per_user() {
+        let h = override_harness().await;
+        let (id, _) = ids(&h).await;
+        let other = {
+            h.server
+                .post("/Users/New")
+                .add_header(header::AUTHORIZATION, h.auth())
+                .json(&json!({ "Name": "second", "Password": "pw" }))
+                .await;
+            h.login("second", "pw")
+                .await
+        };
+        put_json(
+            &h,
+            &h.token,
+            &game_path(&h, &id, "/Core"),
+            &json!({ "core": "mame" }),
+        )
+        .await;
+        put_json(
+            &h,
+            &h.token,
+            &game_path(&h, &id, "/Backend"),
+            &json!({ "backend": "emulatorjs" }),
+        )
+        .await;
+        let d = detail_for(&h, &h.token, &id).await;
+        assert_eq!(d["userCoreOverride"], "mame");
+        assert_eq!(d["userBackendOverride"], "emulatorjs");
+        // Clearing one leaves the other.
+        let d = put_json(
+            &h,
+            &h.token,
+            &game_path(&h, &id, "/Core"),
+            &json!({ "core": null }),
+        )
+        .await
+        .json::<Value>();
+        assert_eq!(d["userBackendOverride"], "emulatorjs");
+        assert!(
+            d.get("userCoreOverride")
+                .is_none()
+        );
+
+        put_json(
+            &h,
+            &h.token,
+            &game_path(&h, &id, "/Core"),
+            &json!({ "core": "mame" }),
+        )
+        .await;
+        let theirs = detail_for(&h, &other, &id).await;
+        assert_eq!(theirs["core"], "arcade");
+        assert!(
+            theirs
+                .get("userCoreOverride")
+                .is_none()
+        );
+        assert!(
+            theirs
+                .get("userBackendOverride")
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn override_routes_require_auth_and_respect_games_flag() {
+        let h = override_harness().await;
+        let (id, _) = ids(&h).await;
+        for tail in ["/Core", "/Backend"] {
+            h.server
+                .put(&game_path(&h, &id, tail))
+                .json(&json!({}))
+                .expect_failure()
+                .await
+                .assert_status(http::StatusCode::UNAUTHORIZED);
+        }
+        let off = harness(false).await;
+        for tail in ["/Core", "/Backend"] {
+            put_json(&off, &off.token, &game_path(&off, &id, tail), &json!({}))
+                .await
+                .assert_status_not_found();
+        }
+    }
+
+    #[tokio::test]
+    async fn deleting_a_user_removes_their_game_overrides() {
+        let h = override_harness().await;
+        let (id, _) = ids(&h).await;
+        h.server
+            .post("/Users/New")
+            .add_header(header::AUTHORIZATION, h.auth())
+            .json(&json!({ "Name": "second", "Password": "pw" }))
+            .await;
+        let other = h
+            .login("second", "pw")
+            .await;
+        put_json(
+            &h,
+            &other,
+            &game_path(&h, &id, "/Core"),
+            &json!({ "core": "mame" }),
+        )
+        .await;
+        let users = h
+            .server
+            .get("/Users")
+            .add_header(header::AUTHORIZATION, h.auth())
+            .await
+            .json::<Value>();
+        let second = users
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|u| u["Name"] == "second")
+            .unwrap()["Id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        h.server
+            .delete(&format!("/Users/{second}"))
+            .add_header(header::AUTHORIZATION, h.auth())
+            .await
+            .assert_status(http::StatusCode::NO_CONTENT);
+        let rows: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM moonfin_game_overrides")
+                .fetch_one(
+                    &h._guard
+                        .0
+                        .db,
+                )
+                .await
+                .unwrap();
+        assert_eq!(rows, 0);
     }
 }
