@@ -195,12 +195,34 @@ pub async fn serve(config: Config, paths: FilesystemPaths) -> Result<()> {
         .clone();
     let addr = std::net::SocketAddr::new(config.host, config.port);
     let remux_web = RemuxWeb::from_filesystem(&paths.remux_web_path);
-    let (router, _) =
+    let (router, ctx) =
         init_app(config, Some(paths), admin, Some(remux_web), move |pool| {
             WebClientService::from_filesystem(&web_path, pool)
         })
         .await?;
+    spawn_games_warmup(&ctx);
     bind_and_serve(router, addr).await
+}
+
+/// Scans the games library and loads its metadata databases in the
+/// background, so the first game opened after a restart already has its
+/// genre, description and the rest. Never blocks a request; does nothing when
+/// games are not active. Part of starting a server (not of building the app),
+/// so tests that arrange their library after boot are unaffected.
+pub fn spawn_games_warmup(ctx: &AppContext) {
+    if !games::is_active(&ctx.config) {
+        return;
+    }
+    let ctx = ctx.clone();
+    tokio::spawn(async move {
+        let snap = ctx
+            .games
+            .snapshot(&ctx.config)
+            .await;
+        ctx.game_meta
+            .warm(&ctx.config, &snap)
+            .await;
+    });
 }
 
 pub async fn bind_and_serve(router: Router, addr: std::net::SocketAddr) -> Result<()> {

@@ -930,6 +930,8 @@ struct Inner {
     stamp: Mutex<StampSlot>,
     schedule: Mutex<Schedule>,
     maps: Mutex<HashMap<Core, MapSlot>>,
+    /// Signalled whenever a background update finishes.
+    settled: tokio::sync::Notify,
 }
 
 /// LaunchBox lookups and the background build. Cheap to clone.
@@ -945,6 +947,7 @@ impl Default for LaunchBox {
                 stamp: Mutex::new(StampSlot::Unread),
                 schedule: Mutex::new(Schedule::default()),
                 maps: Mutex::new(HashMap::new()),
+                settled: tokio::sync::Notify::new(),
             }),
         }
     }
@@ -1033,7 +1036,37 @@ impl LaunchBox {
                     warn!(error = %e, retry_in_secs = wait.as_secs(), "games: LaunchBox metadata update failed");
                 }
             }
+            drop(s);
+            me.inner
+                .settled
+                .notify_waiters();
         });
+    }
+
+    /// Resolves once no background update is running (immediately when none
+    /// is). Used to wait for a build or refresh started by
+    /// [`prewarm`](Self::prewarm).
+    pub async fn settled(&self) {
+        loop {
+            let notified = self
+                .inner
+                .settled
+                .notified();
+            tokio::pin!(notified);
+            notified
+                .as_mut()
+                .enable();
+            if !lock(
+                &self
+                    .inner
+                    .schedule,
+            )
+            .running
+            {
+                return;
+            }
+            notified.await;
+        }
     }
 
     fn covers_all(&self, wanted: &HashSet<Core>) -> bool {

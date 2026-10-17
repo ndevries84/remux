@@ -46,6 +46,11 @@ use crate::Config;
 /// database being parsed, a ROM being hashed). Anything slower finishes in
 /// the background and shows up on the next request.
 pub const REQUEST_WAIT: Duration = Duration::from_millis(250);
+/// How long the startup warm-up waits on one game (a database still being
+/// downloaded or parsed, a big ROM being hashed).
+const WARM_WAIT: Duration = Duration::from_secs(300);
+/// Games resolved at once by the warm-up (hashing is capped separately).
+const WARM_CONCURRENCY: usize = 8;
 /// Simultaneous database downloads (be polite to the CDN).
 const MAX_CONCURRENT_DOWNLOADS: usize = 2;
 /// Simultaneous ROM hashing jobs.
@@ -234,6 +239,46 @@ impl MetaService {
         }
     }
 
+    /// Brings everything a detail needs into memory ahead of the first
+    /// request: starts the LaunchBox update and the database loads
+    /// ([`prewarm`](Self::prewarm)), waits for them (downloads included, as
+    /// the usual rules allow), then resolves every game once so ROM hashes,
+    /// parsed databases and LaunchBox indexes are all cached. Meant for a
+    /// background task at startup; requests never wait for it.
+    pub async fn warm(&self, config: &Config, snap: &GamesSnapshot) {
+        if !config.games_metadata_enabled && !config.games_launchbox_enabled {
+            return;
+        }
+        self.prewarm(config, snap);
+        if config.games_launchbox_enabled {
+            self.inner
+                .launchbox
+                .settled()
+                .await;
+        }
+        let started = Instant::now();
+        let deadline = || tokio::time::Instant::now() + WARM_WAIT;
+        futures_util::stream::iter(
+            snap.games
+                .iter(),
+        )
+        .for_each_concurrent(WARM_CONCURRENCY, |game| async move {
+            let _ = self
+                .get_until(config, game, deadline())
+                .await;
+        })
+        .await;
+        debug!(
+            games = snap
+                .games
+                .len(),
+            secs = started
+                .elapsed()
+                .as_secs(),
+            "games: metadata warmed"
+        );
+    }
+
     /// Whatever is known about `game` right now. Work that is not finished
     /// within [`REQUEST_WAIT`] completes in the background; fields that are
     /// not resolved are simply absent.
@@ -242,6 +287,17 @@ impl MetaService {
     /// (CRC matches are exact); LaunchBox only fills what is missing, and is
     /// the sole source of `overview` and `rating`.
     pub async fn get(&self, config: &Config, game: &Game) -> GameMeta {
+        self.get_until(config, game, tokio::time::Instant::now() + REQUEST_WAIT)
+            .await
+    }
+
+    /// [`get`](Self::get) with an explicit deadline.
+    async fn get_until(
+        &self,
+        config: &Config,
+        game: &Game,
+        deadline: tokio::time::Instant,
+    ) -> GameMeta {
         let rdb_on = config.games_metadata_enabled;
         let lb_on = config.games_launchbox_enabled;
         if !rdb_on && !lb_on {
@@ -252,7 +308,6 @@ impl MetaService {
             return GameMeta::default();
         }
         let st = Settings::new(config);
-        let deadline = tokio::time::Instant::now() + REQUEST_WAIT;
 
         let (mut meta, canonical) = if rdb_on {
             match self
@@ -1009,6 +1064,169 @@ mod tests {
             download(&client, &url, &Validators::default(), 1000).await,
             Download::Fresh(_)
         ));
+    }
+
+    /// A library with one NES ROM, its libretro database (by CRC) and a
+    /// LaunchBox zip, all synthetic, under fresh temp dirs.
+    struct WarmFixture {
+        _dirs: (tempfile::TempDir, tempfile::TempDir),
+        config: Config,
+        snap: GamesSnapshot,
+    }
+
+    fn warm_fixture() -> WarmFixture {
+        use std::io::Write as _;
+        let roms = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        std::fs::create_dir(
+            roms.path()
+                .join("NES"),
+        )
+        .unwrap();
+        let mut rom = b"NES\x1A".to_vec();
+        rom.extend_from_slice(&[7u8; 48]);
+        write(
+            &roms
+                .path()
+                .join("NES"),
+            "Legend of Hero, The (USA).nes",
+            &rom,
+        );
+        let crc = crc32fast::hash(&rom);
+
+        // libretro: read in place from a local directory.
+        let rdb_dir = data
+            .path()
+            .join("rdb");
+        std::fs::create_dir(&rdb_dir).unwrap();
+        write(
+            &rdb_dir,
+            "Nintendo - Nintendo Entertainment System.rdb",
+            &rdb::test_support::build(&[rdb::test_support::Rec::named(
+                "Legend of Hero, The (USA)",
+            )
+            .crc(crc)
+            .genre("RPG")
+            .developer("Hero Soft")]),
+        );
+        // LaunchBox: built from a local zip at warm-up.
+        let zip = data
+            .path()
+            .join("Metadata.zip");
+        let mut w = zip::ZipWriter::new(std::fs::File::create(&zip).unwrap());
+        w.start_file("Metadata.xml", zip::write::SimpleFileOptions::default())
+            .unwrap();
+        w.write_all(
+            b"<LaunchBox><Game><Name>The Legend of Hero</Name>\
+              <Platform>Nintendo Entertainment System</Platform>\
+              <Overview>A hero sets out.</Overview><MaxPlayers>2</MaxPlayers></Game></LaunchBox>",
+        )
+        .unwrap();
+        w.finish()
+            .unwrap();
+
+        let config = Config {
+            data_dir: data
+                .path()
+                .to_path_buf(),
+            games_enabled: true,
+            games_roots: vec![
+                roms.path()
+                    .to_string_lossy()
+                    .into_owned(),
+            ],
+            games_metadata_enabled: true,
+            games_metadata_rdb_base_url: rdb_dir
+                .to_string_lossy()
+                .into_owned(),
+            games_launchbox_enabled: true,
+            games_launchbox_url: zip
+                .to_string_lossy()
+                .into_owned(),
+            ..Default::default()
+        };
+        let snap = crate::games::scanner::scan(&[roms
+            .path()
+            .to_path_buf()]);
+        assert_eq!(
+            snap.games
+                .len(),
+            1
+        );
+        WarmFixture {
+            _dirs: (roms, data),
+            config,
+            snap,
+        }
+    }
+
+    #[tokio::test]
+    async fn warm_up_makes_the_first_detail_complete() {
+        let fx = warm_fixture();
+        let game = &fx
+            .snap
+            .games[0];
+
+        // A fresh service that has been warmed: even a request with no time
+        // to wait at all already finds the rdb fields and the description.
+        let svc = MetaService::default();
+        svc.warm(&fx.config, &fx.snap)
+            .await;
+        let meta = svc
+            .get_until(&fx.config, game, tokio::time::Instant::now())
+            .await;
+        assert_eq!(
+            meta.genre
+                .as_deref(),
+            Some("RPG")
+        );
+        assert_eq!(
+            meta.developer
+                .as_deref(),
+            Some("Hero Soft")
+        );
+        assert_eq!(
+            meta.overview
+                .as_deref(),
+            Some("A hero sets out.")
+        );
+        assert_eq!(meta.players, Some(2));
+    }
+
+    #[tokio::test]
+    async fn without_a_warm_up_the_first_request_is_bare() {
+        // The behaviour the warm-up exists to fix: nothing is loaded yet, so
+        // a request with no budget gets nothing at all.
+        let fx = warm_fixture();
+        let svc = MetaService::default();
+        let meta = svc
+            .get_until(
+                &fx.config,
+                &fx.snap
+                    .games[0],
+                tokio::time::Instant::now(),
+            )
+            .await;
+        assert!(meta.is_empty());
+    }
+
+    #[tokio::test]
+    async fn warm_up_does_nothing_when_both_sources_are_off() {
+        let mut fx = warm_fixture();
+        fx.config
+            .games_metadata_enabled = false;
+        fx.config
+            .games_launchbox_enabled = false;
+        let svc = MetaService::default();
+        svc.warm(&fx.config, &fx.snap)
+            .await;
+        assert!(
+            lock(
+                &svc.inner
+                    .slots
+            )
+            .is_empty()
+        );
     }
 
     #[test]
