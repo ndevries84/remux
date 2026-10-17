@@ -46,7 +46,8 @@ label input:not([type=file]) { display: block; width: 100%; max-width: 320px; ma
 .scroll { overflow-x: auto; }
 table { width: 100%; border-collapse: collapse; font-size: 0.9rem; }
 th, td { text-align: left; padding: 6px 8px; border-bottom: 1px solid var(--line);
-  vertical-align: top; overflow-wrap: anywhere; }
+  vertical-align: top; overflow-wrap: break-word; }
+td.devs { white-space: pre-line; }
 th { color: var(--muted); font-weight: 600; }
 tbody tr.click { cursor: pointer; }
 tbody tr.click:hover, tbody tr.sel { background: var(--bg); }
@@ -72,3 +73,13 @@ dialog { background: var(--card); color: var(--fg); border: 1px solid var(--line
 dialog::backdrop { background: rgba(0, 0, 0, 0.5); }
 [hidden] { display: none !important; }
 @media (max-width: 600px) { main { padding: 12px; } .card { padding: 12px; } }
+
+/* Phone width: render each Users row as a stacked card with labelled fields. */
+@media (max-width: 600px) {
+  #users-table thead { display: none; }
+  #users-table, #users-table tbody, #users-table tr, #users-table td { display: block; width: 100%; }
+  #users-table tr { border: 1px solid var(--line); border-radius: 8px; margin: 8px 0; padding: 4px 0; }
+  #users-table td { border-bottom: 0; padding: 4px 10px; }
+  #users-table td[data-label]::before { content: attr(data-label); display: block;
+    color: var(--muted); font-size: 0.75rem; font-weight: 600; }
+}

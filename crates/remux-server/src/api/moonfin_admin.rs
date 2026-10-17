@@ -171,14 +171,15 @@ async fn users_summary(state: &AppState) -> Result<Vec<Value>, sqlx::Error> {
     )
     .fetch_all(db)
     .await?;
-    // `devices.user_id` is text and may or may not carry dashes.
-    let devices: Vec<(String, String, String, String, String, String)> =
-        sqlx::query_as(
-            "SELECT user_id, id, name, app_name, app_version, last_activity_at \
+    // Auth stores `devices.user_id` as a 16-byte uuid blob (it binds a `Uuid`),
+    // so decode it as one. `LIKE` is ASCII case-insensitive, which is all the
+    // app-name match needs.
+    let devices: Vec<(Uuid, String, String, String, String, String)> = sqlx::query_as(
+        "SELECT user_id, id, name, app_name, app_version, last_activity_at \
          FROM devices WHERE app_name LIKE '%Moonfin%' ORDER BY last_activity_at DESC",
-        )
-        .fetch_all(db)
-        .await?;
+    )
+    .fetch_all(db)
+    .await?;
 
     Ok(users
         .into_iter()
@@ -194,7 +195,7 @@ async fn users_summary(state: &AppState) -> Result<Vec<Value>, sqlx::Error> {
                 .collect();
             let devices: Vec<Value> = devices
                 .iter()
-                .filter(|(u, ..)| Uuid::parse_str(u).ok() == Some(id))
+                .filter(|(u, ..)| *u == id)
                 .map(|(_, device_id, name, app, version, last)| {
                     json!({
                         "id": device_id,
@@ -748,16 +749,12 @@ mod tests {
         push(&h, &other, "global", json!({ "a": 1 })).await;
         push(&h, &other, "tv", json!({ "b": 2 })).await;
         let second = user_id(&h, "second").await;
-        for (id, app, dashed) in [
-            ("d1", "Moonfin Flutter", true),
-            ("d2", "Jellyfin Web", true),
-            ("d3", "Moonfin", false),
+        for (id, app) in [
+            ("d1", "Moonfin Flutter"),
+            ("d2", "Jellyfin Web"),
+            ("d3", "moonfin"),
         ] {
-            let owner = if dashed {
-                second.to_string()
-            } else {
-                simple(second)
-            };
+            let owner = second;
             sqlx::query(
                 "INSERT INTO devices (user_id, id, access_token, name, app_name, app_version) \
                  VALUES (?1, ?2, ?3, 'Living room', ?4, '2.7.0')",
@@ -825,6 +822,43 @@ mod tests {
         device_ids.sort();
         assert_eq!(device_ids, ["d1", "d3"]);
         assert_eq!(second_entry["devices"][0]["appVersion"], "2.7.0");
+    }
+
+    /// Regression: devices created by the real auth flow store `user_id` as a
+    /// uuid blob; the users list used to decode it as text and return 500.
+    #[tokio::test]
+    async fn users_list_includes_devices_created_by_real_login() {
+        let h = Harness::new().await;
+        let resp = h
+            .server
+            .post("/Users/AuthenticateByName")
+            .add_header(
+                http::header::AUTHORIZATION,
+                http::HeaderValue::from_static(
+                    "MediaBrowser Client=\"Moonfin Admin\", Device=\"Browser\", DeviceId=\"moonfin-admin-dev\", Version=\"1.0.0\"",
+                ),
+            )
+            .json(&json!({ "Username": "test", "Pw": "test" }))
+            .await;
+        resp.assert_status_ok();
+
+        let resp = h
+            .get(&h.token, "/Moonfin/Admin/Users")
+            .await;
+        resp.assert_status_ok();
+        let body = resp.json::<Value>();
+        let admin = body["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|u| u["name"] == "test")
+            .unwrap();
+        let devices = admin["devices"]
+            .as_array()
+            .unwrap();
+        assert_eq!(devices.len(), 1);
+        assert_eq!(devices[0]["id"], "moonfin-admin-dev");
+        assert_eq!(devices[0]["appName"], "Moonfin Admin");
     }
 
     #[tokio::test]

@@ -96,25 +96,50 @@
         try { data = text ? JSON.parse(text) : null; } catch (e) { data = null; }
         if (!res.ok) {
           var msg = (data && (data.error || data.Error || data.message)) || res.statusText || 'Request failed';
-          throw new ApiError(res.status, msg, data);
+          var e = new ApiError(res.status, msg, data);
+          e.path = path;
+          throw e;
         }
+        clearFailure(path);
         return data;
       });
     });
   }
 
+  // Error banner state, keyed by request path, so a later successful call to
+  // the same endpoint clears the stale message.
+  var failures = {};
+  var failureShown = false;
+
+  function renderFailures() {
+    var keys = Object.keys(failures);
+    if (keys.length) {
+      showBanner(failures[keys[keys.length - 1]], true);
+      failureShown = true;
+    } else if (failureShown) {
+      showBanner('', false);
+    }
+  }
+
+  function clearFailure(path) {
+    if (!(path in failures)) return;
+    delete failures[path];
+    renderFailures();
+  }
+
   function handleError(err) {
     if (err && err.status === 401) { logout('Your session expired. Sign in again.'); return; }
-    if (err && err.status === 403) {
-      showBanner('This account is not a Remux administrator. Sign in with an admin account.', true);
-      return;
-    }
-    showBanner((err && err.message) || 'Request failed', true);
+    var msg = (err && err.status === 403)
+      ? 'This account is not a Remux administrator. Sign in with an admin account.'
+      : ((err && err.message) || 'Request failed');
+    failures[(err && err.path) || '_'] = msg;
+    renderFailures();
   }
 
   // ---- shell -----------------------------------------------------------
 
   function showBanner(text, bad) {
+    failureShown = false;
     var b = $('banner');
     b.textContent = text;
     b.className = bad ? 'banner bad' : 'banner';
@@ -129,6 +154,7 @@
   }
 
   function showApp() {
+    failures = {};
     $('login').hidden = true;
     $('app').hidden = false;
     $('logout').hidden = false;
@@ -137,6 +163,7 @@
   }
 
   function logout(message) {
+    failures = {};
     token = '';
     store('session', TOKEN_KEY, null);
     stopCoresPolling();
@@ -365,9 +392,9 @@
           return (dv.name || dv.id) + ' - ' + (dv.appName || '') + ' ' + (dv.appVersion || '') + ', last active ' + fmtTime(dv.lastActivityAt);
         });
         var tr = el('tr', { class: 'click' + (selectedUser === u.userId ? ' sel' : ''), tabindex: '0' }, [
-          el('td', { text: u.name || u.userId }),
-          el('td', { text: profiles.length ? profiles.join('; ') : 'none' }),
-          el('td', { text: devices.length ? devices.join('; ') : 'none' })
+          el('td', { 'data-label': 'User', text: u.name || u.userId }),
+          el('td', { 'data-label': 'Profiles', text: profiles.length ? profiles.join('; ') : 'none' }),
+          el('td', { 'data-label': 'Moonfin devices', text: devices.length ? devices.join('\n') : 'none', class: 'devs' })
         ]);
         var open = function () { openUser(u.userId, u.name); };
         tr.addEventListener('click', open);
@@ -494,9 +521,21 @@
     }).then(function (data) {
       token = data.AccessToken;
       $('login-pass').value = '';
-      store('session', TOKEN_KEY, token);
-      showApp();
-    }).catch(function (err) { showBanner(err.message || 'Sign-in failed.', true); });
+      // Only keep the token and show the shell for a Remux administrator.
+      return api('GET', '/moonfin/admin/status').then(function () {
+        store('session', TOKEN_KEY, token);
+        showApp();
+      }).catch(function (err) {
+        token = '';
+        store('session', TOKEN_KEY, null);
+        if (err && err.status === 403) {
+          showLogin('This account is not a Remux administrator. Sign in with an admin account.');
+          $('banner').className = 'banner bad';
+        } else {
+          throw err;
+        }
+      });
+    }).catch(function (err) { showBanner((err && err.message) || 'Sign-in failed.', true); });
   }
 
   // ---- wiring ----------------------------------------------------------
