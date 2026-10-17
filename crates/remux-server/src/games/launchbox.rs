@@ -37,10 +37,10 @@ use quick_xml::{Reader, events::Event};
 use serde::{Deserialize, Serialize};
 use tokio::io::AsyncWriteExt;
 use tracing::{debug, info, warn};
-use unicode_normalization::{UnicodeNormalization, char::is_combining_mark};
 use uuid::Uuid;
 
 use super::{
+    names::{self, Tags},
     rdb::{GameMeta, Rating},
     resolver::Core,
 };
@@ -61,7 +61,14 @@ const MAX_FIELD_BYTES: usize = 1024;
 const MIN_PREFIX_LEN: usize = 5;
 const MAX_PREFIX_GAP: usize = 20;
 const STAMP_FILE: &str = "stamp.json";
-const STAMP_VERSION: u32 = 1;
+/// Bumped whenever the on-disk index format or its name keys change, so
+/// generations built by an older version are rebuilt instead of misread.
+/// 2: name keys per [`names`] (articles, `&`, "Vol."), plus alias keys from
+/// alternate names.
+const STAMP_VERSION: u32 = 2;
+/// Alternate-name records kept while parsing (a safety net, the real file
+/// has about a hundred thousand).
+const MAX_ALT_NAMES: usize = 2_000_000;
 
 /// LaunchBox platform names that fold into each core (Moonbase's table).
 /// Cores without an entry (arcade) have no LaunchBox data.
@@ -153,36 +160,41 @@ impl LbRecord {
 /// One core's games keyed by [`normalize_name`].
 pub type LbMap = HashMap<String, LbRecord>;
 
-/// Matching key: letters and digits only, lowercase, accents dropped and
-/// anything inside `()` or `[]` removed, so a No-Intro file name and a clean
-/// LaunchBox title collapse to the same key.
-pub fn normalize_name(value: &str) -> String {
-    let mut out = String::with_capacity(value.len());
-    let mut depth = 0usize;
-    for ch in value
-        .nfd()
-        .filter(|c| !is_combining_mark(*c))
-    {
-        match ch {
-            '(' | '[' => depth += 1,
-            ')' | ']' => depth = depth.saturating_sub(1),
-            c if depth == 0 && c.is_alphanumeric() => {
-                out.extend(c.to_lowercase());
-            }
-            _ => {}
-        }
-    }
-    out
+/// One core's searchable data: the games by name key, plus extra keys that
+/// lead to one of them (alternate names, titles without a possessive
+/// prefix). An alias that could mean two different games is not kept.
+#[derive(Debug, Default, Serialize, Deserialize)]
+pub struct LbIndex {
+    #[serde(default)]
+    pub names: LbMap,
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub alias: HashMap<String, String>,
 }
 
-/// Match keys for a game, best first and de-duplicated: the database's own
-/// canonical name (when the other database matched), the catalog title, then
-/// the file stems.
+/// Matching key (see [`names`]): letters and digits only, lowercase, accents
+/// dropped, anything inside `()` or `[]` removed and articles, separators,
+/// `&` and "Vol." normalized, so a No-Intro file name and a clean LaunchBox
+/// title collapse to the same key.
+pub fn normalize_name(value: &str) -> String {
+    names::key(value, Tags::Drop)
+}
+
+/// Match keys for a game.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct Candidates {
+    /// Best first and de-duplicated: the database's own canonical name (when
+    /// the other database matched), the catalog title, then the file stems.
+    pub keys: Vec<String>,
+    /// Weaker keys (the same names without a possessive prefix such as
+    /// "David Crane's"), tried only after every key failed exactly.
+    pub loose: Vec<String>,
+}
+
 pub fn name_candidates<'a>(
     canonical: Option<&str>,
     title: &str,
     stems: impl IntoIterator<Item = &'a str>,
-) -> Vec<String> {
+) -> Candidates {
     let stems = stems
         .into_iter()
         .map(|s| {
@@ -191,32 +203,72 @@ pub fn name_candidates<'a>(
                 .and_then(|s| s.to_str())
                 .unwrap_or(s)
         });
-    let mut out: Vec<String> = Vec::new();
+    let mut out = Candidates::default();
     for raw in canonical
         .into_iter()
         .chain(std::iter::once(title))
         .chain(stems)
     {
         let n = normalize_name(raw);
-        if !n.is_empty() && !out.contains(&n) {
-            out.push(n);
+        if !n.is_empty()
+            && !out
+                .keys
+                .contains(&n)
+        {
+            out.keys
+                .push(n);
+        }
+        if let Some(l) = names::loose_key(raw, Tags::Drop)
+            && !out
+                .loose
+                .contains(&l)
+        {
+            out.loose
+                .push(l);
         }
     }
+    out.loose
+        .retain(|l| {
+            !out.keys
+                .contains(l)
+        });
     out
 }
 
-/// Exact key first (over every candidate), then the unambiguous closest
-/// prefix relative of a key (at least 5 characters, length gap at most 20).
-pub fn lookup<'a>(map: &'a LbMap, names: &[String]) -> Option<&'a LbRecord> {
-    if let Some(r) = names
-        .iter()
-        .find_map(|n| map.get(n))
-    {
-        return Some(r);
-    }
-    names
-        .iter()
-        .find_map(|n| prefix_match(map, n))
+/// Exact key first (over every candidate; a game's own name before an
+/// alias), then loose keys, then the unambiguous closest prefix relative of a
+/// key (at least 5 characters, length gap at most 20).
+pub fn lookup<'a>(index: &'a LbIndex, names: &Candidates) -> Option<&'a LbRecord> {
+    exact(index, &names.keys)
+        .or_else(|| exact(index, &names.loose))
+        .or_else(|| {
+            names
+                .keys
+                .iter()
+                .find_map(|n| prefix_match(&index.names, n))
+        })
+}
+
+fn exact<'a>(index: &'a LbIndex, keys: &[String]) -> Option<&'a LbRecord> {
+    keys.iter()
+        .find_map(|k| {
+            index
+                .names
+                .get(k)
+        })
+        .or_else(|| {
+            keys.iter()
+                .find_map(|k| {
+                    index
+                        .alias
+                        .get(k)
+                        .and_then(|t| {
+                            index
+                                .names
+                                .get(t)
+                        })
+                })
+        })
 }
 
 fn prefix_match<'a>(map: &'a LbMap, name: &str) -> Option<&'a LbRecord> {
@@ -324,6 +376,8 @@ enum Field {
     MaxPlayers,
     Rating,
     RatingCount,
+    DatabaseId,
+    AlternateName,
 }
 
 impl Field {
@@ -340,6 +394,8 @@ impl Field {
             b"MaxPlayers" => Self::MaxPlayers,
             b"CommunityRating" => Self::Rating,
             b"CommunityRatingCount" => Self::RatingCount,
+            b"DatabaseID" => Self::DatabaseId,
+            b"AlternateName" => Self::AlternateName,
             _ => return None,
         })
     }
@@ -366,6 +422,11 @@ struct Raw {
     max_players: String,
     rating: String,
     rating_count: String,
+    /// `DatabaseID` of a game, or of the game an alternate name belongs to.
+    database_id: String,
+    alternate_name: String,
+    /// Set for a `<GameAlternateName>` element.
+    alt: bool,
 }
 
 impl Raw {
@@ -382,6 +443,8 @@ impl Raw {
             Field::MaxPlayers => &mut self.max_players,
             Field::Rating => &mut self.rating,
             Field::RatingCount => &mut self.rating_count,
+            Field::DatabaseId => &mut self.database_id,
+            Field::AlternateName => &mut self.alternate_name,
         }
     }
 
@@ -455,19 +518,16 @@ fn push_capped(dst: &mut String, s: &str, cap: usize) {
 }
 
 /// Pull-parses `<Game>` elements from `src`, keeping those of the `wanted`
-/// cores. Per core and name key the entry with the most votes wins, so the
-/// canonical release beats hacks and re-releases (ties keep the first).
+/// cores, and the `<GameAlternateName>` elements that belong to them. Per
+/// core and name key the entry with the most votes wins, so the canonical
+/// release beats hacks and re-releases (ties keep the first).
 pub fn parse_games<R: std::io::BufRead>(
     src: R,
     wanted: &HashSet<Core>,
-) -> Result<HashMap<Core, LbMap>, BuildError> {
+) -> Result<HashMap<Core, LbIndex>, BuildError> {
     let mut reader = Reader::from_reader(src);
     let mut buf = Vec::new();
-    let mut out: HashMap<Core, HashMap<String, (LbRecord, i64)>> = wanted
-        .iter()
-        .map(|c| (*c, HashMap::new()))
-        .collect();
-
+    let mut out = Collector::new(wanted);
     let mut depth = 0usize;
     let mut game: Option<Raw> = None;
     // Depth inside the current game (0 = directly in `<Game>`) and the field
@@ -483,12 +543,19 @@ pub fn parse_games<R: std::io::BufRead>(
             Event::Start(e) => {
                 depth += 1;
                 match game.as_mut() {
-                    None if e
-                        .name()
-                        .as_ref()
-                        == b"Game" =>
+                    None if matches!(
+                        e.name()
+                            .as_ref(),
+                        b"Game" | b"GameAlternateName"
+                    ) =>
                     {
-                        game = Some(Raw::default());
+                        game = Some(Raw {
+                            alt: e
+                                .name()
+                                .as_ref()
+                                == b"GameAlternateName",
+                            ..Raw::default()
+                        });
                         inner = 0;
                         field = None;
                     }
@@ -512,7 +579,7 @@ pub fn parse_games<R: std::io::BufRead>(
                         let raw = game
                             .take()
                             .expect("game is set");
-                        keep(&mut out, wanted, &raw);
+                        out.add(&raw);
                     } else {
                         inner -= 1;
                         if inner == 0 {
@@ -550,46 +617,147 @@ pub fn parse_games<R: std::io::BufRead>(
         }
         buf.clear();
     }
-    Ok(out
-        .into_iter()
-        .map(|(c, m)| {
-            (
-                c,
-                m.into_iter()
-                    .map(|(k, (r, _))| (k, r))
-                    .collect(),
-            )
-        })
-        .collect())
+    Ok(out.finish())
 }
 
-fn keep(
-    out: &mut HashMap<Core, HashMap<String, (LbRecord, i64)>>,
-    wanted: &HashSet<Core>,
-    raw: &Raw,
-) {
-    let Some(core) = core_for_platform(
-        wanted,
-        raw.platform
-            .trim(),
-    ) else {
-        return;
-    };
-    let key = normalize_name(&raw.name);
-    if key.is_empty() {
-        return;
+/// Games and alternate names gathered while streaming, resolved into
+/// per-core indexes once the whole file has been seen (the two kinds of
+/// element may come in any order).
+struct Collector {
+    wanted: HashSet<Core>,
+    names: HashMap<Core, HashMap<String, (LbRecord, i64)>>,
+    /// Kept games by `DatabaseID`: their core and name key.
+    ids: HashMap<String, (Core, String)>,
+    /// Extra keys from the games' own titles: core, alias, target key.
+    loose: Vec<(Core, String, String)>,
+    /// `(DatabaseID, AlternateName)` of every alternate name seen.
+    alts: Vec<(String, String)>,
+}
+
+impl Collector {
+    fn new(wanted: &HashSet<Core>) -> Self {
+        Self {
+            wanted: wanted.clone(),
+            names: wanted
+                .iter()
+                .map(|c| (*c, HashMap::new()))
+                .collect(),
+            ids: HashMap::new(),
+            loose: Vec::new(),
+            alts: Vec::new(),
+        }
     }
-    let votes = raw.votes();
-    let map = out
-        .entry(core)
-        .or_default();
-    if map
-        .get(&key)
-        .is_some_and(|(_, v)| *v >= votes)
-    {
-        return;
+
+    fn add(&mut self, raw: &Raw) {
+        if raw.alt {
+            let id = raw
+                .database_id
+                .trim();
+            let name = raw
+                .alternate_name
+                .trim();
+            if !id.is_empty()
+                && !name.is_empty()
+                && self
+                    .alts
+                    .len()
+                    < MAX_ALT_NAMES
+            {
+                self.alts
+                    .push((id.to_string(), name.to_string()));
+            }
+            return;
+        }
+        self.keep(raw);
     }
-    map.insert(key, (raw.record(), votes));
+
+    fn keep(&mut self, raw: &Raw) {
+        let Some(core) = core_for_platform(
+            &self.wanted,
+            raw.platform
+                .trim(),
+        ) else {
+            return;
+        };
+        let key = normalize_name(&raw.name);
+        if key.is_empty() {
+            return;
+        }
+        let id = raw
+            .database_id
+            .trim();
+        if !id.is_empty() {
+            self.ids
+                .insert(id.to_string(), (core, key.clone()));
+        }
+        if let Some(l) = names::loose_key(&raw.name, Tags::Drop) {
+            self.loose
+                .push((core, l, key.clone()));
+        }
+        let votes = raw.votes();
+        let map = self
+            .names
+            .entry(core)
+            .or_default();
+        if map
+            .get(&key)
+            .is_some_and(|(_, v)| *v >= votes)
+        {
+            return;
+        }
+        map.insert(key, (raw.record(), votes));
+    }
+
+    fn finish(self) -> HashMap<Core, LbIndex> {
+        // Alias -> target; `None` once two different games claim the alias.
+        let mut aliases: HashMap<Core, HashMap<String, Option<String>>> =
+            HashMap::new();
+        let mut claim = |core: Core, alias: String, target: &str| {
+            let slot = aliases
+                .entry(core)
+                .or_default()
+                .entry(alias)
+                .or_insert_with(|| Some(target.to_string()));
+            if slot
+                .as_deref()
+                .is_some_and(|t| t != target)
+            {
+                *slot = None;
+            }
+        };
+        for (core, alias, target) in &self.loose {
+            claim(*core, alias.clone(), target);
+        }
+        for (id, name) in &self.alts {
+            if let Some((core, target)) = self
+                .ids
+                .get(id)
+            {
+                let alias = normalize_name(name);
+                if !alias.is_empty() && alias != *target {
+                    claim(*core, alias, target);
+                }
+            }
+        }
+        self.names
+            .into_iter()
+            .map(|(core, m)| {
+                let names: LbMap = m
+                    .into_iter()
+                    .map(|(k, (r, _))| (k, r))
+                    .collect();
+                let alias = aliases
+                    .remove(&core)
+                    .unwrap_or_default()
+                    .into_iter()
+                    .filter_map(|(a, t)| Some((a, t?)))
+                    // A game's own name always beats an alias.
+                    .filter(|(a, _)| !names.contains_key(a))
+                    .collect();
+                (core, LbIndex { names, alias })
+            })
+            .collect()
+    }
 }
 
 /// Reads `Metadata.xml` out of the zip at `zip_path` as a stream and writes
@@ -624,7 +792,9 @@ pub fn build(
     std::fs::create_dir_all(out_dir)?;
     let mut total = 0;
     for (core, map) in &maps {
-        total += map.len();
+        total += map
+            .names
+            .len();
         let path = out_dir.join(format!("{core}.json"));
         let mut w = std::io::BufWriter::new(File::create(path)?);
         serde_json::to_writer(&mut w, map)?;
@@ -739,7 +909,7 @@ struct Schedule {
     failures: u32,
 }
 
-type SharedMap = Shared<BoxFuture<'static, Option<Arc<LbMap>>>>;
+type SharedMap = Shared<BoxFuture<'static, Option<Arc<LbIndex>>>>;
 
 enum MapSlot {
     Loading {
@@ -748,7 +918,7 @@ enum MapSlot {
     },
     Ready {
         generation: String,
-        map: Arc<LbMap>,
+        map: Arc<LbIndex>,
     },
     /// The generation's file is unusable; do not retry until it changes.
     Missing {
@@ -885,7 +1055,7 @@ impl LaunchBox {
         &self,
         config: &Config,
         core: Core,
-        names: &[String],
+        names: &Candidates,
         deadline: tokio::time::Instant,
     ) -> Option<GameMeta> {
         if !config.games_launchbox_enabled || !supports(core) {
@@ -928,7 +1098,7 @@ impl LaunchBox {
         st: &Settings,
         core: Core,
         deadline: tokio::time::Instant,
-    ) -> Option<Arc<LbMap>> {
+    ) -> Option<Arc<LbIndex>> {
         let stamp = tokio::time::timeout_at(deadline, self.stamp(st))
             .await
             .ok()??;
@@ -1016,11 +1186,11 @@ impl LaunchBox {
     }
 }
 
-async fn load_map(path: &Path) -> Option<Arc<LbMap>> {
+async fn load_map(path: &Path) -> Option<Arc<LbIndex>> {
     let path = path.to_path_buf();
     tokio::task::spawn_blocking(move || {
         let file = File::open(&path).ok()?;
-        match serde_json::from_reader::<_, LbMap>(BufReader::new(file)) {
+        match serde_json::from_reader::<_, LbIndex>(BufReader::new(file)) {
             Ok(m) => Some(Arc::new(m)),
             Err(e) => {
                 warn!(error = %e, path = %path.display(), "games: unreadable LaunchBox cache file");
@@ -1355,7 +1525,7 @@ mod tests {
             .collect()
     }
 
-    fn parse(xml: &str, cores: &[Core]) -> Result<HashMap<Core, LbMap>, BuildError> {
+    fn parse(xml: &str, cores: &[Core]) -> Result<HashMap<Core, LbIndex>, BuildError> {
         parse_games(xml.as_bytes(), &wanted(cores))
     }
 
@@ -1379,7 +1549,7 @@ mod tests {
         assert_eq!(normalize_name("Tetris [!]"), "tetris");
         assert_eq!(normalize_name("Pokémon: Red Version"), "pokemonredversion");
         assert_eq!(normalize_name("(unbalanced"), "");
-        assert_eq!(normalize_name("a) b"), "ab");
+        assert_eq!(normalize_name("x) y"), "xy");
     }
 
     #[test]
@@ -1389,8 +1559,12 @@ mod tests {
             "Tetris",
             ["Tetris (USA) (Rev 1).nes", "other.zip"],
         );
-        assert_eq!(c, ["tetris", "other"]);
-        assert!(name_candidates(None, "(x)", ["[y].nes"]).is_empty());
+        assert_eq!(c.keys, ["tetris", "other"]);
+        assert!(
+            name_candidates(None, "(x)", ["[y].nes"])
+                .keys
+                .is_empty()
+        );
     }
 
     #[test]
@@ -1411,7 +1585,7 @@ mod tests {
         ]);
         let out = parse(&xml, &[Core::Nes, Core::Gb]).unwrap();
         assert!(!out.contains_key(&Core::Snes));
-        let nes = &out[&Core::Nes];
+        let nes = &out[&Core::Nes].names;
         assert_eq!(nes.len(), 1);
         let t = &nes["tetris"];
         assert_eq!(
@@ -1428,7 +1602,11 @@ mod tests {
         assert_eq!(t.year, Some(1989));
         assert_eq!(t.players, Some(2));
         assert_eq!(t.rating, Some(350));
-        assert!(out[&Core::Gb].contains_key("wario"));
+        assert!(
+            out[&Core::Gb]
+                .names
+                .contains_key("wario")
+        );
     }
 
     #[test]
@@ -1440,7 +1618,7 @@ mod tests {
              <MaxPlayers>0</MaxPlayers><CommunityRating>9.9</CommunityRating>\
              <CommunityRatingCount>5</CommunityRatingCount><Overview>  </Overview>",
         )]);
-        let r = &parse(&xml, &[Core::N64]).unwrap()[&Core::N64]["a"];
+        let r = &parse(&xml, &[Core::N64]).unwrap()[&Core::N64].names["a"];
         assert_eq!(r.year, Some(1997));
         assert_eq!(r.players, None);
         // Out of the 0 to 5 scale: not a rating. Blank text: not an overview.
@@ -1455,7 +1633,7 @@ mod tests {
             "A",
             "<Overview>Fast&nbsp;car</Overview>",
         )]);
-        let r = &parse(&xml, &[Core::N64]).unwrap()[&Core::N64]["a"];
+        let r = &parse(&xml, &[Core::N64]).unwrap()[&Core::N64].names["a"];
         assert!(
             r.overview
                 .as_deref()
@@ -1479,7 +1657,7 @@ mod tests {
         for order in [[low.clone(), high.clone()], [high.clone(), low.clone()]] {
             let out = parse(&doc(&order), &[Core::N64]).unwrap();
             assert_eq!(
-                out[&Core::N64]["mariokart64"]
+                out[&Core::N64].names["mariokart64"]
                     .overview
                     .as_deref(),
                 Some("real")
@@ -1489,7 +1667,7 @@ mod tests {
         let b = game("Nintendo 64", "Same", "<Overview>second</Overview>");
         let out = parse(&doc(&[a, b]), &[Core::N64]).unwrap();
         assert_eq!(
-            out[&Core::N64]["same"]
+            out[&Core::N64].names["same"]
                 .overview
                 .as_deref(),
             Some("first")
@@ -1504,7 +1682,7 @@ mod tests {
             "A",
             &format!("<Overview>{long}</Overview>"),
         )]);
-        let r = &parse(&xml, &[Core::N64]).unwrap()[&Core::N64]["a"];
+        let r = &parse(&xml, &[Core::N64]).unwrap()[&Core::N64].names["a"];
         let o = r
             .overview
             .as_deref()
@@ -1535,15 +1713,21 @@ mod tests {
             overview: Some(o.into()),
             ..Default::default()
         };
-        let mut map = LbMap::new();
-        map.insert("supermariobros".into(), rec("smb"));
-        map.insert("tetris".into(), rec("tetris"));
-        map.insert("tetrisattack".into(), rec("attack"));
-        map.insert("zeldaone".into(), rec("z1"));
-        let names = |s: &[&str]| -> Vec<String> {
-            s.iter()
+        let mut map = LbIndex::default();
+        map.names
+            .insert("supermariobros".into(), rec("smb"));
+        map.names
+            .insert("tetris".into(), rec("tetris"));
+        map.names
+            .insert("tetrisattack".into(), rec("attack"));
+        map.names
+            .insert("zeldaone".into(), rec("z1"));
+        let names = |s: &[&str]| Candidates {
+            keys: s
+                .iter()
                 .map(|s| s.to_string())
-                .collect()
+                .collect(),
+            loose: Vec::new(),
         };
         fn over(r: Option<&LbRecord>) -> Option<&str> {
             r.and_then(|r| {
@@ -1563,8 +1747,10 @@ mod tests {
         assert_eq!(over(lookup(&map, &names(&["tetr"]))), None);
         // Closest key wins; a tie between different games is no match.
         assert_eq!(over(lookup(&map, &names(&["tetrisa"]))), Some("tetris"));
-        map.insert("marioland".into(), rec("land"));
-        map.insert("mariokart".into(), rec("kart"));
+        map.names
+            .insert("marioland".into(), rec("land"));
+        map.names
+            .insert("mariokart".into(), rec("kart"));
         assert_eq!(over(lookup(&map, &names(&["mario"]))), None);
         assert_eq!(
             over(lookup(
@@ -1595,20 +1781,23 @@ mod tests {
         )
         .unwrap();
         assert_eq!(n, 1);
-        let n64: LbMap =
+        let n64: LbIndex =
             serde_json::from_slice(&std::fs::read(out.join("n64.json")).unwrap())
                 .unwrap();
         assert_eq!(
-            n64["a"]
+            n64.names["a"]
                 .overview
                 .as_deref(),
             Some("text")
         );
         // A wanted core with no games still gets a (empty) file.
-        let nes: LbMap =
+        let nes: LbIndex =
             serde_json::from_slice(&std::fs::read(out.join("nes.json")).unwrap())
                 .unwrap();
-        assert!(nes.is_empty());
+        assert!(
+            nes.names
+                .is_empty()
+        );
 
         // Declared size over the cap.
         let tiny = Limits { max_xml_bytes: 10 };
@@ -1677,5 +1866,270 @@ mod tests {
         ok.read_to_string(&mut s)
             .unwrap();
         assert_eq!(s, "12345");
+    }
+
+    fn with_id(platform: &str, name: &str, id: u32, extra: &str) -> String {
+        game(
+            platform,
+            name,
+            &format!("<DatabaseID>{id}</DatabaseID>{extra}"),
+        )
+    }
+
+    fn alt(id: u32, name: &str) -> String {
+        format!(
+            "<GameAlternateName><AlternateName>{name}</AlternateName>\
+             <DatabaseID>{id}</DatabaseID><Region>North America</Region></GameAlternateName>"
+        )
+    }
+
+    const NES: &str = "Nintendo Entertainment System";
+
+    fn over<'a>(
+        index: &'a LbIndex,
+        canonical: Option<&str>,
+        file: &str,
+    ) -> Option<&'a str> {
+        let c = name_candidates(canonical, file, [file]);
+        lookup(index, &c).and_then(|r| {
+            r.overview
+                .as_deref()
+        })
+    }
+
+    fn nes_index(items: &[String]) -> LbIndex {
+        parse(&doc(items), &[Core::Nes])
+            .unwrap()
+            .remove(&Core::Nes)
+            .unwrap()
+    }
+
+    #[test]
+    fn articles_separators_and_ampersands_match_across_spellings() {
+        let idx = nes_index(&[
+            game(
+                NES,
+                "The Legend of Zelda: Link's Awakening",
+                "<Overview>link</Overview>",
+            ),
+            game(NES, "The Battle of Olympus", "<Overview>olympus</Overview>"),
+            game(
+                NES,
+                "The Flintstones: The Rescue of Dino &amp; Hoppy",
+                "<Overview>dino</Overview>",
+            ),
+            game(
+                NES,
+                "Town and Country Surf Designs",
+                "<Overview>surf</Overview>",
+            ),
+            game(
+                NES,
+                "Captain Tsubasa II: Super Striker",
+                "<Overview>cts</Overview>",
+            ),
+        ]);
+        let f = |file| over(&idx, None, file);
+        assert_eq!(
+            f("Legend of Zelda, The - Link's Awakening (USA).nes"),
+            Some("link")
+        );
+        assert_eq!(f("Battle of Olympus, The (USA).nes"), Some("olympus"));
+        assert_eq!(
+            f("Flintstones, The - The Rescue of Dino & Hoppy (USA).nes"),
+            Some("dino")
+        );
+        assert_eq!(f("Town & Country Surf Designs (USA).nes"), Some("surf"));
+        assert_eq!(
+            f("Captain Tsubasa Vol. II - Super Striker (Japan).nes"),
+            Some("cts")
+        );
+    }
+
+    #[test]
+    fn similar_games_stay_distinct() {
+        let idx = nes_index(&[
+            game(NES, "Rescue Rangers", "<Overview>one</Overview>"),
+            game(NES, "Rescue Rangers 2", "<Overview>two</Overview>"),
+            game(NES, "The Legend of Zelda", "<Overview>z1</Overview>"),
+            game(
+                NES,
+                "Zelda II: The Adventure of Link",
+                "<Overview>z2</Overview>",
+            ),
+            game(NES, "Super Contra", "<Overview>sc</Overview>"),
+        ]);
+        assert_eq!(over(&idx, None, "Rescue Rangers 2 (USA).nes"), Some("two"));
+        assert_eq!(over(&idx, None, "Rescue Rangers (USA).nes"), Some("one"));
+        assert_eq!(
+            over(&idx, None, "Legend of Zelda, The (USA).nes"),
+            Some("z1")
+        );
+        assert_eq!(
+            over(&idx, None, "Zelda II - The Adventure of Link (USA).nes"),
+            Some("z2")
+        );
+        // A different game that merely shares a word is not a match.
+        assert_eq!(over(&idx, None, "Contra (USA).nes"), None);
+        assert_eq!(over(&idx, None, "Rescue Heroes (USA).nes"), None);
+    }
+
+    #[test]
+    fn possessive_prefixes_match_in_both_directions() {
+        let idx = nes_index(&[
+            with_id(
+                NES,
+                "Disney's Chip 'n Dale Rescue Rangers",
+                1,
+                "<Overview>chip</Overview>",
+            ),
+            with_id(
+                NES,
+                "A Boy and His Blob: Trouble on Blobolonia",
+                2,
+                "<Overview>blob</Overview>",
+            ),
+        ]);
+        assert_eq!(
+            over(&idx, None, "Chip 'n Dale - Rescue Rangers (USA).nes"),
+            Some("chip")
+        );
+        assert_eq!(
+            over(
+                &idx,
+                None,
+                "David Crane's A Boy and His Blob - Trouble on Blobolonia (USA).nes"
+            ),
+            Some("blob")
+        );
+        // The exact name still wins over the loose one.
+        let idx = nes_index(&[
+            with_id(
+                NES,
+                "Disney's Chip 'n Dale Rescue Rangers",
+                1,
+                "<Overview>disney</Overview>",
+            ),
+            with_id(
+                NES,
+                "Chip 'n Dale Rescue Rangers",
+                2,
+                "<Overview>plain</Overview>",
+            ),
+        ]);
+        assert_eq!(
+            over(&idx, None, "Chip 'n Dale - Rescue Rangers (USA).nes"),
+            Some("plain")
+        );
+    }
+
+    #[test]
+    fn alternate_names_lead_to_their_game_in_either_file_order() {
+        let mother = with_id(NES, "Mother", 7, "<Overview>mother</Overview>");
+        let other = with_id(NES, "Mother 2", 8, "<Overview>mother2</Overview>");
+        for items in [
+            vec![
+                mother.clone(),
+                other.clone(),
+                alt(7, "EarthBound Beginnings"),
+            ],
+            vec![
+                alt(7, "EarthBound Beginnings"),
+                mother.clone(),
+                other.clone(),
+            ],
+        ] {
+            let idx = nes_index(&items);
+            assert_eq!(
+                over(&idx, None, "EarthBound Beginnings (USA, Europe).nes"),
+                Some("mother")
+            );
+            // The game's own name keeps working.
+            assert_eq!(over(&idx, None, "Mother (Japan).nes"), Some("mother"));
+        }
+    }
+
+    #[test]
+    fn ambiguous_unknown_and_shadowing_aliases_are_dropped() {
+        let idx = nes_index(&[
+            with_id(NES, "Alpha", 1, "<Overview>alpha</Overview>"),
+            with_id(NES, "Beta", 2, "<Overview>beta</Overview>"),
+            with_id("Nintendo 64", "Gamma", 3, "<Overview>gamma</Overview>"),
+            // Two games claim the same alternate name.
+            alt(1, "Shared Title"),
+            alt(2, "Shared Title"),
+            // An alias equal to another game's own name.
+            alt(1, "Beta"),
+            // Alternate name of a game outside the wanted cores / unknown id.
+            alt(3, "Gamma Prime"),
+            alt(99, "Ghost"),
+        ]);
+        assert_eq!(over(&idx, None, "Shared Title.nes"), None);
+        assert_eq!(over(&idx, None, "Beta.nes"), Some("beta"));
+        assert_eq!(over(&idx, None, "Gamma Prime.nes"), None);
+        assert_eq!(over(&idx, None, "Ghost.nes"), None);
+        assert!(
+            !idx.alias
+                .contains_key("beta")
+        );
+    }
+
+    #[test]
+    fn aliases_survive_the_build_round_trip() {
+        let dir = tempfile::tempdir().unwrap();
+        let zip = dir
+            .path()
+            .join("m.zip");
+        let xml = doc(&[
+            with_id(NES, "Mother", 7, "<Overview>mother</Overview>"),
+            alt(7, "EarthBound Beginnings"),
+        ]);
+        write_zip(&zip, XML_ENTRY, xml.as_bytes());
+        let out = dir
+            .path()
+            .join("out");
+        build(&zip, &out, &wanted(&[Core::Nes]), Limits::default()).unwrap();
+        let idx: LbIndex =
+            serde_json::from_slice(&std::fs::read(out.join("nes.json")).unwrap())
+                .unwrap();
+        assert_eq!(
+            over(&idx, None, "EarthBound Beginnings (USA).nes"),
+            Some("mother")
+        );
+    }
+
+    #[tokio::test]
+    async fn a_stamp_from_an_older_index_format_is_not_used() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(
+            dir.path()
+                .join("gen-g"),
+        )
+        .unwrap();
+        let stamp = |version| Stamp {
+            version,
+            generation: "g".into(),
+            cores: vec!["nes".into()],
+            source: "x".into(),
+            etag: None,
+            last_modified: None,
+            checked_at: 0,
+        };
+        write_stamp(dir.path(), &stamp(STAMP_VERSION - 1))
+            .await
+            .unwrap();
+        assert!(
+            read_stamp(dir.path())
+                .await
+                .is_none()
+        );
+        write_stamp(dir.path(), &stamp(STAMP_VERSION))
+            .await
+            .unwrap();
+        assert!(
+            read_stamp(dir.path())
+                .await
+                .is_some()
+        );
     }
 }

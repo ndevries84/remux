@@ -5,6 +5,7 @@
 pub mod archive;
 pub mod launchbox;
 pub mod meta;
+pub mod names;
 pub mod rdb;
 pub mod resolver;
 pub mod scanner;

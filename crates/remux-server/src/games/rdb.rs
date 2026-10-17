@@ -22,7 +22,7 @@
 
 use std::{collections::HashMap, path::Path};
 
-use unicode_normalization::{UnicodeNormalization, char::is_combining_mark};
+use super::names;
 
 /// Largest `.rdb` accepted (download and parse).
 pub const MAX_RDB_BYTES: usize = 64 * 1024 * 1024;
@@ -442,15 +442,11 @@ pub fn parse(bytes: &[u8]) -> Result<Vec<RdbRecord>, RdbError> {
 // Index
 // ---------------------------------------------------------------------------
 
-/// Name key used for matching: Unicode-decomposed, accents dropped, letters
-/// and digits only, lowercase. Text inside parentheses is kept, so region
-/// variants stay distinct.
+/// Name key used for matching (see [`super::names`]): case, accents,
+/// punctuation, separators and articles do not matter. Text inside
+/// parentheses is kept, so region variants stay distinct.
 pub fn normalize_name(name: &str) -> String {
-    name.nfd()
-        .filter(|c| !is_combining_mark(*c))
-        .filter(|c| c.is_alphanumeric())
-        .flat_map(char::to_lowercase)
-        .collect()
+    names::key(name, names::Tags::Keep)
 }
 
 /// A `rom_name` without its file extension.
