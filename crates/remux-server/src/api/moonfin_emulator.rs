@@ -423,13 +423,13 @@ mod tests {
         let resp = s
             .get("/Moonfin/EmulatorJS/player.html?core=nes&rom=x")
             .await;
-        assert!(
-            !hdr(&resp, "content-security-policy")
-                .unwrap()
-                .contains("cdn.emulatorjs.org")
-        );
+        let csp = hdr(&resp, "content-security-policy").unwrap();
+        assert!(!csp.contains("cdn.emulatorjs.org"));
+        assert!(csp.contains("connect-src 'self'"));
         let body = resp.text();
         assert!(body.contains("window.EJS_pathtodata = './data/'"));
+        // The update check is stubbed (it would fetch the CDN, blocked by connect-src).
+        assert!(body.contains("prototype.checkForUpdates"));
         let r = s
             .get("/Moonfin/EmulatorJS/data/loader.js")
             .await;
