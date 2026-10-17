@@ -11,18 +11,17 @@
 //! * Resolve layers `[device, global, admin defaults]`, first non-null value
 //!   per key wins. A user with nothing stored gets `200 {}` (not 404), or
 //!   the admin defaults, so the client's first-sign-in sync can initialise.
+//! * Admin defaults live in the database (`moonfin_default_settings`) and are
+//!   edited through the admin API in `moonfin_admin`. A handful of keys that
+//!   Remux itself owns can never be defaults ([`ADMIN_BLOCKED_KEYS`]).
 //! * `/moonfin/settings/stream` is a per-user SSE feed that emits
-//!   `settingsUpdated` only when a save actually changed stored settings.
+//!   `settingsUpdated` when a save changed that user's stored settings, and
+//!   to every connected user when the admin defaults change.
 //!
 //! Routes are registered under lowercase paths; `rewrite_request_uri`
 //! lowercases the Moonfin client's mixed-case URLs.
 
-use std::{
-    collections::HashMap,
-    convert::Infallible,
-    sync::{Arc, OnceLock},
-    time::Duration,
-};
+use std::{collections::HashMap, convert::Infallible, sync::Arc, time::Duration};
 
 use axum::{
     Json,
@@ -40,7 +39,7 @@ use tokio::sync::broadcast;
 use tracing::{error, warn};
 use uuid::Uuid;
 
-use crate::{AppState, Config, db::auth::AuthSession};
+use crate::{AppContext, AppState, db::auth::AuthSession};
 
 /// Largest accepted profile-save body (real profiles are ~10-30 KB).
 const MAX_SAVE_BYTES: usize = 1024 * 1024;
@@ -49,7 +48,20 @@ const HEARTBEAT: Duration = Duration::from_secs(30);
 
 const VALID_PROFILES: [&str; 4] = ["global", "desktop", "mobile", "tv"];
 
-type Profile = Map<String, Value>;
+/// Keys the admin defaults may not carry, because Remux already owns the
+/// setting: they duplicate the Jellyfin user configuration (audio/subtitle
+/// language and mode, autoplay) that Remux uses to pick default streams.
+/// Users can still sync them per profile; only the shared defaults layer
+/// refuses them.
+pub(crate) const ADMIN_BLOCKED_KEYS: [&str; 5] = [
+    "defaultAudioLanguage",
+    "preferDefaultAudioTrack",
+    "autoplayNextEpisode",
+    "defaultSubtitleLanguage",
+    "subtitleMode",
+];
+
+pub(crate) type Profile = Map<String, Value>;
 
 // ---------------------------------------------------------------------------
 // Shared state
@@ -61,48 +73,33 @@ pub struct SettingsHub {
     inner: Arc<HubInner>,
 }
 
+/// An event pushed down every open settings stream.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum StreamEvent {
+    /// Stored or default settings changed; the client re-resolves them.
+    SettingsUpdated,
+}
+
+impl StreamEvent {
+    /// The SSE frame for this event.
+    fn frame(self) -> Bytes {
+        match self {
+            Self::SettingsUpdated => {
+                Bytes::from_static(b"data: {\"type\":\"settingsUpdated\"}\n\n")
+            }
+        }
+    }
+}
+
 #[derive(Default)]
 struct HubInner {
     /// One broadcast channel per user with at least one open stream.
-    streams: DashMap<Uuid, broadcast::Sender<()>>,
+    streams: DashMap<Uuid, broadcast::Sender<StreamEvent>>,
     /// Serializes read-modify-write saves (low volume, so one lock is fine).
     write_lock: tokio::sync::Mutex<()>,
-    /// Admin defaults file, read once on first use.
-    defaults: OnceLock<Option<Profile>>,
 }
 
 impl SettingsHub {
-    /// Admin default settings (the lowest resolve layer). A missing or
-    /// invalid file means no defaults; the problem is logged once.
-    fn defaults(&self, config: &Config) -> Option<&Profile> {
-        self.inner
-            .defaults
-            .get_or_init(|| {
-                let path = config
-                    .moonfin_default_settings_path
-                    .as_deref()?;
-                let loaded = std::fs::read_to_string(path)
-                    .map_err(|e| e.to_string())
-                    .and_then(|s| match serde_json::from_str::<Value>(&s) {
-                        Ok(Value::Object(map)) => Ok(map),
-                        Ok(_) => Err("expected a JSON object".to_string()),
-                        Err(e) => Err(e.to_string()),
-                    });
-                match loaded {
-                    Ok(map) => Some(map),
-                    Err(e) => {
-                        warn!(
-                            path,
-                            err = %e,
-                            "ignoring Moonfin default settings file"
-                        );
-                        None
-                    }
-                }
-            })
-            .as_ref()
-    }
-
     /// Opens a settings stream for `user`.
     fn subscribe(&self, user: Uuid) -> StreamGuard {
         let rx = self
@@ -118,15 +115,35 @@ impl SettingsHub {
         }
     }
 
-    fn notify(&self, user: Uuid) {
+    /// Sends `event` to `user`'s open streams, if any.
+    pub(crate) fn notify(&self, user: Uuid, event: StreamEvent) {
         if let Some(tx) = self
             .inner
             .streams
             .get(&user)
         {
             // No receivers is fine: nobody is listening.
-            let _ = tx.send(());
+            let _ = tx.send(event);
         }
+    }
+
+    /// Sends `event` to every user with an open stream.
+    pub(crate) fn notify_all(&self, event: StreamEvent) {
+        for tx in self
+            .inner
+            .streams
+            .iter()
+        {
+            let _ = tx.send(event);
+        }
+    }
+
+    /// Serializes writers of Moonfin settings (user profiles and defaults).
+    pub(crate) async fn write_lock(&self) -> tokio::sync::MutexGuard<'_, ()> {
+        self.inner
+            .write_lock
+            .lock()
+            .await
     }
 }
 
@@ -135,7 +152,7 @@ impl SettingsHub {
 struct StreamGuard {
     hub: SettingsHub,
     user: Uuid,
-    rx: Option<broadcast::Receiver<()>>,
+    rx: Option<broadcast::Receiver<StreamEvent>>,
 }
 
 impl Drop for StreamGuard {
@@ -334,6 +351,154 @@ async fn load_profiles(
 }
 
 // ---------------------------------------------------------------------------
+// Admin defaults
+// ---------------------------------------------------------------------------
+
+/// The admin default settings as stored.
+pub(crate) struct StoredDefaults {
+    pub settings: Profile,
+    /// Epoch milliseconds.
+    pub updated_at: i64,
+}
+
+/// The [`ADMIN_BLOCKED_KEYS`] present in `settings`, in blocklist order.
+pub(crate) fn blocked_keys_in(settings: &Profile) -> Vec<&'static str> {
+    ADMIN_BLOCKED_KEYS
+        .into_iter()
+        .filter(|k| settings.contains_key(*k))
+        .collect()
+}
+
+/// Admin defaults from the database, or `None` when none were ever saved.
+/// Blocked keys that older data may still carry are dropped on the way out,
+/// so they can never reach a resolved profile.
+pub(crate) async fn load_defaults(
+    db: &SqlitePool,
+) -> Result<Option<StoredDefaults>, sqlx::Error> {
+    let row: Option<(String, i64)> = sqlx::query_as(
+        "SELECT data, updated_at FROM moonfin_default_settings WHERE id = 1",
+    )
+    .fetch_optional(db)
+    .await?;
+    Ok(row.map(|(data, updated_at)| {
+        let mut settings = parse_stored(&data);
+        for key in ADMIN_BLOCKED_KEYS {
+            settings.remove(key);
+        }
+        StoredDefaults {
+            settings,
+            updated_at,
+        }
+    }))
+}
+
+/// Replaces the admin defaults. The caller has already rejected blocked
+/// keys. Connected users are told to re-resolve when the stored value
+/// actually changed.
+pub(crate) async fn save_defaults(
+    ctx: &AppContext,
+    settings: Profile,
+    updated_by: Uuid,
+) -> Result<StoredDefaults, sqlx::Error> {
+    let _write = ctx
+        .moonfin_settings
+        .write_lock()
+        .await;
+    let before = load_defaults(&ctx.db).await?;
+    if let Some(existing) = before
+        && existing.settings == settings
+    {
+        return Ok(existing);
+    }
+    let updated_at = now_ms();
+    sqlx::query(
+        "INSERT INTO moonfin_default_settings (id, data, updated_at, updated_by) \
+         VALUES (1, ?1, ?2, ?3) \
+         ON CONFLICT(id) DO UPDATE SET data = excluded.data, \
+         updated_at = excluded.updated_at, updated_by = excluded.updated_by",
+    )
+    .bind(Value::Object(settings.clone()).to_string())
+    .bind(updated_at)
+    .bind(updated_by)
+    .execute(&ctx.db)
+    .await?;
+    ctx.moonfin_settings
+        .notify_all(StreamEvent::SettingsUpdated);
+    Ok(StoredDefaults {
+        settings,
+        updated_at,
+    })
+}
+
+/// One-time seed from `Config.moonfin_default_settings_path`: when the file
+/// is configured and the database holds no defaults yet, its contents become
+/// the stored defaults (minus blocked keys). Afterwards the database wins and
+/// the file is never read again. Problems are logged, never fatal.
+pub(crate) async fn import_defaults_file(ctx: &AppContext) {
+    let Some(path) = ctx
+        .config
+        .moonfin_default_settings_path
+        .as_deref()
+    else {
+        return;
+    };
+    let _write = ctx
+        .moonfin_settings
+        .write_lock()
+        .await;
+    match sqlx::query_scalar::<_, bool>(
+        "SELECT EXISTS(SELECT 1 FROM moonfin_default_settings)",
+    )
+    .fetch_one(&ctx.db)
+    .await
+    {
+        Ok(false) => {}
+        Ok(true) => return,
+        Err(e) => {
+            error!(%e, "could not check stored Moonfin default settings");
+            return;
+        }
+    }
+    let loaded = tokio::fs::read_to_string(path)
+        .await
+        .map_err(|e| e.to_string())
+        .and_then(|s| match serde_json::from_str::<Value>(&s) {
+            Ok(Value::Object(map)) => Ok(map),
+            Ok(_) => Err("expected a JSON object".to_string()),
+            Err(e) => Err(e.to_string()),
+        });
+    let mut settings = match loaded {
+        Ok(map) => map,
+        Err(e) => {
+            warn!(path, err = %e, "ignoring Moonfin default settings file");
+            return;
+        }
+    };
+    let dropped = blocked_keys_in(&settings);
+    for key in &dropped {
+        settings.remove(*key);
+    }
+    let count = settings.len();
+    let stored = sqlx::query(
+        "INSERT INTO moonfin_default_settings (id, data, updated_at, updated_by) \
+         VALUES (1, ?1, ?2, NULL)",
+    )
+    .bind(Value::Object(settings).to_string())
+    .bind(now_ms())
+    .execute(&ctx.db)
+    .await;
+    match stored {
+        Ok(_) => tracing::info!(
+            path,
+            keys = count,
+            ignored = ?dropped,
+            "imported Moonfin default settings file into the database"
+        ),
+        Err(e) => error!(%e, "could not store imported Moonfin default settings"),
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Ping
 // ---------------------------------------------------------------------------
 
@@ -419,7 +584,14 @@ pub(crate) async fn resolved_profile(
         user,
     )
     .await?;
-    let empty = Profile::new();
+    let defaults = load_defaults(
+        &state
+            .ctx
+            .db,
+    )
+    .await?
+    .map(|d| d.settings)
+    .unwrap_or_default();
     let mut layers: Vec<&Profile> = Vec::with_capacity(3);
     if profile != "global"
         && let Some((device, ..)) = stored.get(profile)
@@ -429,17 +601,7 @@ pub(crate) async fn resolved_profile(
     if let Some((global, ..)) = stored.get("global") {
         layers.push(global);
     }
-    layers.push(
-        state
-            .ctx
-            .moonfin_settings
-            .defaults(
-                &state
-                    .ctx
-                    .config,
-            )
-            .unwrap_or(&empty),
-    );
+    layers.push(&defaults);
     Ok(resolve(&layers))
 }
 
@@ -554,9 +716,7 @@ pub async fn moonfin_settings_save(
         .ctx
         .moonfin_settings;
     let _write = hub
-        .inner
-        .write_lock
-        .lock()
+        .write_lock()
         .await;
     let db = &state
         .ctx
@@ -610,7 +770,7 @@ pub async fn moonfin_settings_save(
         Err(e) => return internal_error(e),
     };
     if changed {
-        hub.notify(user);
+        hub.notify(user, StreamEvent::SettingsUpdated);
     }
     Json(json!({
         "Success": true,
@@ -632,9 +792,7 @@ pub async fn moonfin_settings_delete_all(
     let _write = state
         .ctx
         .moonfin_settings
-        .inner
-        .write_lock
-        .lock()
+        .write_lock()
         .await;
     match sqlx::query("DELETE FROM moonfin_settings WHERE user_id = ?1")
         .bind(
@@ -677,9 +835,7 @@ pub async fn moonfin_settings_delete_profile(
     let _write = state
         .ctx
         .moonfin_settings
-        .inner
-        .write_lock
-        .lock()
+        .write_lock()
         .await;
     match sqlx::query(
         "DELETE FROM moonfin_settings WHERE user_id = ?1 AND profile = ?2",
@@ -732,11 +888,10 @@ pub async fn moonfin_settings_stream(
             let Some(rx) = guard.rx.as_mut() else { break };
             tokio::select! {
                 msg = rx.recv() => match msg {
+                    Ok(event) => yield Ok(event.frame()),
                     // A lagged receiver missed events; one refresh covers them.
-                    Ok(()) | Err(broadcast::error::RecvError::Lagged(_)) => {
-                        yield Ok(Bytes::from_static(
-                            b"data: {\"type\":\"settingsUpdated\"}\n\n",
-                        ));
+                    Err(broadcast::error::RecvError::Lagged(_)) => {
+                        yield Ok(StreamEvent::SettingsUpdated.frame());
                     }
                     Err(broadcast::error::RecvError::Closed) => break,
                 },
@@ -1822,6 +1977,235 @@ mod tests {
                 "{contents}"
             );
         }
+    }
+
+    // ------------------------------------------------------------------
+    // Admin defaults in the database
+    // ------------------------------------------------------------------
+
+    use crate::api::moonfin_test_support::Harness as Shared;
+
+    fn profile(v: Value) -> super::Profile {
+        v.as_object()
+            .unwrap()
+            .clone()
+    }
+
+    async fn admin_id(h: &Shared) -> uuid::Uuid {
+        sqlx::query_scalar("SELECT id FROM users LIMIT 1")
+            .fetch_one(
+                &h.ctx
+                    .db,
+            )
+            .await
+            .unwrap()
+    }
+
+    async fn resolved_for(h: &Shared, profile: &str) -> Value {
+        let resp = h
+            .get(
+                &h.token,
+                &format!("/Moonfin/Settings/Resolved/{profile}?client=moonfin"),
+            )
+            .await;
+        resp.assert_status_ok();
+        resp.json::<Value>()
+    }
+
+    #[tokio::test]
+    async fn defaults_file_is_imported_once_and_the_database_then_wins() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir
+            .path()
+            .join("defaults.json");
+        std::fs::write(
+            &file,
+            r#"{"posterSize":"small","subtitleMode":"always","defaultAudioLanguage":"eng"}"#,
+        )
+        .unwrap();
+        let path = file
+            .to_string_lossy()
+            .into_owned();
+        let h =
+            Shared::new_with(|c| c.moonfin_default_settings_path = Some(path)).await;
+
+        // Imported at startup, minus the keys Remux owns.
+        assert_eq!(
+            resolved_for(&h, "desktop").await,
+            json!({ "posterSize": "small" })
+        );
+        let stored = super::load_defaults(
+            &h.ctx
+                .db,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(stored.settings, profile(json!({ "posterSize": "small" })));
+
+        // Once the database holds defaults the file is never read again.
+        super::save_defaults(&h.ctx, profile(json!({ "x": 1 })), admin_id(&h).await)
+            .await
+            .unwrap();
+        std::fs::write(&file, r#"{"posterSize":"large"}"#).unwrap();
+        super::import_defaults_file(&h.ctx).await;
+        assert_eq!(resolved_for(&h, "desktop").await, json!({ "x": 1 }));
+
+        // An admin who saved an empty object keeps it empty too.
+        super::save_defaults(&h.ctx, profile(json!({})), admin_id(&h).await)
+            .await
+            .unwrap();
+        super::import_defaults_file(&h.ctx).await;
+        assert_eq!(resolved_for(&h, "desktop").await, json!({}));
+    }
+
+    #[tokio::test]
+    async fn invalid_defaults_file_is_not_imported() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir
+            .path()
+            .join("defaults.json");
+        std::fs::write(&file, "[1,2,3]").unwrap();
+        let path = file
+            .to_string_lossy()
+            .into_owned();
+        let h =
+            Shared::new_with(|c| c.moonfin_default_settings_path = Some(path)).await;
+        assert!(
+            super::load_defaults(
+                &h.ctx
+                    .db
+            )
+            .await
+            .unwrap()
+            .is_none()
+        );
+        assert_eq!(resolved_for(&h, "desktop").await, json!({}));
+    }
+
+    #[tokio::test]
+    async fn blocked_keys_in_legacy_defaults_are_ignored_but_user_sync_is_not() {
+        let h = Shared::new().await;
+        // Data written before the blocklist existed.
+        sqlx::query(
+            "INSERT INTO moonfin_default_settings (id, data, updated_at) \
+             VALUES (1, ?1, 0)",
+        )
+        .bind(
+            json!({
+                "posterSize": "small",
+                "defaultAudioLanguage": "eng",
+                "preferDefaultAudioTrack": true,
+                "autoplayNextEpisode": false,
+                "defaultSubtitleLanguage": "eng",
+                "subtitleMode": "always",
+            })
+            .to_string(),
+        )
+        .execute(
+            &h.ctx
+                .db,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            resolved_for(&h, "global").await,
+            json!({ "posterSize": "small" })
+        );
+
+        // The user's own copies of those keys still sync as before.
+        h.post(
+            &h.token,
+            "/Moonfin/Settings/Profile/global",
+            &json!({ "profile": { "subtitleMode": "none" }, "clientId": "t" }),
+        )
+        .await;
+        assert_eq!(
+            resolved_for(&h, "global").await,
+            json!({ "posterSize": "small", "subtitleMode": "none" })
+        );
+    }
+
+    #[tokio::test]
+    async fn changing_defaults_notifies_every_stream_but_only_when_changed() {
+        let h = Shared::new().await;
+        let hub = &h
+            .ctx
+            .moonfin_settings;
+        let (a, b) = (uuid::Uuid::new_v4(), uuid::Uuid::new_v4());
+        let mut stream_a = hub.subscribe(a);
+        let mut stream_b = hub.subscribe(b);
+        let admin = admin_id(&h).await;
+
+        super::save_defaults(&h.ctx, profile(json!({ "x": 1 })), admin)
+            .await
+            .unwrap();
+        for stream in [&mut stream_a, &mut stream_b] {
+            let event = stream
+                .rx
+                .as_mut()
+                .unwrap()
+                .try_recv()
+                .unwrap();
+            assert_eq!(event, super::StreamEvent::SettingsUpdated);
+        }
+
+        super::save_defaults(&h.ctx, profile(json!({ "x": 1 })), admin)
+            .await
+            .unwrap();
+        assert!(
+            stream_a
+                .rx
+                .as_mut()
+                .unwrap()
+                .try_recv()
+                .is_err()
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // Keys added by newer clients round-trip untouched
+    // ------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn newer_client_keys_round_trip_through_save_and_resolve() {
+        let h = harness().await;
+        let settings = json!({
+            "bottomNavbarStyle": "split",
+            "bottomNavbarTabs": ["search", "libraries", "favorites"],
+            "showFriendsButton": true,
+            "seasonalSurprise": "snow",
+            "seasonalDensity": "heavy",
+            "seasonalRowEnabled": true,
+            "seasonalRowCountry": "NL",
+            "seasonalRowHiddenHolidays": ["newYear", "easter"],
+            "hiddenDetailSectionsTv": ["cast"],
+            "hiddenDetailSectionsMobile": [],
+            "hiddenDetailSectionsDesktop": ["similar", "extras"],
+            "libraryStyle": "docked",
+            "homeRowImageTypes": "genres:thumb,nextup:poster",
+            "preferTextSubtitles": true,
+            "preferExternalSubtitles": false,
+        });
+        h.push(&h.token, "global", settings.clone())
+            .await
+            .assert_status_ok();
+        for profile in ["global", "desktop", "tv", "mobile"] {
+            assert_eq!(
+                h.resolved(&h.token, profile)
+                    .await,
+                settings,
+                "{profile}"
+            );
+        }
+        // A device profile replaces arrays whole, including with `[]`.
+        h.push(&h.token, "tv", json!({ "bottomNavbarTabs": [] }))
+            .await;
+        assert_eq!(
+            h.resolved(&h.token, "tv")
+                .await["bottomNavbarTabs"],
+            json!([])
+        );
     }
 
     // ------------------------------------------------------------------

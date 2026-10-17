@@ -444,6 +444,8 @@ pub async fn init_app(
             ctx.clone(),
         ));
 
+    api::moonfin_settings::import_defaults_file(&ctx).await;
+
     // Sync intro items at startup (best-effort; errors are logged not fatal).
     if let Err(e) = intro::sync_intros(&ctx).await {
         warn!(err = ?e, "intro sync failed at startup");
@@ -806,9 +808,11 @@ pub struct Config {
     /// Most bytes extracted from a cores archive (zip-bomb guard).
     #[serde(default = "default_games_cores_max_extract_bytes")]
     pub games_cores_max_extract_bytes: u64,
-    /// Optional JSON file holding admin default Moonfin settings (a flat
-    /// profile object). It is the lowest-precedence layer when resolving a
-    /// user's settings. A missing or invalid file means no defaults.
+    /// Optional JSON file with admin default Moonfin settings (a flat profile
+    /// object). Only a one-time seed: at startup, if the database holds no
+    /// defaults yet, the file is imported into it; after that the database
+    /// (edited through `/Moonfin/Admin/Defaults`) is the only source and the
+    /// file is ignored. A missing or invalid file is skipped with a warning.
     #[serde(default)]
     pub moonfin_default_settings_path: Option<String>,
     /// Directory holding the extracted Moonfin web bundle served at
