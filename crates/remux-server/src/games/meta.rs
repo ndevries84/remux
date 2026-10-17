@@ -1196,15 +1196,21 @@ mod tests {
     #[tokio::test]
     async fn without_a_warm_up_the_first_request_is_bare() {
         // The behaviour the warm-up exists to fix: nothing is loaded yet, so
-        // a request with no budget gets nothing at all.
+        // a request with no budget gets nothing at all. The deadline is
+        // already well past: tokio timers tick in whole milliseconds, so a
+        // deadline of "now" can still be pending for up to a tick, and on a
+        // loaded machine the local CRC and index loads finish inside it.
         let fx = warm_fixture();
         let svc = MetaService::default();
+        let spent = tokio::time::Instant::now()
+            .checked_sub(Duration::from_secs(60))
+            .expect("a minute before now is representable");
         let meta = svc
             .get_until(
                 &fx.config,
                 &fx.snap
                     .games[0],
-                tokio::time::Instant::now(),
+                spent,
             )
             .await;
         assert!(meta.is_empty());
