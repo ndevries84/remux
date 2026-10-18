@@ -2619,8 +2619,6 @@ async fn item_for_user(
     Ok(Some(base_item))
 }
 
-/// Jellyfin web requests `/Items/livetv` (literal string) when navigating to
-/// the Live TV section — handle it before the `{id}` UUID route.
 /// The synthetic Games view item when `id` is its id and the games feature is
 /// active; `None` otherwise (so a disabled feature leaves the id a plain 404).
 pub fn games_view_for(state: &AppState, id: Uuid) -> Option<api::BaseItemDto> {
@@ -2631,6 +2629,8 @@ pub fn games_view_for(state: &AppState, id: Uuid) -> Option<api::BaseItemDto> {
         .then(|| crate::games::games_view_item(&cfg.games_library_name))
 }
 
+/// Jellyfin web requests `/Items/livetv` (literal string) when navigating to
+/// the Live TV section — handle it before the `{id}` UUID route.
 #[get("/items/livetv")]
 pub async fn items_livetv(_session: auth::AuthSession) -> Result<impl IntoResponse> {
     Ok(Json(super::shows::livetv_view_item()))
