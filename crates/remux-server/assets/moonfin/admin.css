@@ -152,3 +152,8 @@ td.mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size
 .hb-actions { display: inline-flex; gap: 4px; margin-left: auto; }
 .hb-actions button { min-width: 40px; min-height: 40px; padding: 2px 8px; }
 .home-builder select { max-width: 100%; }
+
+/* Server settings. */
+.ss-field { border-bottom: 1px solid var(--line); padding: 4px 0 8px; }
+.ss-field label:not(.choice) input { max-width: 480px; }
+.ss-key-result .tile { display: inline-block; margin: 2px 6px 2px 0; }

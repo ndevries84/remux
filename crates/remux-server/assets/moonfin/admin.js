@@ -207,7 +207,7 @@
   function defaults() { return window.MoonfinAdminDefaults; }
 
   function loadAll() {
-    loadStatus(); defaults().load(); loadUsers(); loadThemes();
+    loadStatus(); window.MoonfinAdminServerSettings.load(); defaults().load(); loadUsers(); loadThemes();
   }
 
   // ---- status ----------------------------------------------------------
@@ -524,6 +524,11 @@
       $: $, el: el, clear: clear, api: api, confirmDialog: confirmDialog,
       handleError: handleError, fmtTime: fmtTime, preview: preview, setErrors: setErrors,
       loadStatus: loadStatus, loadUsers: loadUsers
+    });
+
+    window.MoonfinAdminServerSettings.init({
+      $: $, el: el, clear: clear, api: api, confirmDialog: confirmDialog,
+      handleError: handleError, loadStatus: loadStatus
     });
 
     $('theme-file').addEventListener('change', function (e) { readFile(e.target, $('theme-text')); });

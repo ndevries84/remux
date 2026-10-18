@@ -8,6 +8,7 @@
 <link rel="stylesheet" href="/moonfin/admin/admin.css">
 <script src="/moonfin/admin/admin-home-rows.js" defer></script>
 <script src="/moonfin/admin/admin-defaults.js" defer></script>
+<script src="/moonfin/admin/admin-server-settings.js" defer></script>
 <script src="/moonfin/admin/admin.js" defer></script>
 </head>
 <body>
@@ -43,7 +44,43 @@
         <button id="cores-install" type="button">Install cores</button>
         <label class="file">Upload archive (.7z / .zip) <input id="cores-upload" type="file" accept=".7z,.zip"></label>
       </div>
-      <p class="muted">Server settings are not edited here. They come from the server configuration (config file or environment): GAMES_ENABLED, GAMES_ROOTS, GAMES_EMULATORJS_CDN_FALLBACK, GAMES_METADATA_ENABLED, GAMES_LAUNCHBOX_ENABLED, MDBLIST_API_KEY, MOONFIN_WEB_PATH, MOONFIN_DEFAULT_SETTINGS_PATH, MOONFIN_WEB_DEFAULT_SERVER_URL, MOONFIN_WEB_FORCED_SERVER_URL.</p>
+      <p class="muted">The web app URLs and the MDBList key are edited in Server settings below. Other settings come from the server configuration (config file or environment): GAMES_ENABLED, GAMES_ROOTS, GAMES_EMULATORJS_CDN_FALLBACK, GAMES_METADATA_ENABLED, GAMES_LAUNCHBOX_ENABLED, MOONFIN_WEB_PATH, MOONFIN_DEFAULT_SETTINGS_PATH.</p>
+    </section>
+
+    <section class="card" id="server-settings-section">
+      <div class="head"><h2>Server settings</h2><button id="ss-refresh" type="button">Refresh</button></div>
+      <p class="muted">Values saved here are stored in the database and win over the server configuration (config file or environment). Clearing a value falls back to the configuration.</p>
+      <p id="ss-message" class="muted" role="status" hidden></p>
+
+      <h3>Web app</h3>
+      <div class="ss-field" id="ss-default-url">
+        <label>Default server URL <input id="ss-default-url-input" type="url" inputmode="url" autocomplete="off" spellcheck="false" placeholder="Full address of the server"></label>
+        <p class="muted help">Sent to the web app in its config.json as <code>defaultServerUrl</code>, the server address it starts with.</p>
+        <div class="row"><span id="ss-default-url-source" class="badge"></span><button id="ss-default-url-save" type="button" class="primary">Save</button><button id="ss-default-url-clear" type="button">Clear</button></div>
+      </div>
+      <div class="ss-field" id="ss-forced-url">
+        <label>Forced server URL <input id="ss-forced-url-input" type="url" inputmode="url" autocomplete="off" spellcheck="false" placeholder="Full address of the server"></label>
+        <p class="muted help">Sent to the web app in its config.json as <code>forcedServerUrl</code>, the server it must use. A trailing /web or /web/index.html is removed.</p>
+        <div class="row"><span id="ss-forced-url-source" class="badge"></span><button id="ss-forced-url-save" type="button" class="primary">Save</button><button id="ss-forced-url-clear" type="button">Clear</button></div>
+      </div>
+      <div class="ss-field" id="ss-webrtc">
+        <label class="choice"><input id="ss-webrtc-input" type="checkbox"> <span>Let the web app scan the local network with WebRTC (<code>enableWebRtcScan</code>)</span></label>
+        <div class="row"><span id="ss-webrtc-source" class="badge"></span><button id="ss-webrtc-save" type="button" class="primary">Save</button><button id="ss-webrtc-clear" type="button">Clear</button></div>
+      </div>
+
+      <h3>MDBList</h3>
+      <p id="ss-key-state" class="muted"></p>
+      <label>API key <input id="ss-key-input" type="password" autocomplete="new-password" spellcheck="false" placeholder="Paste a key to set or test it"></label>
+      <p class="muted help">The key is never shown again after you save it. Clear removes the stored key; the key from the server configuration, if any, is used instead.</p>
+      <div class="row">
+        <button id="ss-key-save" type="button" class="primary" disabled>Save key</button>
+        <button id="ss-key-clear" type="button">Clear key</button>
+        <button id="ss-key-test" type="button">Test key</button>
+      </div>
+      <p class="muted help">Test key checks the key you typed. If the box is empty, it checks the key the server uses now.</p>
+      <div id="ss-key-result" hidden></div>
+      <div class="row"><button id="ss-cache-clear" type="button" class="danger">Clear ratings cache</button></div>
+      <p id="ss-cache-result" class="muted" role="status" hidden></p>
     </section>
 
     <section class="card" id="defaults-section">

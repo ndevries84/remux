@@ -19,6 +19,8 @@ use remux_macros::get;
 const PAGE_HTML: &str = include_str!("../../assets/moonfin/admin.html");
 const PAGE_JS: &str = include_str!("../../assets/moonfin/admin.js");
 const PAGE_DEFAULTS_JS: &str = include_str!("../../assets/moonfin/admin-defaults.js");
+const PAGE_SERVER_SETTINGS_JS: &str =
+    include_str!("../../assets/moonfin/admin-server-settings.js");
 const PAGE_HOME_ROWS_JS: &str = include_str!("../../assets/moonfin/admin-home-rows.js");
 const PAGE_CSS: &str = include_str!("../../assets/moonfin/admin.css");
 /// The option schema behind the default settings forms. Derived from Moonbase
@@ -75,6 +77,15 @@ pub async fn moonfin_admin_defaults_script() -> Response {
 #[get("/moonfin/admin/admin-home-rows.js")]
 pub async fn moonfin_admin_home_rows_script() -> Response {
     with_headers("text/javascript; charset=utf-8", PAGE_HOME_ROWS_JS, false)
+}
+
+#[get("/moonfin/admin/admin-server-settings.js")]
+pub async fn moonfin_admin_server_settings_script() -> Response {
+    with_headers(
+        "text/javascript; charset=utf-8",
+        PAGE_SERVER_SETTINGS_JS,
+        false,
+    )
 }
 
 #[get("/moonfin/admin/admin.css")]
@@ -174,6 +185,24 @@ mod tests {
             home_rows_js
                 .text()
                 .contains("MoonfinHomeRows")
+        );
+        let server_settings_js = h
+            .server
+            .get("/Moonfin/Admin/admin-server-settings.js")
+            .await;
+        server_settings_js.assert_status_ok();
+        assert_eq!(
+            hdr(&server_settings_js, "content-type"),
+            "text/javascript; charset=utf-8"
+        );
+        assert_eq!(
+            hdr(&server_settings_js, "x-content-type-options"),
+            "nosniff"
+        );
+        assert!(
+            server_settings_js
+                .text()
+                .contains("MoonfinAdminServerSettings")
         );
         let css = h
             .server
@@ -276,6 +305,7 @@ mod tests {
             ("js", super::PAGE_JS),
             ("defaults-js", super::PAGE_DEFAULTS_JS),
             ("home-rows-js", super::PAGE_HOME_ROWS_JS),
+            ("server-settings-js", super::PAGE_SERVER_SETTINGS_JS),
             ("css", super::PAGE_CSS),
         ] {
             assert!(!text.contains("http://"), "{name} references http://");
@@ -286,6 +316,7 @@ mod tests {
             super::PAGE_JS,
             super::PAGE_DEFAULTS_JS,
             super::PAGE_HOME_ROWS_JS,
+            super::PAGE_SERVER_SETTINGS_JS,
         ] {
             assert!(
                 !js.contains("innerHTML")
