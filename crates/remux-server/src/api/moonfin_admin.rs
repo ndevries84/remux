@@ -15,7 +15,7 @@ use axum::{
     Json,
     body::Body,
     extract::{Path, Query, State},
-    http::{Request, StatusCode},
+    http::{HeaderMap, Request, StatusCode},
     response::{IntoResponse, Response},
 };
 use remux_macros::{delete, get, put};
@@ -373,17 +373,18 @@ pub async fn moonfin_admin_user_settings_reset(
 pub async fn moonfin_admin_status(
     State(state): State<AppState>,
     session: AuthSession,
+    headers: HeaderMap,
 ) -> Response {
     if let Some(denied) = require_admin(&session) {
         return denied;
     }
-    match status(&state).await {
+    match status(&state, &headers).await {
         Ok(body) => Json(body).into_response(),
         Err(e) => internal_error(e),
     }
 }
 
-async fn status(state: &AppState) -> Result<Value, sqlx::Error> {
+async fn status(state: &AppState, headers: &HeaderMap) -> Result<Value, sqlx::Error> {
     let ctx = &state.ctx;
     let config = &ctx.config;
     let eff = super::moonfin_server_settings::effective(state).await;
@@ -416,10 +417,8 @@ async fn status(state: &AppState) -> Result<Value, sqlx::Error> {
             d.settings
                 .len()
         });
-    let web_app =
-        tokio::fs::metadata(super::moonfin_web::web_root(state).join("index.html"))
-            .await
-            .is_ok_and(|m| m.is_file());
+    let web = web_app_status(state, &eff, headers).await;
+    let web_app = web["present"] == true;
 
     Ok(json!({
         "ping": ping_body(eff.mdblist_key.is_some()),
@@ -442,9 +441,47 @@ async fn status(state: &AppState) -> Result<Value, sqlx::Error> {
         "mdblistConfigured": eff.mdblist_key.is_some(),
         "mdblistKeySource": eff.mdblist_key.as_ref().map(|(_, s)| s),
         "webAppPresent": web_app,
+        "webApp": web,
         "themesCount": themes,
         "defaultsKeyCount": defaults_keys,
     }))
+}
+
+/// The hosted web app: whether its bundle is in place, which version it is
+/// (Flutter's `version.json`), the effective `config.json` URLs and the URL
+/// apps should use, derived from the request origin.
+async fn web_app_status(
+    state: &AppState,
+    eff: &super::moonfin_server_settings::Effective,
+    headers: &HeaderMap,
+) -> Value {
+    let root = super::moonfin_web::web_root(state);
+    let present = tokio::fs::metadata(root.join("index.html"))
+        .await
+        .is_ok_and(|m| m.is_file());
+    let version: Option<Value> = match tokio::fs::read(root.join("version.json")).await
+    {
+        Ok(bytes) => serde_json::from_slice(&bytes).ok(),
+        Err(_) => None,
+    };
+    let field = |name: &str| {
+        version
+            .as_ref()
+            .and_then(|v| v.get(name))
+            .and_then(Value::as_str)
+            .map(str::to_string)
+    };
+    let origin = super::moonfin_web::request_origin(headers);
+    json!({
+        "present": present,
+        "bundlePath": root.to_string_lossy(),
+        "version": field("version"),
+        "buildNumber": field("build_number"),
+        "defaultServerUrl": eff.web_default_server_url.as_ref().map(|(u, _)| u),
+        "forcedServerUrl": eff.web_forced_server_url.as_ref().map(|(u, _)| u),
+        "enableWebRtcScan": eff.web_enable_webrtc_scan.0,
+        "appUrl": origin.map(|o| format!("{o}/Moonfin/Web")),
+    })
 }
 
 #[cfg(test)]
@@ -1012,6 +1049,12 @@ mod tests {
             "<html></html>",
         )
         .unwrap();
+        std::fs::write(
+            web.path()
+                .join("version.json"),
+            r#"{"app_name":"moonfin","version":"1.2.3","build_number":"45"}"#,
+        )
+        .unwrap();
         let roots = tempfile::tempdir().unwrap();
         let web_path = web
             .path()
@@ -1021,8 +1064,10 @@ mod tests {
             .path()
             .to_string_lossy()
             .into_owned();
+        let web_path_str = web_path.clone();
         let h = Harness::new_with(|c| {
             c.mdblist_api_key = Some(crate::Secret::new(KEY));
+            c.moonfin_web_forced_server_url = Some("https://forced.example".into());
             c.moonfin_web_path = Some(web_path);
             c.games_enabled = true;
             c.games_roots = vec![root, "  ".into()];
@@ -1034,7 +1079,11 @@ mod tests {
             .assert_status_ok();
 
         let resp = h
-            .get(&h.token, "/Moonfin/Admin/Status")
+            .server
+            .get("/Moonfin/Admin/Status")
+            .add_header(http::header::AUTHORIZATION, auth(&h.token))
+            .add_header(http::header::HOST, "remux.example:8096")
+            .add_header("x-forwarded-proto", "https")
             .await;
         resp.assert_status_ok();
         let text = resp.text();
@@ -1054,6 +1103,16 @@ mod tests {
         assert_eq!(body["metadata"]["launchbox"]["index"]["indexed"], false);
         assert!(body["metadata"]["libretro"].is_boolean());
         assert_eq!(body["webAppPresent"], true);
+        assert_eq!(body["webApp"]["present"], true);
+        assert_eq!(body["webApp"]["version"], "1.2.3");
+        assert_eq!(body["webApp"]["buildNumber"], "45");
+        assert_eq!(body["webApp"]["bundlePath"], web_path_str);
+        assert_eq!(
+            body["webApp"]["appUrl"],
+            "https://remux.example:8096/Moonfin/Web"
+        );
+        assert_eq!(body["webApp"]["forcedServerUrl"], "https://forced.example");
+        assert_eq!(body["webApp"]["enableWebRtcScan"], false);
         assert_eq!(body["themesCount"], 0);
         assert_eq!(body["defaultsKeyCount"], 2);
     }
@@ -1080,6 +1139,9 @@ mod tests {
         assert_eq!(body["games"]["active"], false);
         assert_eq!(body["games"]["rootsCount"], 0);
         assert_eq!(body["webAppPresent"], false);
+        assert_eq!(body["webApp"]["present"], false);
+        assert_eq!(body["webApp"]["version"], Value::Null);
+        assert_eq!(body["webApp"]["forcedServerUrl"], Value::Null);
         assert_eq!(body["defaultsKeyCount"], 0);
     }
 }

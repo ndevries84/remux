@@ -311,7 +311,7 @@ fn normalize_forced_url(url: &str) -> String {
 /// Request origin from `Host`; the scheme comes from `X-Forwarded-Proto` when a
 /// reverse proxy sets it. Only used for the Add Server pre-fill, since the app
 /// auto-connects to its own origin in plugin mode.
-fn request_origin(headers: &HeaderMap) -> Option<String> {
+pub(crate) fn request_origin(headers: &HeaderMap) -> Option<String> {
     let host = headers
         .get(header::HOST)?
         .to_str()
