@@ -19,6 +19,7 @@
 //! `GET /tmdb/{movie|show}/{id}?apikey=...`; a `429` carries `Retry-After`).
 
 use std::{
+    hash::{Hash, Hasher},
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -38,17 +39,23 @@ use strum_macros::{Display, EnumString};
 use tracing::warn;
 
 use crate::{
-    AppState, Config, api::moonfin_settings::resolved_profile, db::auth::AuthSession,
+    AppState, Config,
+    api::moonfin_settings::resolved_profile,
+    db::{self, auth::AuthSession},
 };
 
 /// Rating sources returned when the user has not chosen any.
 const DEFAULT_SOURCES: [&str; 4] = ["imdb", "tmdb", "tomatoes", "metacritic"];
-/// How long a failed lookup (bad key, rate limit, outage) is remembered.
+/// How long a failed lookup (bad key, outage) is remembered.
 const NEGATIVE_TTL: Duration = Duration::from_secs(10 * 60);
 /// Longest `Retry-After` worth sleeping through for an in-request retry.
 const MAX_INLINE_RETRY: Duration = Duration::from_secs(2);
 /// Longest a 429 can keep us off the upstream API.
 const MAX_RATE_LIMIT_GATE: Duration = Duration::from_secs(10 * 60);
+
+/// Most keys tracked in the rate-limit gate at once.
+const MAX_RATE_LIMITED_KEYS: usize = 1024;
+const NOT_IN_LIBRARY_MESSAGE: &str = "No MDBList ratings available for this title.";
 
 const RATE_LIMIT_MESSAGE: &str = "MDBList rate limit reached. Try again later.";
 const NO_KEY_MESSAGE: &str = "No MDBList API key configured. Add your key in Moonfin Settings, or ask your server admin to set a server-wide key.";
@@ -63,6 +70,19 @@ const NO_KEY_MESSAGE: &str = "No MDBList API key configured. Add your key in Moo
 enum MediaType {
     Movie,
     Show,
+}
+
+/// Opaque, process-local identity of an API key: a hash, never the key.
+/// Scopes failures to the credential that caused them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+struct KeyId(u64);
+
+impl KeyId {
+    fn of(api_key: &str) -> Self {
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        api_key.hash(&mut hasher);
+        Self(hasher.finish())
+    }
 }
 
 /// One rating as MDBList reports it and as Moonbase relays it.
@@ -248,10 +268,13 @@ struct Inner {
     client: reqwest::Client,
     /// One lock per cache key so concurrent lookups share a single fetch.
     in_flight: DashMap<String, Arc<tokio::sync::Mutex<()>>>,
-    /// Cache key -> user-facing error from a recent failed lookup.
-    failures: moka::sync::Cache<String, String>,
-    /// API key -> when upstream 429s stop applying. Held in memory only.
-    rate_limited: DashMap<String, Instant>,
+    /// Title cache key -> error from an upstream outage (5xx, network, parse).
+    /// Independent of any key, so shared by everyone.
+    title_failures: moka::sync::Cache<String, String>,
+    /// (key, title cache key) -> error for 401/403: only that key is bad.
+    key_failures: moka::sync::Cache<(KeyId, String), String>,
+    /// Key -> when upstream 429s stop applying. Memory only, bounded.
+    rate_limited: DashMap<KeyId, Instant>,
 }
 
 impl Default for MdbListService {
@@ -269,7 +292,11 @@ impl Default for MdbListService {
             inner: Arc::new(Inner {
                 client,
                 in_flight: DashMap::new(),
-                failures: moka::sync::Cache::builder()
+                title_failures: moka::sync::Cache::builder()
+                    .max_capacity(10_000)
+                    .time_to_live(NEGATIVE_TTL)
+                    .build(),
+                key_failures: moka::sync::Cache::builder()
                     .max_capacity(10_000)
                     .time_to_live(NEGATIVE_TTL)
                     .build(),
@@ -279,12 +306,19 @@ impl Default for MdbListService {
     }
 }
 
+/// What a failed fetch says about who is to blame, and so who remembers it.
+enum Blame {
+    /// Upstream trouble (5xx, 404, network, parse): remembered per title.
+    Title,
+    /// 401/403: this key is bad; remembered per (key, title).
+    Key,
+    /// 429: gates only this key for the given time; not a title failure.
+    RateLimit(Duration),
+}
+
 enum Fetch {
     Ratings(Vec<Rating>),
-    Failed {
-        message: String,
-        rate_limit: Option<Duration>,
-    },
+    Failed { message: String, blame: Blame },
 }
 
 impl MdbListService {
@@ -299,15 +333,18 @@ impl MdbListService {
         tmdb_id: u64,
     ) -> Result<Vec<Rating>, String> {
         let cache_key = format!("{media}:{tmdb_id}");
+        let key_id = KeyId::of(api_key);
         let ttl = Duration::from_secs(
             config
                 .mdblist_cache_ttl_hours
                 .saturating_mul(3600),
         );
+        // Cache hits are served whichever key asks: the ratings are public
+        // MDBList data and a hit costs no quota.
         if let Some(hit) = cache_get(db, &cache_key, ttl).await {
             return Ok(hit);
         }
-        if let Some(err) = self.known_failure(&cache_key, api_key) {
+        if let Some(err) = self.known_failure(&cache_key, key_id) {
             return Err(err);
         }
 
@@ -324,7 +361,7 @@ impl MdbListService {
             // A concurrent lookup may have finished while we waited.
             if let Some(hit) = cache_get(db, &cache_key, ttl).await {
                 Ok(hit)
-            } else if let Some(err) = self.known_failure(&cache_key, api_key) {
+            } else if let Some(err) = self.known_failure(&cache_key, key_id) {
                 Err(err)
             } else {
                 match self
@@ -335,18 +372,18 @@ impl MdbListService {
                         cache_put(db, &cache_key, &ratings, ttl).await;
                         Ok(ratings)
                     }
-                    Fetch::Failed {
-                        message,
-                        rate_limit,
-                    } => {
-                        if let Some(wait) = rate_limit {
-                            self.inner
-                                .rate_limited
-                                .insert(api_key.to_string(), Instant::now() + wait);
+                    Fetch::Failed { message, blame } => {
+                        match blame {
+                            Blame::Title => self
+                                .inner
+                                .title_failures
+                                .insert(cache_key.clone(), message.clone()),
+                            Blame::Key => self
+                                .inner
+                                .key_failures
+                                .insert((key_id, cache_key.clone()), message.clone()),
+                            Blame::RateLimit(wait) => self.gate(key_id, wait),
                         }
-                        self.inner
-                            .failures
-                            .insert(cache_key.clone(), message.clone());
                         Err(message)
                     }
                 }
@@ -359,18 +396,44 @@ impl MdbListService {
         result
     }
 
-    fn known_failure(&self, cache_key: &str, api_key: &str) -> Option<String> {
+    /// Starts (or extends) the 429 gate for one key, keeping the map bounded.
+    fn gate(&self, key_id: KeyId, wait: Duration) {
+        let now = Instant::now();
+        let map = &self
+            .inner
+            .rate_limited;
+        map.retain(|_, until| *until > now);
+        if map.len() >= MAX_RATE_LIMITED_KEYS
+            && !map.contains_key(&key_id)
+            && let Some(oldest) = map
+                .iter()
+                .min_by_key(|e| *e.value())
+                .map(|e| *e.key())
+        {
+            map.remove(&oldest);
+        }
+        map.insert(key_id, now + wait);
+    }
+
+    fn known_failure(&self, cache_key: &str, key_id: KeyId) -> Option<String> {
         if let Some(err) = self
             .inner
-            .failures
+            .title_failures
             .get(cache_key)
+        {
+            return Some(err);
+        }
+        if let Some(err) = self
+            .inner
+            .key_failures
+            .get(&(key_id, cache_key.to_string()))
         {
             return Some(err);
         }
         let gated = self
             .inner
             .rate_limited
-            .get(api_key)
+            .get(&key_id)
             .is_some_and(|until| Instant::now() < *until);
         gated.then(|| RATE_LIMIT_MESSAGE.to_string())
     }
@@ -390,7 +453,7 @@ impl MdbListService {
         )) else {
             return Fetch::Failed {
                 message: "MDBList is not configured correctly".into(),
-                rate_limit: None,
+                blame: Blame::Title,
             };
         };
         url.query_pairs_mut()
@@ -409,7 +472,7 @@ impl MdbListService {
                     warn!(err = %e.without_url(), "MDBList request failed");
                     return Fetch::Failed {
                         message: "Failed to fetch from MDBList".into(),
-                        rate_limit: None,
+                        blame: Blame::Title,
                     };
                 }
             };
@@ -428,14 +491,22 @@ impl MdbListService {
                 warn!(?gate, "MDBList rate limit reached");
                 return Fetch::Failed {
                     message: RATE_LIMIT_MESSAGE.into(),
-                    rate_limit: Some(gate),
+                    blame: Blame::RateLimit(gate),
                 };
             }
             if !status.is_success() {
                 warn!(status = status.as_u16(), "MDBList returned an error status");
+                let blame = if matches!(
+                    status,
+                    reqwest::StatusCode::UNAUTHORIZED | reqwest::StatusCode::FORBIDDEN
+                ) {
+                    Blame::Key
+                } else {
+                    Blame::Title
+                };
                 return Fetch::Failed {
                     message: format!("MDBList returned status {}", status.as_u16()),
-                    rate_limit: None,
+                    blame,
                 };
             }
             return match resp
@@ -447,7 +518,7 @@ impl MdbListService {
                     warn!(err = %e.without_url(), "MDBList returned an unreadable body");
                     Fetch::Failed {
                         message: "Failed to fetch from MDBList".into(),
-                        rate_limit: None,
+                        blame: Blame::Title,
                     }
                 }
             };
@@ -506,6 +577,30 @@ async fn cache_put(db: &SqlitePool, key: &str, ratings: &[Rating], ttl: Duration
 // ---------------------------------------------------------------------------
 // Handler
 // ---------------------------------------------------------------------------
+
+/// Whether the library holds a movie/series with this TMDb id (uses the
+/// `json_extract(external_ids, '$.tmdb')` expression index).
+async fn title_in_library(db: &SqlitePool, media: MediaType, tmdb_id: u64) -> bool {
+    let Ok(tmdb_id) = i64::try_from(tmdb_id) else {
+        return false;
+    };
+    let kind = match media {
+        MediaType::Movie => db::MediaKind::Movie,
+        MediaType::Show => db::MediaKind::Series,
+    };
+    sqlx::query_scalar::<_, i64>(
+        "SELECT 1 FROM media WHERE kind = ?1 \
+         AND json_extract(external_ids, '$.tmdb') = ?2 LIMIT 1",
+    )
+    .bind(kind)
+    .bind(tmdb_id)
+    .fetch_optional(db)
+    .await
+    .inspect_err(|e| warn!(err = %e, "MDBList library lookup failed"))
+    .ok()
+    .flatten()
+    .is_some()
+}
 
 #[get("/moonfin/mdblist/ratings")]
 pub async fn moonfin_mdblist_ratings(
@@ -568,15 +663,28 @@ pub async fn moonfin_mdblist_ratings(
     let config = &state
         .ctx
         .config;
-    let api_key = profile
+    let own_key = profile
         .get("mdblistApiKey")
         .and_then(Value::as_str)
         .map(str::trim)
-        .filter(|k| !k.is_empty())
-        .or_else(|| config.mdblist_key());
-    let Some(api_key) = api_key else {
+        .filter(|k| !k.is_empty());
+    let Some(api_key) = own_key.or_else(|| config.mdblist_key()) else {
         return Json(RatingsResponse::failed(NO_KEY_MESSAGE)).into_response();
     };
+    // The shared server key's quota is only spent on titles in this library;
+    // a user's own key is their own quota and is unrestricted.
+    if own_key.is_none()
+        && !title_in_library(
+            &state
+                .ctx
+                .db,
+            media,
+            tmdb_id,
+        )
+        .await
+    {
+        return Json(RatingsResponse::failed(NOT_IN_LIBRARY_MESSAGE)).into_response();
+    }
 
     match state
         .ctx
@@ -640,14 +748,93 @@ mod tests {
 
     impl Harness {
         async fn get(&self, path: &str) -> TestResponse {
+            self.get_as(&self.token, path)
+                .await
+        }
+
+        async fn get_as(&self, token: &str, path: &str) -> TestResponse {
             self.server
                 .get(path)
+                .add_header(
+                    header::AUTHORIZATION,
+                    http::HeaderValue::from_str(&auth_header_with_token(token))
+                        .unwrap(),
+                )
+                .await
+        }
+
+        /// Creates a regular second user and returns its token.
+        async fn second_user(&self) -> String {
+            self.server
+                .post("/Users/New")
                 .add_header(
                     header::AUTHORIZATION,
                     http::HeaderValue::from_str(&auth_header_with_token(&self.token))
                         .unwrap(),
                 )
+                .json(&json!({ "Name": "second", "Password": "pw" }))
+                .await;
+            self.server
+                .post("/Users/AuthenticateByName")
+                .add_header(
+                    header::AUTHORIZATION,
+                    http::HeaderValue::from_static(AUTH_HEADER),
+                )
+                .json(&json!({ "Username": "second", "Pw": "pw" }))
                 .await
+                .json::<Value>()["AccessToken"]
+                .as_str()
+                .unwrap()
+                .to_string()
+        }
+
+        async fn push_as(&self, token: &str, settings: Value) {
+            self.server
+                .post("/Moonfin/Settings/Profile/global")
+                .add_header(
+                    header::AUTHORIZATION,
+                    http::HeaderValue::from_str(&auth_header_with_token(token))
+                        .unwrap(),
+                )
+                .json(&json!({ "profile": settings, "clientId": "test" }))
+                .await
+                .assert_status_ok();
+        }
+
+        /// Puts a movie/series with this TMDb id in the library.
+        async fn seed(&self, kind: db::MediaKind, tmdb: i64) {
+            let external_ids = db::ExternalIds {
+                tmdb: Some(tmdb),
+                ..Default::default()
+            };
+            let mut media = db::Media {
+                id: uuid::Uuid::from(&db::MediaIdRaw {
+                    kind: kind.clone(),
+                    external_ids: external_ids.clone(),
+                    season: None,
+                    episode: None,
+                }),
+                title: format!("title {tmdb}"),
+                kind,
+                external_ids,
+                ..Default::default()
+            };
+            media
+                .save(
+                    &self
+                        ._guard
+                        .0
+                        .db,
+                )
+                .await
+                .unwrap();
+        }
+
+        async fn seed_movies(&self, ids: &[i64]) {
+            for id in ids {
+                self.seed(db::MediaKind::Movie, *id)
+                    .await;
+            }
         }
 
         async fn json(&self, path: &str) -> Value {
@@ -659,16 +846,8 @@ mod tests {
         }
 
         async fn push(&self, settings: Value) {
-            self.server
-                .post("/Moonfin/Settings/Profile/global")
-                .add_header(
-                    header::AUTHORIZATION,
-                    http::HeaderValue::from_str(&auth_header_with_token(&self.token))
-                        .unwrap(),
-                )
-                .json(&json!({ "profile": settings, "clientId": "test" }))
-                .await
-                .assert_status_ok();
+            self.push_as(&self.token, settings)
+                .await;
         }
     }
 
@@ -751,6 +930,8 @@ mod tests {
                 .json_body(upstream_body());
         });
         let h = harness(Some(KEY), mock.base_url()).await;
+        h.seed_movies(&[603])
+            .await;
 
         let resp = h
             .get(URL_603)
@@ -795,6 +976,8 @@ mod tests {
                 .json_body(upstream_body());
         });
         let h = harness(Some(KEY), mock.base_url()).await;
+        h.seed_movies(&[603])
+            .await;
 
         h.json(URL_603)
             .await;
@@ -827,6 +1010,8 @@ mod tests {
                 .json_body(upstream_body());
         });
         let h = harness(Some(KEY), mock.base_url()).await;
+        h.seed(db::MediaKind::Series, 1396)
+            .await;
         let url = "/Moonfin/MdbList/Ratings?type=show&tmdbId=1396";
         h.json(url)
             .await;
@@ -955,6 +1140,8 @@ mod tests {
                 .body(format!("upstream exploded for apikey={KEY}"));
         });
         let h = harness(Some(KEY), mock.base_url()).await;
+        h.seed_movies(&[1, 2])
+            .await;
 
         for (id, status, mock_hits) in [(1, 404, &not_found), (2, 500, &broken)] {
             let url = format!("/Moonfin/MdbList/Ratings?type=movie&tmdbId={id}");
@@ -990,6 +1177,8 @@ mod tests {
                 .json_body(upstream_body());
         });
         let h = harness(Some(KEY), mock.base_url()).await;
+        h.seed_movies(&[1, 2])
+            .await;
 
         let body = h
             .json("/Moonfin/MdbList/Ratings?type=movie&tmdbId=1")
@@ -1015,6 +1204,8 @@ mod tests {
                 .header("Retry-After", "0");
         });
         let h = harness(Some(KEY), mock.base_url()).await;
+        h.seed_movies(&[1])
+            .await;
         let body = h
             .json("/Moonfin/MdbList/Ratings?type=movie&tmdbId=1")
             .await;
@@ -1033,6 +1224,8 @@ mod tests {
             )
         };
         let h = harness(Some(KEY), closed).await;
+        h.seed_movies(&[603])
+            .await;
         let resp = h
             .get(URL_603)
             .await;
@@ -1055,6 +1248,8 @@ mod tests {
                 .json_body(upstream_body());
         });
         let h = harness(Some(KEY), mock.base_url()).await;
+        h.seed_movies(&[603])
+            .await;
         let (a, b, c) = tokio::join!(h.get(URL_603), h.get(URL_603), h.get(URL_603));
         for r in [a, b, c] {
             assert_eq!(r.json::<Value>()["success"], true);
@@ -1076,6 +1271,338 @@ mod tests {
                 .json("/Moonfin/Ping")
                 .await["mdblistAvailable"],
             false
+        );
+    }
+
+    fn mock_ok<'a>(mock: &'a MockServer, path: &str, key: &str) -> httpmock::Mock<'a> {
+        mock.mock(|when, then| {
+            when.method(GET)
+                .path(path)
+                .query_param("apikey", key);
+            then.status(200)
+                .json_body(upstream_body());
+        })
+    }
+
+    const BAD: &str = "fake-bad-user-key";
+    const OTHER: &str = "fake-other-user-key";
+    const URL_1: &str = "/Moonfin/MdbList/Ratings?type=movie&tmdbId=1";
+
+    #[tokio::test]
+    async fn bad_user_key_does_not_poison_the_title_for_other_users() {
+        let mock = MockServer::start();
+        let bad = mock.mock(|when, then| {
+            when.method(GET)
+                .path("/tmdb/movie/1")
+                .query_param("apikey", BAD);
+            then.status(401);
+        });
+        let good = mock_ok(&mock, "/tmdb/movie/1", KEY);
+        let h = harness(Some(KEY), mock.base_url()).await;
+        h.seed_movies(&[1])
+            .await;
+        let second = h
+            .second_user()
+            .await;
+        h.push_as(&second, json!({ "mdblistApiKey": BAD }))
+            .await;
+
+        // User A (bad key) fails, and is remembered failed for that key.
+        for _ in 0..2 {
+            let resp = h
+                .get_as(&second, URL_1)
+                .await;
+            resp.assert_status_ok();
+            let body = resp.json::<Value>();
+            assert_eq!(body["success"], false);
+            assert_eq!(body["error"], "MDBList returned status 401");
+        }
+        bad.assert_hits(1);
+        // User B (server key) still gets the title.
+        let body = h
+            .json(URL_1)
+            .await;
+        assert_eq!(body["success"], true);
+        good.assert_hits(1);
+    }
+
+    #[tokio::test]
+    async fn rate_limit_gates_only_the_key_that_hit_it() {
+        let mock = MockServer::start();
+        let limited = mock.mock(|when, then| {
+            when.method(GET)
+                .path("/tmdb/movie/1")
+                .query_param("apikey", OTHER);
+            then.status(429)
+                .header("Retry-After", "30");
+        });
+        let ok_other = mock_ok(&mock, "/tmdb/movie/2", OTHER);
+        let ok_server = mock_ok(&mock, "/tmdb/movie/1", KEY);
+        let h = harness(Some(KEY), mock.base_url()).await;
+        h.seed_movies(&[1, 2])
+            .await;
+        let second = h
+            .second_user()
+            .await;
+        h.push_as(&second, json!({ "mdblistApiKey": OTHER }))
+            .await;
+
+        let body = h
+            .get_as(&second, URL_1)
+            .await
+            .json::<Value>();
+        assert_eq!(body["error"], RATE_LIMIT_MESSAGE);
+        // The gated key is held off for other titles too, with no new call.
+        let body = h
+            .get_as(&second, "/Moonfin/MdbList/Ratings?type=movie&tmdbId=2")
+            .await
+            .json::<Value>();
+        assert_eq!(body["error"], RATE_LIMIT_MESSAGE);
+        limited.assert_hits(1);
+        ok_other.assert_hits(0);
+        // The server-key user is unaffected, even for the same title.
+        assert_eq!(
+            h.json(URL_1)
+                .await["success"],
+            true
+        );
+        ok_server.assert_hits(1);
+        // A 429 is a key gate, never a remembered title failure.
+        let svc = &h
+            ._guard
+            .0
+            .mdblist
+            .inner;
+        assert_eq!(
+            svc.title_failures
+                .iter()
+                .count(),
+            0
+        );
+        assert_eq!(
+            svc.key_failures
+                .iter()
+                .count(),
+            0
+        );
+        let gate = svc
+            .rate_limited
+            .get(&KeyId::of(OTHER))
+            .map(|g| *g)
+            .unwrap();
+        let left = gate - Instant::now();
+        assert!(left <= Duration::from_secs(30), "{left:?}");
+    }
+
+    #[tokio::test]
+    async fn short_retry_after_gate_expires_instead_of_lasting_ten_minutes() {
+        let mock = MockServer::start();
+        let limited = mock.mock(|when, then| {
+            when.method(GET)
+                .path("/tmdb/movie/1");
+            then.status(429)
+                .header("Retry-After", "3");
+        });
+        let h = harness(Some(KEY), mock.base_url()).await;
+        h.seed_movies(&[1])
+            .await;
+        assert_eq!(
+            h.json(URL_1)
+                .await["error"],
+            RATE_LIMIT_MESSAGE
+        );
+        limited.assert_hits(1);
+        let svc = &h
+            ._guard
+            .0
+            .mdblist
+            .inner;
+        assert!(
+            svc.rate_limited
+                .get(&KeyId::of(KEY))
+                .map(|g| *g - Instant::now())
+                .unwrap()
+                <= Duration::from_secs(3)
+        );
+        // Nothing title-scoped lingers once the short gate passes.
+        assert_eq!(
+            svc.title_failures
+                .iter()
+                .count(),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn upstream_5xx_stays_remembered_for_everyone() {
+        let mock = MockServer::start();
+        let broken = mock.mock(|when, then| {
+            when.method(GET)
+                .path("/tmdb/movie/1");
+            then.status(503);
+        });
+        let h = harness(Some(KEY), mock.base_url()).await;
+        h.seed_movies(&[1])
+            .await;
+        let second = h
+            .second_user()
+            .await;
+        h.push_as(&second, json!({ "mdblistApiKey": OTHER }))
+            .await;
+        assert_eq!(
+            h.json(URL_1)
+                .await["success"],
+            false
+        );
+        // A different user with a different key is served the memory.
+        let body = h
+            .get_as(&second, URL_1)
+            .await
+            .json::<Value>();
+        assert_eq!(body["error"], "MDBList returned status 503");
+        broken.assert_hits(1);
+    }
+
+    #[tokio::test]
+    async fn server_key_skips_titles_outside_the_library() {
+        let mock = MockServer::start();
+        let m = mock.mock(|when, then| {
+            when.method(GET);
+            then.status(200)
+                .json_body(upstream_body());
+        });
+        let h = harness(Some(KEY), mock.base_url()).await;
+        h.seed_movies(&[603])
+            .await;
+        h.seed(db::MediaKind::Series, 1396)
+            .await;
+
+        for url in [
+            "/Moonfin/MdbList/Ratings?type=movie&tmdbId=999999",
+            // Right id, wrong type.
+            "/Moonfin/MdbList/Ratings?type=show&tmdbId=603",
+            "/Moonfin/MdbList/Ratings?type=movie&tmdbId=1396",
+            "/Moonfin/MdbList/Ratings?type=movie&tmdbId=99999999999999999999",
+        ] {
+            let resp = h
+                .get(url)
+                .await;
+            if url.ends_with("99999999999999999999") {
+                resp.assert_status(StatusCode::BAD_REQUEST);
+                continue;
+            }
+            let body = resp.json::<Value>();
+            assert_eq!(body["success"], false, "{url}");
+            assert_eq!(body["ratings"], json!([]), "{url}");
+        }
+        m.assert_hits(0);
+        // In-library ids of the matching type proceed.
+        assert_eq!(
+            h.json(URL_603)
+                .await["success"],
+            true
+        );
+        assert_eq!(
+            h.json("/Moonfin/MdbList/Ratings?type=show&tmdbId=1396")
+                .await["success"],
+            true
+        );
+        m.assert_hits(2);
+    }
+
+    #[tokio::test]
+    async fn own_key_lookup_is_not_limited_to_the_library() {
+        let mock = MockServer::start();
+        let m = mock_ok(&mock, "/tmdb/movie/424242", "fake-user-key");
+        let h = harness(Some(KEY), mock.base_url()).await;
+        h.push(json!({ "mdblistApiKey": "fake-user-key" }))
+            .await;
+        let body = h
+            .json("/Moonfin/MdbList/Ratings?type=movie&tmdbId=424242")
+            .await;
+        assert_eq!(body["success"], true);
+        m.assert_hits(1);
+    }
+
+    #[tokio::test]
+    async fn api_keys_never_appear_in_internal_state() {
+        let mock = MockServer::start();
+        let _m = mock.mock(|when, then| {
+            when.method(GET)
+                .path("/tmdb/movie/1");
+            then.status(401);
+        });
+        let h = harness(Some(KEY), mock.base_url()).await;
+        h.seed_movies(&[1])
+            .await;
+        let second = h
+            .second_user()
+            .await;
+        h.push_as(&second, json!({ "mdblistApiKey": OTHER }))
+            .await;
+        for token in [
+            h.token
+                .clone(),
+            second,
+        ] {
+            let text = h
+                .get_as(&token, URL_1)
+                .await
+                .text();
+            assert!(!text.contains(KEY) && !text.contains(OTHER));
+        }
+        let svc = &h
+            ._guard
+            .0
+            .mdblist
+            .inner;
+        let mut dump = format!("{:?}", KeyId::of(KEY));
+        for (k, v) in svc
+            .key_failures
+            .iter()
+        {
+            dump += &format!("{k:?} {v}");
+        }
+        for (k, v) in svc
+            .title_failures
+            .iter()
+        {
+            dump += &format!("{k:?} {v}");
+        }
+        for e in svc
+            .rate_limited
+            .iter()
+        {
+            dump += &format!("{:?}", e.key());
+        }
+        assert!(!dump.contains(KEY) && !dump.contains(OTHER), "{dump}");
+        assert!(
+            svc.key_failures
+                .iter()
+                .count()
+                > 0
+        );
+    }
+
+    #[test]
+    fn rate_limit_gate_map_is_bounded_and_pruned() {
+        let svc = MdbListService::default();
+        for i in 0..(MAX_RATE_LIMITED_KEYS as u64 + 50) {
+            svc.gate(KeyId(i), Duration::from_secs(60 + i));
+        }
+        assert!(
+            svc.inner
+                .rate_limited
+                .len()
+                <= MAX_RATE_LIMITED_KEYS
+        );
+        svc.gate(KeyId(u64::MAX), Duration::from_millis(1));
+        std::thread::sleep(Duration::from_millis(5));
+        svc.gate(KeyId(u64::MAX - 1), Duration::from_secs(60));
+        assert!(
+            !svc.inner
+                .rate_limited
+                .contains_key(&KeyId(u64::MAX))
         );
     }
 
