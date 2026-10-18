@@ -19,6 +19,10 @@ use remux_macros::get;
 const PAGE_HTML: &str = include_str!("../../assets/moonfin/admin.html");
 const PAGE_JS: &str = include_str!("../../assets/moonfin/admin.js");
 const PAGE_CSS: &str = include_str!("../../assets/moonfin/admin.css");
+/// The option schema behind the default settings forms. Derived from Moonbase
+/// (see NOTICE); data only.
+const DEFAULT_OPTIONS_JSON: &str =
+    include_str!("../../assets/moonfin/default-options.json");
 
 /// Scripts and styles are same-origin files, so no nonce or `unsafe-inline`
 /// is needed. The page only talks to its own origin.
@@ -64,6 +68,15 @@ pub async fn moonfin_admin_script() -> Response {
 #[get("/moonfin/admin/admin.css")]
 pub async fn moonfin_admin_style() -> Response {
     with_headers("text/css; charset=utf-8", PAGE_CSS, false)
+}
+
+#[get("/moonfin/admin/default-options.json")]
+pub async fn moonfin_admin_default_options() -> Response {
+    with_headers(
+        "application/json; charset=utf-8",
+        DEFAULT_OPTIONS_JSON,
+        false,
+    )
 }
 
 #[cfg(test)]
@@ -131,6 +144,24 @@ mod tests {
             .await;
         css.assert_status_ok();
         assert_eq!(hdr(&css, "content-type"), "text/css; charset=utf-8");
+    }
+
+    #[tokio::test]
+    async fn default_options_are_served_as_json_with_strict_headers() {
+        let h = Harness::new().await;
+        let resp = h
+            .server
+            .get("/Moonfin/Admin/default-options.json")
+            .await;
+        resp.assert_status_ok();
+        assert_eq!(
+            hdr(&resp, "content-type"),
+            "application/json; charset=utf-8"
+        );
+        assert_eq!(hdr(&resp, "x-content-type-options"), "nosniff");
+        assert_eq!(hdr(&resp, "cache-control"), "no-store");
+        let body: serde_json::Value = resp.json();
+        assert!(body["controls"].is_array() && body["excluded"].is_array());
     }
 
     /// True when `html` has an attribute named `on<letters>` on any tag.
@@ -201,6 +232,252 @@ mod tests {
                 && !super::PAGE_JS.contains("document.write"),
             "script must build the DOM with textContent only"
         );
+    }
+
+    mod options {
+        use serde::Deserialize;
+        use std::collections::HashSet;
+
+        use crate::api::moonfin_settings::ADMIN_BLOCKED_KEYS;
+
+        #[derive(Deserialize)]
+        #[serde(rename_all = "lowercase")]
+        enum Kind {
+            Bool,
+            Enum,
+            Number,
+            String,
+            Color,
+            List,
+            Json,
+        }
+
+        #[derive(Deserialize)]
+        struct Choice {
+            value: serde_json::Value,
+            label: String,
+        }
+
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase", deny_unknown_fields)]
+        struct Control {
+            key: String,
+            label: String,
+            group: String,
+            section: Option<String>,
+            #[serde(rename = "type")]
+            kind: Kind,
+            help: Option<String>,
+            default: Option<serde_json::Value>,
+            options: Option<Vec<Choice>>,
+            suggestions: Option<Vec<Choice>>,
+            min: Option<f64>,
+            max: Option<f64>,
+            step: Option<f64>,
+            max_items: Option<u32>,
+            store_as: Option<String>,
+            also_keys: Option<Vec<String>>,
+        }
+
+        #[derive(Deserialize)]
+        struct Excluded {
+            key: String,
+            reason: String,
+            group: String,
+            label: String,
+        }
+
+        #[derive(Deserialize)]
+        struct Schema {
+            groups: Vec<String>,
+            controls: Vec<Control>,
+            excluded: Vec<Excluded>,
+        }
+
+        fn schema() -> Schema {
+            serde_json::from_str(super::super::DEFAULT_OPTIONS_JSON)
+                .expect("default-options.json parses against the schema")
+        }
+
+        #[test]
+        fn keys_are_unique_and_never_blocked() {
+            let s = schema();
+            assert!(
+                s.controls
+                    .len()
+                    > 100
+            );
+            let mut seen = HashSet::new();
+            for c in &s.controls {
+                let keys = std::iter::once(&c.key).chain(
+                    c.also_keys
+                        .iter()
+                        .flatten(),
+                );
+                for k in keys {
+                    assert!(seen.insert(k.clone()), "duplicate key {k}");
+                    assert!(
+                        !ADMIN_BLOCKED_KEYS.contains(&k.as_str()),
+                        "blocked key {k} is offered as a control"
+                    );
+                }
+            }
+            for e in &s.excluded {
+                assert!(
+                    !seen.contains(&e.key),
+                    "{} is both included and excluded",
+                    e.key
+                );
+                assert!(
+                    !e.reason
+                        .is_empty()
+                        && !e
+                            .group
+                            .is_empty()
+                        && !e
+                            .label
+                            .is_empty()
+                );
+            }
+            let ex: HashSet<&str> = s
+                .excluded
+                .iter()
+                .map(|e| {
+                    e.key
+                        .as_str()
+                })
+                .collect();
+            assert_eq!(
+                ex.len(),
+                s.excluded
+                    .len(),
+                "duplicate excluded key"
+            );
+            for k in ADMIN_BLOCKED_KEYS {
+                assert!(ex.contains(k), "blocked key {k} must be listed as excluded");
+            }
+        }
+
+        #[test]
+        fn groups_and_types_are_consistent() {
+            let s = schema();
+            for c in &s.controls {
+                assert!(
+                    s.groups
+                        .contains(&c.group),
+                    "{}: unknown group {}",
+                    c.key,
+                    c.group
+                );
+                assert!(
+                    !c.label
+                        .is_empty(),
+                    "{}: empty label",
+                    c.key
+                );
+                let _ = (&c.section, &c.help);
+                match c.kind {
+                    Kind::Enum => {
+                        let opts = c
+                            .options
+                            .as_ref()
+                            .unwrap_or_else(|| {
+                                panic!("{}: enum without options", c.key)
+                            });
+                        assert!(!opts.is_empty());
+                        let mut vals = HashSet::new();
+                        for o in opts {
+                            assert!(
+                                !o.label
+                                    .is_empty()
+                            );
+                            assert!(
+                                vals.insert(
+                                    o.value
+                                        .to_string()
+                                ),
+                                "{}: duplicate option",
+                                c.key
+                            );
+                        }
+                        if let Some(d) = &c.default {
+                            assert!(
+                                opts.iter()
+                                    .any(|o| &o.value == d),
+                                "{}: default is not one of the options",
+                                c.key
+                            );
+                        }
+                    }
+                    Kind::Number => {
+                        let (min, max) = (
+                            c.min
+                                .unwrap(),
+                            c.max
+                                .unwrap(),
+                        );
+                        assert!(min <= max, "{}: min > max", c.key);
+                        assert!(
+                            c.step
+                                .unwrap_or(1.0)
+                                > 0.0
+                        );
+                        if let Some(d) = c
+                            .default
+                            .as_ref()
+                            .and_then(|d| d.as_f64())
+                        {
+                            assert!(
+                                (min..=max).contains(&d),
+                                "{}: default out of range",
+                                c.key
+                            );
+                        }
+                        if let Some(t) = &c.store_as {
+                            assert_eq!(t, "string");
+                        }
+                    }
+                    Kind::List => {
+                        for o in c
+                            .suggestions
+                            .iter()
+                            .flatten()
+                        {
+                            assert!(
+                                o.value
+                                    .is_string(),
+                                "{}: suggestion not a string",
+                                c.key
+                            );
+                        }
+                        assert!(
+                            c.max_items
+                                .is_none_or(|n| n > 0)
+                        );
+                    }
+                    Kind::Bool | Kind::String | Kind::Color | Kind::Json => {}
+                }
+                if !matches!(c.kind, Kind::Enum) {
+                    assert!(
+                        c.options
+                            .is_none(),
+                        "{}: options only on enums",
+                        c.key
+                    );
+                }
+            }
+        }
+
+        #[test]
+        fn home_layout_pair_is_present() {
+            let s = schema();
+            let has = |k: &str| {
+                s.controls
+                    .iter()
+                    .any(|c| c.key == k)
+            };
+            assert!(has("homeSections") && has("homeRowOrder"));
+        }
     }
 
     #[tokio::test]

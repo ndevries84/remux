@@ -1,0 +1,5256 @@
+{
+  "source": {
+    "project": "Moonfin Plugin (Moonbase)",
+    "license": "GPL-3.0",
+    "repository": "https://github.com/Moonfin-Client/Plugin",
+    "commit": "7ccfd6bc9d043c34eb2b00efcf8fb68679e354ee",
+    "files": [
+      "Jellyfin/backend/Pages/configPage.html",
+      "Jellyfin/backend/Models/MoonfinSettingsProfile.cs"
+    ]
+  },
+  "notes": [
+    "Every control is optional: a key that is absent is \"not set\" and the app uses its built-in default.",
+    "\"default\" is the starting value Moonbase offers when an admin turns the control on; absent when Moonbase starts it unset.",
+    "\"storeAs\": \"string\" means the client stores a numeric slider value as text.",
+    "\"alsoKeys\" are further keys that Moonbase writes with the same value as \"key\"."
+  ],
+  "groups": [
+    "Account",
+    "General",
+    "Appearance",
+    "Home Screen",
+    "Libraries",
+    "Details Page",
+    "Playback",
+    "Integrations"
+  ],
+  "controls": [
+    {
+      "key": "recommendationsApplyParentalRatingCap",
+      "label": "Apply Rating Limit to Recommendations",
+      "group": "Account",
+      "section": "Parental Controls",
+      "type": "bool",
+      "help": "Filter recommendations to not exceed the current item's age rating."
+    },
+    {
+      "key": "clockBehavior",
+      "label": "Clock Display",
+      "group": "General",
+      "section": "Clock",
+      "type": "enum",
+      "options": [
+        {
+          "value": "always",
+          "label": "Always"
+        },
+        {
+          "value": "inMenus",
+          "label": "In menus"
+        },
+        {
+          "value": "never",
+          "label": "Never"
+        }
+      ]
+    },
+    {
+      "key": "use24HourClock",
+      "label": "24-Hour Clock",
+      "group": "General",
+      "section": "Clock",
+      "type": "bool"
+    },
+    {
+      "key": "confirmExit",
+      "label": "Confirm Exit (TV clients only)",
+      "group": "General",
+      "section": "Behavior",
+      "type": "bool",
+      "help": "Ask before the back button leaves the app."
+    },
+    {
+      "key": "updateNotificationsEnabled",
+      "label": "Update Notifications",
+      "group": "General",
+      "section": "Behavior",
+      "type": "bool"
+    },
+    {
+      "key": "navbarPosition",
+      "label": "Navigation Style",
+      "group": "Appearance",
+      "section": "Navigation Bar",
+      "type": "enum",
+      "options": [
+        {
+          "value": "top",
+          "label": "Top"
+        },
+        {
+          "value": "left",
+          "label": "Left (Sidebar)"
+        },
+        {
+          "value": "bottom",
+          "label": "Bottom"
+        }
+      ]
+    },
+    {
+      "key": "navbarColor",
+      "label": "Navbar Color",
+      "group": "Appearance",
+      "section": "Navigation Bar",
+      "type": "enum",
+      "options": [
+        {
+          "value": "black",
+          "label": "Black"
+        },
+        {
+          "value": "gray",
+          "label": "Gray"
+        },
+        {
+          "value": "darkBlue",
+          "label": "Dark Blue"
+        },
+        {
+          "value": "purple",
+          "label": "Purple"
+        },
+        {
+          "value": "teal",
+          "label": "Teal"
+        },
+        {
+          "value": "navy",
+          "label": "Navy"
+        },
+        {
+          "value": "charcoal",
+          "label": "Charcoal"
+        },
+        {
+          "value": "brown",
+          "label": "Brown"
+        },
+        {
+          "value": "darkRed",
+          "label": "Dark Red"
+        },
+        {
+          "value": "darkGreen",
+          "label": "Dark Green"
+        },
+        {
+          "value": "slate",
+          "label": "Slate"
+        },
+        {
+          "value": "indigo",
+          "label": "Indigo"
+        },
+        {
+          "value": "moonfinCyan",
+          "label": "Moonfin Cyan"
+        },
+        {
+          "value": "neonPulseMagenta",
+          "label": "Neon Pulse Magenta"
+        }
+      ]
+    },
+    {
+      "key": "navbarOpacity",
+      "label": "Navbar Opacity",
+      "group": "Appearance",
+      "section": "Navigation Bar",
+      "type": "number",
+      "min": 0,
+      "max": 100,
+      "step": 5,
+      "default": 100
+    },
+    {
+      "key": "navbarAlwaysExpanded",
+      "label": "Always Expand Navbar Labels",
+      "group": "Appearance",
+      "section": "Navigation Bar",
+      "type": "bool"
+    },
+    {
+      "key": "bottomNavbarStyle",
+      "label": "Bottom Bar Style",
+      "group": "Appearance",
+      "section": "Navigation Bar",
+      "type": "enum",
+      "options": [
+        {
+          "value": "dock",
+          "label": "Dock"
+        },
+        {
+          "value": "split",
+          "label": "Split"
+        },
+        {
+          "value": "strip",
+          "label": "Strip"
+        }
+      ],
+      "help": "Phones and tablets with the Bottom navigation style."
+    },
+    {
+      "key": "bottomNavbarTabs",
+      "label": "Bottom Bar Tabs",
+      "group": "Appearance",
+      "section": "Navigation Bar",
+      "type": "list",
+      "maxItems": 3,
+      "suggestions": [
+        {
+          "value": "search",
+          "label": "Search"
+        },
+        {
+          "value": "libraries",
+          "label": "Libraries"
+        },
+        {
+          "value": "favorites",
+          "label": "Favorites"
+        },
+        {
+          "value": "genres",
+          "label": "Genres"
+        },
+        {
+          "value": "liveTv",
+          "label": "Live TV"
+        },
+        {
+          "value": "folders",
+          "label": "Folders"
+        }
+      ],
+      "help": "Up to three tabs between Home and You. Left unset, each device picks them from the Nav Buttons below, and everything else shows in the You menu."
+    },
+    {
+      "key": "showShuffleButton",
+      "label": "Show Shuffle Button",
+      "group": "Appearance",
+      "section": "Navigation Bar Buttons",
+      "type": "bool"
+    },
+    {
+      "key": "shuffleContentType",
+      "label": "Shuffle Content",
+      "group": "Appearance",
+      "section": "Navigation Bar Buttons",
+      "type": "enum",
+      "options": [
+        {
+          "value": "both",
+          "label": "Movies and Shows"
+        },
+        {
+          "value": "movies",
+          "label": "Movies"
+        },
+        {
+          "value": "shows",
+          "label": "Shows"
+        }
+      ]
+    },
+    {
+      "key": "showGenresButton",
+      "label": "Show Genres Button",
+      "group": "Appearance",
+      "section": "Navigation Bar Buttons",
+      "type": "bool"
+    },
+    {
+      "key": "showFavoritesButton",
+      "label": "Show Favorites Button",
+      "group": "Appearance",
+      "section": "Navigation Bar Buttons",
+      "type": "bool"
+    },
+    {
+      "key": "showLiveTvButton",
+      "label": "Show Live TV Button",
+      "group": "Appearance",
+      "section": "Navigation Bar Buttons",
+      "type": "bool"
+    },
+    {
+      "key": "showLibrariesInToolbar",
+      "label": "Show Libraries in Toolbar",
+      "group": "Appearance",
+      "section": "Navigation Bar Buttons",
+      "type": "bool"
+    },
+    {
+      "key": "showSyncPlayButton",
+      "label": "Show SyncPlay Button",
+      "group": "Appearance",
+      "section": "Navigation Bar Buttons",
+      "type": "bool"
+    },
+    {
+      "key": "enableFolderView",
+      "label": "Enable Folder View",
+      "group": "Appearance",
+      "section": "Navigation Bar Buttons",
+      "type": "bool"
+    },
+    {
+      "key": "interfaceStyle",
+      "label": "Interface Style",
+      "group": "Appearance",
+      "section": "Theme",
+      "type": "enum",
+      "options": [
+        {
+          "value": "automatic",
+          "label": "Automatic"
+        },
+        {
+          "value": "apple",
+          "label": "Apple"
+        },
+        {
+          "value": "material",
+          "label": "Material"
+        }
+      ],
+      "help": "Automatic adapts to your device. Choose Apple or Material to lock the look."
+    },
+    {
+      "key": "visualTheme",
+      "label": "App Theme",
+      "group": "Appearance",
+      "section": "Theme",
+      "type": "enum",
+      "options": [
+        {
+          "value": "moonfin",
+          "label": "Moonfin"
+        },
+        {
+          "value": "neonPulse",
+          "label": "Neon Pulse"
+        },
+        {
+          "value": "glass",
+          "label": "Glass"
+        },
+        {
+          "value": "eightbitHero",
+          "label": "8-bit Hero"
+        }
+      ],
+      "help": "Default overall app style. Keep Not set to let users choose."
+    },
+    {
+      "key": "focusColor",
+      "label": "Focus Border Color",
+      "group": "Appearance",
+      "section": "Theme",
+      "type": "enum",
+      "options": [
+        {
+          "value": "white",
+          "label": "White"
+        },
+        {
+          "value": "black",
+          "label": "Black"
+        },
+        {
+          "value": "gray",
+          "label": "Gray"
+        },
+        {
+          "value": "darkBlue",
+          "label": "Dark Blue"
+        },
+        {
+          "value": "purple",
+          "label": "Purple"
+        },
+        {
+          "value": "teal",
+          "label": "Teal"
+        },
+        {
+          "value": "navy",
+          "label": "Navy"
+        },
+        {
+          "value": "charcoal",
+          "label": "Charcoal"
+        },
+        {
+          "value": "brown",
+          "label": "Brown"
+        },
+        {
+          "value": "darkRed",
+          "label": "Dark Red"
+        },
+        {
+          "value": "darkGreen",
+          "label": "Dark Green"
+        },
+        {
+          "value": "slate",
+          "label": "Slate"
+        },
+        {
+          "value": "indigo",
+          "label": "Indigo"
+        },
+        {
+          "value": "moonfinCyan",
+          "label": "Moonfin Cyan"
+        },
+        {
+          "value": "neonPulseMagenta",
+          "label": "Neon Pulse Magenta"
+        },
+        {
+          "value": "eightBitGold",
+          "label": "8-bit Gold"
+        }
+      ],
+      "help": "Color used for focused cards and controls."
+    },
+    {
+      "key": "cardFocusExpansion",
+      "label": "Focus Expansion Animation",
+      "group": "Appearance",
+      "section": "Display",
+      "type": "bool"
+    },
+    {
+      "key": "desktopUiScale",
+      "label": "UI Scaling",
+      "group": "Appearance",
+      "section": "Display",
+      "type": "enum",
+      "options": [
+        {
+          "value": "small",
+          "label": "Small"
+        },
+        {
+          "value": "medium",
+          "label": "Medium"
+        },
+        {
+          "value": "large",
+          "label": "Large"
+        },
+        {
+          "value": "extraLarge",
+          "label": "Extra Large"
+        },
+        {
+          "value": "grandparents",
+          "label": "Grandparents"
+        },
+        {
+          "value": "greatGrandparents",
+          "label": "Great-Grandparents"
+        }
+      ]
+    },
+    {
+      "key": "backdropEnabled",
+      "label": "Background Backdrops",
+      "group": "Appearance",
+      "section": "Display",
+      "type": "bool"
+    },
+    {
+      "key": "browsingBlur",
+      "label": "Browsing Background Blur",
+      "group": "Appearance",
+      "section": "Display",
+      "type": "number",
+      "min": 0,
+      "max": 25,
+      "step": 1,
+      "default": 0,
+      "storeAs": "string"
+    },
+    {
+      "key": "watchedIndicator",
+      "label": "Watched Indicators",
+      "group": "Appearance",
+      "section": "Display",
+      "type": "enum",
+      "options": [
+        {
+          "value": "always",
+          "label": "Always"
+        },
+        {
+          "value": "hideUnwatched",
+          "label": "Hide Unwatched"
+        },
+        {
+          "value": "episodesOnly",
+          "label": "Episodes Only"
+        },
+        {
+          "value": "never",
+          "label": "Never"
+        }
+      ]
+    },
+    {
+      "key": "seasonalSurprise",
+      "label": "Seasonal Effects",
+      "group": "Appearance",
+      "section": "Seasonal Effects",
+      "type": "enum",
+      "options": [
+        {
+          "value": "none",
+          "label": "None"
+        },
+        {
+          "value": "snow",
+          "label": "Snow"
+        },
+        {
+          "value": "christmas",
+          "label": "Christmas"
+        },
+        {
+          "value": "fireworks",
+          "label": "Fireworks"
+        },
+        {
+          "value": "confetti",
+          "label": "Confetti"
+        },
+        {
+          "value": "petals",
+          "label": "Spring Petals"
+        },
+        {
+          "value": "fireflies",
+          "label": "Fireflies"
+        },
+        {
+          "value": "leaves",
+          "label": "Falling Leaves"
+        },
+        {
+          "value": "halloween",
+          "label": "Halloween"
+        }
+      ]
+    },
+    {
+      "key": "seasonalDensity",
+      "label": "Seasonal Effects Density",
+      "group": "Appearance",
+      "section": "Seasonal Effects",
+      "type": "enum",
+      "options": [
+        {
+          "value": "light",
+          "label": "Light"
+        },
+        {
+          "value": "normal",
+          "label": "Normal"
+        },
+        {
+          "value": "heavy",
+          "label": "Heavy"
+        }
+      ]
+    },
+    {
+      "key": "seasonalRowHiddenHolidays",
+      "label": "Seasonal Row Hidden Holidays",
+      "group": "Appearance",
+      "section": "Seasonal Effects",
+      "type": "list",
+      "suggestions": [
+        {
+          "value": "newYear",
+          "label": "New Year's"
+        },
+        {
+          "value": "valentines",
+          "label": "Valentine's Day"
+        },
+        {
+          "value": "easter",
+          "label": "Easter"
+        },
+        {
+          "value": "pride",
+          "label": "Pride"
+        },
+        {
+          "value": "halloween",
+          "label": "Halloween"
+        },
+        {
+          "value": "thanksgiving",
+          "label": "Thanksgiving"
+        },
+        {
+          "value": "christmas",
+          "label": "Christmas"
+        },
+        {
+          "value": "lunarNewYear",
+          "label": "Lunar New Year"
+        },
+        {
+          "value": "diwali",
+          "label": "Diwali"
+        }
+      ],
+      "help": "Holidays whose row is hidden for users who have not chosen for themselves."
+    },
+    {
+      "key": "loadingAnimationImage",
+      "label": "Loading Animation Image",
+      "group": "Appearance",
+      "section": "Loading Animation",
+      "type": "enum",
+      "options": [
+        {
+          "value": "none",
+          "label": "None"
+        },
+        {
+          "value": "moonfinLogo",
+          "label": "Moonfin Logo"
+        },
+        {
+          "value": "spinner",
+          "label": "Spinner"
+        },
+        {
+          "value": "runner",
+          "label": "Runner"
+        },
+        {
+          "value": "moonPhases",
+          "label": "Moon Phases"
+        },
+        {
+          "value": "moonfinPhases",
+          "label": "Moonfin Phases"
+        },
+        {
+          "value": "neonfinPhases",
+          "label": "Neonfin Phases"
+        }
+      ]
+    },
+    {
+      "key": "loadingAnimationPosition",
+      "label": "Loading Animation Position",
+      "group": "Appearance",
+      "section": "Loading Animation",
+      "type": "enum",
+      "options": [
+        {
+          "value": "topLeft",
+          "label": "Top-Left"
+        },
+        {
+          "value": "topCenter",
+          "label": "Top-Center"
+        },
+        {
+          "value": "topRight",
+          "label": "Top-Right"
+        },
+        {
+          "value": "middleLeft",
+          "label": "Middle-Left"
+        },
+        {
+          "value": "middle",
+          "label": "Middle"
+        },
+        {
+          "value": "middleRight",
+          "label": "Middle-Right"
+        },
+        {
+          "value": "bottomLeft",
+          "label": "Bottom-Left"
+        },
+        {
+          "value": "bottomCenter",
+          "label": "Bottom-Center"
+        },
+        {
+          "value": "bottomRight",
+          "label": "Bottom-Right"
+        },
+        {
+          "value": "bouncing",
+          "label": "Bouncing"
+        }
+      ]
+    },
+    {
+      "key": "loadingAnimationSize",
+      "label": "Loading Animation Size",
+      "group": "Appearance",
+      "section": "Loading Animation",
+      "type": "enum",
+      "options": [
+        {
+          "value": "thumbnail",
+          "label": "Thumbnail"
+        },
+        {
+          "value": "small",
+          "label": "Small"
+        },
+        {
+          "value": "medium",
+          "label": "Medium"
+        },
+        {
+          "value": "large",
+          "label": "Large"
+        }
+      ]
+    },
+    {
+      "key": "loadingAnimationSpeed",
+      "label": "Loading Animation Speed",
+      "group": "Appearance",
+      "section": "Loading Animation",
+      "type": "enum",
+      "options": [
+        {
+          "value": "slow",
+          "label": "Slow"
+        },
+        {
+          "value": "moderate",
+          "label": "Moderate"
+        },
+        {
+          "value": "fast",
+          "label": "Fast"
+        },
+        {
+          "value": "ultra",
+          "label": "Ultra"
+        }
+      ]
+    },
+    {
+      "key": "showLoadingAnimationText",
+      "label": "Show Loading Animation Text",
+      "group": "Appearance",
+      "section": "Loading Animation",
+      "type": "bool"
+    },
+    {
+      "key": "screensaverMode",
+      "label": "Screensaver Mode (TV clients only)",
+      "group": "Appearance",
+      "section": "Screensaver",
+      "type": "enum",
+      "options": [
+        {
+          "value": "logo",
+          "label": "Logo"
+        },
+        {
+          "value": "library",
+          "label": "Library"
+        }
+      ]
+    },
+    {
+      "key": "screensaverBackdrop",
+      "label": "Screensaver Backdrop",
+      "group": "Appearance",
+      "section": "Screensaver",
+      "type": "enum",
+      "options": [
+        {
+          "value": "library",
+          "label": "Library Art"
+        },
+        {
+          "value": "black",
+          "label": "Black"
+        },
+        {
+          "value": "moonfin",
+          "label": "Moonfin"
+        },
+        {
+          "value": "calm",
+          "label": "Calm"
+        },
+        {
+          "value": "neonPulse",
+          "label": "Neon Pulse"
+        },
+        {
+          "value": "aurora",
+          "label": "Aurora"
+        }
+      ]
+    },
+    {
+      "key": "screensaverComponent",
+      "label": "Screensaver Additional Component",
+      "group": "Appearance",
+      "section": "Screensaver",
+      "type": "enum",
+      "options": [
+        {
+          "value": "none",
+          "label": "None"
+        },
+        {
+          "value": "moonfinLogo",
+          "label": "Moonfin Logo"
+        },
+        {
+          "value": "clock",
+          "label": "Clock"
+        },
+        {
+          "value": "runner",
+          "label": "Runner"
+        }
+      ]
+    },
+    {
+      "key": "screensaverMovement",
+      "label": "Screensaver Component Movement",
+      "group": "Appearance",
+      "section": "Screensaver",
+      "type": "enum",
+      "options": [
+        {
+          "value": "staticCorner",
+          "label": "Static"
+        },
+        {
+          "value": "slow",
+          "label": "Slow"
+        },
+        {
+          "value": "moderate",
+          "label": "Moderate"
+        },
+        {
+          "value": "fast",
+          "label": "Fast"
+        },
+        {
+          "value": "ultra",
+          "label": "Ultra"
+        }
+      ]
+    },
+    {
+      "key": "screensaverPosition",
+      "label": "Screensaver Component Position",
+      "group": "Appearance",
+      "section": "Screensaver",
+      "type": "enum",
+      "options": [
+        {
+          "value": "topLeft",
+          "label": "Top-Left"
+        },
+        {
+          "value": "topCenter",
+          "label": "Top-Center"
+        },
+        {
+          "value": "topRight",
+          "label": "Top-Right"
+        },
+        {
+          "value": "middleLeft",
+          "label": "Middle-Left"
+        },
+        {
+          "value": "middle",
+          "label": "Middle"
+        },
+        {
+          "value": "middleRight",
+          "label": "Middle-Right"
+        },
+        {
+          "value": "bottomLeft",
+          "label": "Bottom-Left"
+        },
+        {
+          "value": "bottomCenter",
+          "label": "Bottom-Center"
+        },
+        {
+          "value": "bottomRight",
+          "label": "Bottom-Right"
+        }
+      ],
+      "help": "Applies when the component movement is Static."
+    },
+    {
+      "key": "screensaverSize",
+      "label": "Screensaver Component Size",
+      "group": "Appearance",
+      "section": "Screensaver",
+      "type": "enum",
+      "options": [
+        {
+          "value": "thumbnail",
+          "label": "Thumbnail"
+        },
+        {
+          "value": "small",
+          "label": "Small"
+        },
+        {
+          "value": "medium",
+          "label": "Medium"
+        },
+        {
+          "value": "large",
+          "label": "Large"
+        }
+      ]
+    },
+    {
+      "key": "screensaverContentType",
+      "label": "Screensaver Content Type",
+      "group": "Appearance",
+      "section": "Screensaver",
+      "type": "enum",
+      "options": [
+        {
+          "value": "both",
+          "label": "Movies & TV Shows"
+        },
+        {
+          "value": "movies",
+          "label": "Movies Only"
+        },
+        {
+          "value": "tvshows",
+          "label": "TV Shows Only"
+        }
+      ],
+      "help": "What the Library Art backdrop shows."
+    },
+    {
+      "key": "screensaverLibraryIds",
+      "label": "Screensaver Libraries",
+      "group": "Appearance",
+      "section": "Screensaver",
+      "type": "list",
+      "help": "IDs of the libraries the screensaver draws from. Empty means all libraries."
+    },
+    {
+      "key": "screensaverCollectionIds",
+      "label": "Screensaver Collections",
+      "group": "Appearance",
+      "section": "Screensaver",
+      "type": "list",
+      "help": "IDs of the collections the screensaver draws from."
+    },
+    {
+      "key": "screensaverExcludedGenres",
+      "label": "Screensaver Excluded Genres",
+      "group": "Appearance",
+      "section": "Screensaver",
+      "type": "list",
+      "help": "Genre names the screensaver never shows."
+    },
+    {
+      "key": "mergeContinueWatchingNextUp",
+      "label": "Merge Continue Watching and Next Up",
+      "group": "Home Screen",
+      "section": "Row Options",
+      "type": "bool",
+      "help": "Combine Continue Watching and Next Up into a single home row by default."
+    },
+    {
+      "key": "nextUpMaxDays",
+      "label": "Max days in Next Up",
+      "group": "Home Screen",
+      "section": "Row Options",
+      "type": "enum",
+      "options": [
+        {
+          "value": 0,
+          "label": "0 (No limit)"
+        },
+        {
+          "value": 30,
+          "label": "30 Days"
+        },
+        {
+          "value": 90,
+          "label": "90 Days"
+        },
+        {
+          "value": 180,
+          "label": "180 Days"
+        },
+        {
+          "value": 365,
+          "label": "365 Days (1 Year)"
+        },
+        {
+          "value": 730,
+          "label": "730 Days (2 Years)"
+        }
+      ],
+      "help": "How long a show stays in Next Up after it was last watched."
+    },
+    {
+      "key": "mergeRecentRowsByType",
+      "label": "Merge Recent Rows by Type",
+      "group": "Home Screen",
+      "section": "Row Options",
+      "type": "bool",
+      "help": "Combines recently added media from different libraries of the same type into unified rows."
+    },
+    {
+      "key": "recentlyReleasedSeriesType",
+      "label": "Recently Released Series Sort By",
+      "group": "Home Screen",
+      "section": "Row Options",
+      "type": "enum",
+      "options": [
+        {
+          "value": "series",
+          "label": "Series"
+        },
+        {
+          "value": "season",
+          "label": "Season"
+        },
+        {
+          "value": "episode",
+          "label": "Episode"
+        }
+      ],
+      "help": "Sort Recently Released Series home rows by series, latest season, or latest episode air date. Toggle the switches for these home row categories to make them available in the home sections page by default."
+    },
+    {
+      "key": "displayAudioRows",
+      "label": "Audio Rows",
+      "group": "Home Screen",
+      "section": "Row Options",
+      "type": "bool"
+    },
+    {
+      "key": "audioRowsSortBy",
+      "label": "Audio Rows Sorting",
+      "group": "Home Screen",
+      "section": "Row Options",
+      "type": "enum",
+      "options": [
+        {
+          "value": "name",
+          "label": "Name"
+        },
+        {
+          "value": "dateAdded",
+          "label": "Date Added"
+        },
+        {
+          "value": "premiereDate",
+          "label": "Release Date"
+        },
+        {
+          "value": "runtime",
+          "label": "Runtime"
+        },
+        {
+          "value": "random",
+          "label": "Random"
+        }
+      ]
+    },
+    {
+      "key": "audioRowsSortOrder",
+      "label": "Audio Rows Sort Direction",
+      "group": "Home Screen",
+      "section": "Row Options",
+      "type": "enum",
+      "options": [
+        {
+          "value": "ascending",
+          "label": "Ascending"
+        },
+        {
+          "value": "descending",
+          "label": "Descending"
+        }
+      ]
+    },
+    {
+      "key": "displayCollectionsRows",
+      "label": "Collections Rows",
+      "group": "Home Screen",
+      "section": "Row Options",
+      "type": "bool"
+    },
+    {
+      "key": "collectionsRowSortBy",
+      "label": "Collections Rows Sorting",
+      "group": "Home Screen",
+      "section": "Row Options",
+      "type": "enum",
+      "options": [
+        {
+          "value": "playlistOrder",
+          "label": "Playlist Order"
+        },
+        {
+          "value": "name",
+          "label": "Name"
+        },
+        {
+          "value": "dateAdded",
+          "label": "Date Added"
+        },
+        {
+          "value": "dateEpisodeAdded",
+          "label": "Date Episode Added"
+        },
+        {
+          "value": "premiereDate",
+          "label": "Release Date"
+        },
+        {
+          "value": "rating",
+          "label": "Rating"
+        },
+        {
+          "value": "runtime",
+          "label": "Runtime"
+        },
+        {
+          "value": "random",
+          "label": "Random"
+        },
+        {
+          "value": "criticRating",
+          "label": "Critic Rating"
+        },
+        {
+          "value": "communityRating",
+          "label": "Community Rating"
+        },
+        {
+          "value": "myRating",
+          "label": "My Rating"
+        },
+        {
+          "value": "datePlayed",
+          "label": "Last Played"
+        },
+        {
+          "value": "playCount",
+          "label": "Play Count"
+        },
+        {
+          "value": "albumArtist",
+          "label": "Album Artist"
+        },
+        {
+          "value": "album",
+          "label": "Album"
+        },
+        {
+          "value": "artist",
+          "label": "Artist"
+        },
+        {
+          "value": "trackNumber",
+          "label": "Number"
+        },
+        {
+          "value": "genre",
+          "label": "Genre"
+        },
+        {
+          "value": "foldersFirst",
+          "label": "Folders First"
+        }
+      ]
+    },
+    {
+      "key": "collectionsRowSortOrder",
+      "label": "Collections Rows Sort Direction",
+      "group": "Home Screen",
+      "section": "Row Options",
+      "type": "enum",
+      "options": [
+        {
+          "value": "ascending",
+          "label": "Ascending"
+        },
+        {
+          "value": "descending",
+          "label": "Descending"
+        }
+      ]
+    },
+    {
+      "key": "collectionsRowShowEpisodes",
+      "label": "Collections Rows Show Episodes",
+      "group": "Home Screen",
+      "section": "Row Options",
+      "type": "bool"
+    },
+    {
+      "key": "displayFavoritesRows",
+      "label": "Favorites Rows",
+      "group": "Home Screen",
+      "section": "Row Options",
+      "type": "bool"
+    },
+    {
+      "key": "favoritesRowSortBy",
+      "label": "Favorites Rows Sorting",
+      "group": "Home Screen",
+      "section": "Row Options",
+      "type": "enum",
+      "options": [
+        {
+          "value": "name",
+          "label": "Name"
+        },
+        {
+          "value": "dateAdded",
+          "label": "Date Added"
+        },
+        {
+          "value": "dateEpisodeAdded",
+          "label": "Date Episode Added"
+        },
+        {
+          "value": "premiereDate",
+          "label": "Release Date"
+        },
+        {
+          "value": "rating",
+          "label": "Rating"
+        },
+        {
+          "value": "runtime",
+          "label": "Runtime"
+        },
+        {
+          "value": "random",
+          "label": "Random"
+        },
+        {
+          "value": "criticRating",
+          "label": "Critic Rating"
+        },
+        {
+          "value": "communityRating",
+          "label": "Community Rating"
+        },
+        {
+          "value": "datePlayed",
+          "label": "Last Played"
+        },
+        {
+          "value": "playCount",
+          "label": "Play Count"
+        },
+        {
+          "value": "albumArtist",
+          "label": "Album Artist"
+        },
+        {
+          "value": "album",
+          "label": "Album"
+        },
+        {
+          "value": "artist",
+          "label": "Artist"
+        },
+        {
+          "value": "trackNumber",
+          "label": "Number"
+        },
+        {
+          "value": "genre",
+          "label": "Genre"
+        },
+        {
+          "value": "foldersFirst",
+          "label": "Folders First"
+        }
+      ]
+    },
+    {
+      "key": "favoritesRowSortOrder",
+      "label": "Favorites Rows Sort Direction",
+      "group": "Home Screen",
+      "section": "Row Options",
+      "type": "enum",
+      "options": [
+        {
+          "value": "ascending",
+          "label": "Ascending"
+        },
+        {
+          "value": "descending",
+          "label": "Descending"
+        }
+      ]
+    },
+    {
+      "key": "displayGenresRows",
+      "label": "Genres Rows",
+      "group": "Home Screen",
+      "section": "Row Options",
+      "type": "bool"
+    },
+    {
+      "key": "genresRowSortBy",
+      "label": "Genres Rows Sorting",
+      "group": "Home Screen",
+      "section": "Row Options",
+      "type": "enum",
+      "options": [
+        {
+          "value": "name",
+          "label": "Name"
+        },
+        {
+          "value": "dateAdded",
+          "label": "Date Added"
+        },
+        {
+          "value": "dateEpisodeAdded",
+          "label": "Date Episode Added"
+        },
+        {
+          "value": "premiereDate",
+          "label": "Release Date"
+        },
+        {
+          "value": "rating",
+          "label": "Rating"
+        },
+        {
+          "value": "runtime",
+          "label": "Runtime"
+        },
+        {
+          "value": "random",
+          "label": "Random"
+        },
+        {
+          "value": "criticRating",
+          "label": "Critic Rating"
+        },
+        {
+          "value": "communityRating",
+          "label": "Community Rating"
+        },
+        {
+          "value": "datePlayed",
+          "label": "Last Played"
+        },
+        {
+          "value": "playCount",
+          "label": "Play Count"
+        },
+        {
+          "value": "albumArtist",
+          "label": "Album Artist"
+        },
+        {
+          "value": "album",
+          "label": "Album"
+        },
+        {
+          "value": "artist",
+          "label": "Artist"
+        },
+        {
+          "value": "trackNumber",
+          "label": "Number"
+        },
+        {
+          "value": "genre",
+          "label": "Genre"
+        },
+        {
+          "value": "foldersFirst",
+          "label": "Folders First"
+        }
+      ]
+    },
+    {
+      "key": "genresRowSortOrder",
+      "label": "Genres Rows Sort Direction",
+      "group": "Home Screen",
+      "section": "Row Options",
+      "type": "enum",
+      "options": [
+        {
+          "value": "ascending",
+          "label": "Ascending"
+        },
+        {
+          "value": "descending",
+          "label": "Descending"
+        }
+      ]
+    },
+    {
+      "key": "genresRowItemFilter",
+      "label": "Genres Rows Content",
+      "group": "Home Screen",
+      "section": "Row Options",
+      "type": "enum",
+      "options": [
+        {
+          "value": "both",
+          "label": "Movies and Series"
+        },
+        {
+          "value": "movies",
+          "label": "Movies"
+        },
+        {
+          "value": "series",
+          "label": "Series"
+        }
+      ]
+    },
+    {
+      "key": "displayPlaylistsRows",
+      "label": "Playlists Rows",
+      "group": "Home Screen",
+      "section": "Row Options",
+      "type": "bool"
+    },
+    {
+      "key": "playlistsRowSortBy",
+      "label": "Playlists Rows Sorting",
+      "group": "Home Screen",
+      "section": "Row Options",
+      "type": "enum",
+      "options": [
+        {
+          "value": "playlistOrder",
+          "label": "Playlist Order"
+        },
+        {
+          "value": "name",
+          "label": "Name"
+        },
+        {
+          "value": "dateAdded",
+          "label": "Date Added"
+        },
+        {
+          "value": "dateEpisodeAdded",
+          "label": "Date Episode Added"
+        },
+        {
+          "value": "premiereDate",
+          "label": "Release Date"
+        },
+        {
+          "value": "rating",
+          "label": "Rating"
+        },
+        {
+          "value": "runtime",
+          "label": "Runtime"
+        },
+        {
+          "value": "random",
+          "label": "Random"
+        },
+        {
+          "value": "criticRating",
+          "label": "Critic Rating"
+        },
+        {
+          "value": "communityRating",
+          "label": "Community Rating"
+        },
+        {
+          "value": "myRating",
+          "label": "My Rating"
+        },
+        {
+          "value": "datePlayed",
+          "label": "Last Played"
+        },
+        {
+          "value": "playCount",
+          "label": "Play Count"
+        },
+        {
+          "value": "albumArtist",
+          "label": "Album Artist"
+        },
+        {
+          "value": "album",
+          "label": "Album"
+        },
+        {
+          "value": "artist",
+          "label": "Artist"
+        },
+        {
+          "value": "trackNumber",
+          "label": "Number"
+        },
+        {
+          "value": "genre",
+          "label": "Genre"
+        },
+        {
+          "value": "foldersFirst",
+          "label": "Folders First"
+        }
+      ]
+    },
+    {
+      "key": "playlistsRowSortOrder",
+      "label": "Playlists Rows Sort Direction",
+      "group": "Home Screen",
+      "section": "Row Options",
+      "type": "enum",
+      "options": [
+        {
+          "value": "ascending",
+          "label": "Ascending"
+        },
+        {
+          "value": "descending",
+          "label": "Descending"
+        }
+      ]
+    },
+    {
+      "key": "playlistsRowShowEpisodes",
+      "label": "Playlists Rows Show Episodes",
+      "group": "Home Screen",
+      "section": "Row Options",
+      "type": "bool"
+    },
+    {
+      "key": "displayRewatchRow",
+      "label": "Rewatch Row",
+      "group": "Home Screen",
+      "section": "Row Options",
+      "type": "bool"
+    },
+    {
+      "key": "rewatchSortBy",
+      "label": "Rewatch Row Sorting",
+      "group": "Home Screen",
+      "section": "Row Options",
+      "type": "enum",
+      "options": [
+        {
+          "value": "recentlyWatched",
+          "label": "Recently Watched"
+        },
+        {
+          "value": "random",
+          "label": "Random"
+        }
+      ]
+    },
+    {
+      "key": "rewatchIncludeMovies",
+      "label": "Rewatch Row Includes Movies",
+      "group": "Home Screen",
+      "section": "Row Options",
+      "type": "bool"
+    },
+    {
+      "key": "rewatchIncludeShows",
+      "label": "Rewatch Row Includes Shows",
+      "group": "Home Screen",
+      "section": "Row Options",
+      "type": "bool"
+    },
+    {
+      "key": "rewatchIncludeCollections",
+      "label": "Rewatch Row Includes Collections",
+      "group": "Home Screen",
+      "section": "Row Options",
+      "type": "bool"
+    },
+    {
+      "key": "displaySinceYouWatchedRows",
+      "label": "Since You Watched Rows",
+      "group": "Home Screen",
+      "section": "Row Options",
+      "type": "bool"
+    },
+    {
+      "key": "sinceYouWatchedSource",
+      "label": "Since You Watched Source",
+      "group": "Home Screen",
+      "section": "Row Options",
+      "type": "enum",
+      "options": [
+        {
+          "value": "local",
+          "label": "Local"
+        },
+        {
+          "value": "online",
+          "label": "Online"
+        }
+      ]
+    },
+    {
+      "key": "sinceYouWatchedSourceType",
+      "label": "Since You Watched Content",
+      "group": "Home Screen",
+      "section": "Row Options",
+      "type": "enum",
+      "options": [
+        {
+          "value": "both",
+          "label": "Movies and Shows"
+        },
+        {
+          "value": "movies",
+          "label": "Movies"
+        },
+        {
+          "value": "shows",
+          "label": "Shows"
+        }
+      ]
+    },
+    {
+      "key": "sinceYouWatchedSourceItem",
+      "label": "Since You Watched Based On",
+      "group": "Home Screen",
+      "section": "Row Options",
+      "type": "enum",
+      "options": [
+        {
+          "value": "recentlyWatched",
+          "label": "Recently Watched"
+        },
+        {
+          "value": "favorites",
+          "label": "Favorites"
+        },
+        {
+          "value": "random",
+          "label": "Random"
+        }
+      ]
+    },
+    {
+      "key": "sinceYouWatchedIncludeWatched",
+      "label": "Since You Watched Includes Watched Items",
+      "group": "Home Screen",
+      "section": "Row Options",
+      "type": "bool"
+    },
+    {
+      "key": "sinceYouWatched1Enabled",
+      "label": "Since You Watched Row 1",
+      "group": "Home Screen",
+      "section": "Row Options",
+      "type": "bool"
+    },
+    {
+      "key": "sinceYouWatched2Enabled",
+      "label": "Since You Watched Row 2",
+      "group": "Home Screen",
+      "section": "Row Options",
+      "type": "bool"
+    },
+    {
+      "key": "sinceYouWatched3Enabled",
+      "label": "Since You Watched Row 3",
+      "group": "Home Screen",
+      "section": "Row Options",
+      "type": "bool"
+    },
+    {
+      "key": "sinceYouWatched4Enabled",
+      "label": "Since You Watched Row 4",
+      "group": "Home Screen",
+      "section": "Row Options",
+      "type": "bool"
+    },
+    {
+      "key": "sinceYouWatched5Enabled",
+      "label": "Since You Watched Row 5",
+      "group": "Home Screen",
+      "section": "Row Options",
+      "type": "bool"
+    },
+    {
+      "key": "displayStudiosRows",
+      "label": "Studios Rows",
+      "group": "Home Screen",
+      "section": "Row Options",
+      "type": "bool"
+    },
+    {
+      "key": "studiosRowSortBy",
+      "label": "Studios Rows Sorting",
+      "group": "Home Screen",
+      "section": "Row Options",
+      "type": "enum",
+      "options": [
+        {
+          "value": "name",
+          "label": "Name"
+        },
+        {
+          "value": "dateAdded",
+          "label": "Date Added"
+        },
+        {
+          "value": "dateEpisodeAdded",
+          "label": "Date Episode Added"
+        },
+        {
+          "value": "premiereDate",
+          "label": "Release Date"
+        },
+        {
+          "value": "rating",
+          "label": "Rating"
+        },
+        {
+          "value": "runtime",
+          "label": "Runtime"
+        },
+        {
+          "value": "random",
+          "label": "Random"
+        },
+        {
+          "value": "criticRating",
+          "label": "Critic Rating"
+        },
+        {
+          "value": "communityRating",
+          "label": "Community Rating"
+        },
+        {
+          "value": "datePlayed",
+          "label": "Last Played"
+        },
+        {
+          "value": "playCount",
+          "label": "Play Count"
+        },
+        {
+          "value": "albumArtist",
+          "label": "Album Artist"
+        },
+        {
+          "value": "album",
+          "label": "Album"
+        },
+        {
+          "value": "artist",
+          "label": "Artist"
+        },
+        {
+          "value": "trackNumber",
+          "label": "Number"
+        },
+        {
+          "value": "genre",
+          "label": "Genre"
+        },
+        {
+          "value": "foldersFirst",
+          "label": "Folders First"
+        }
+      ]
+    },
+    {
+      "key": "studiosRowSortOrder",
+      "label": "Studios Rows Sort Direction",
+      "group": "Home Screen",
+      "section": "Row Options",
+      "type": "enum",
+      "options": [
+        {
+          "value": "ascending",
+          "label": "Ascending"
+        },
+        {
+          "value": "descending",
+          "label": "Descending"
+        }
+      ]
+    },
+    {
+      "key": "mediaBarMode",
+      "label": "Media Bar Style",
+      "group": "Home Screen",
+      "section": "Media Bar",
+      "type": "enum",
+      "options": [
+        {
+          "value": "moonfin",
+          "label": "Moonfin"
+        },
+        {
+          "value": "makd",
+          "label": "MakD"
+        },
+        {
+          "value": "bookshelf",
+          "label": "Bookshelf"
+        },
+        {
+          "value": "gallery",
+          "label": "Gallery"
+        },
+        {
+          "value": "banner",
+          "label": "Banner"
+        },
+        {
+          "value": "aya",
+          "label": "Aya"
+        },
+        {
+          "value": "off",
+          "label": "Off"
+        }
+      ]
+    },
+    {
+      "key": "mediaBarContentType",
+      "label": "Content Type",
+      "group": "Home Screen",
+      "section": "Media Bar",
+      "type": "enum",
+      "options": [
+        {
+          "value": "both",
+          "label": "Movies and TV Shows"
+        },
+        {
+          "value": "movies",
+          "label": "Movies Only"
+        },
+        {
+          "value": "tvshows",
+          "label": "TV Shows Only"
+        }
+      ]
+    },
+    {
+      "key": "mediaBarItemCount",
+      "label": "Item Count",
+      "group": "Home Screen",
+      "section": "Media Bar",
+      "type": "enum",
+      "options": [
+        {
+          "value": 5,
+          "label": "5"
+        },
+        {
+          "value": 10,
+          "label": "10"
+        },
+        {
+          "value": 15,
+          "label": "15"
+        },
+        {
+          "value": 20,
+          "label": "20"
+        },
+        {
+          "value": 25,
+          "label": "25"
+        },
+        {
+          "value": 30,
+          "label": "30"
+        }
+      ]
+    },
+    {
+      "key": "mediaBarSourceType",
+      "label": "Media Bar Source",
+      "group": "Home Screen",
+      "section": "Media Bar",
+      "type": "enum",
+      "options": [
+        {
+          "value": "library",
+          "label": "Library (Random)"
+        },
+        {
+          "value": "collection",
+          "label": "Collections / Playlists"
+        }
+      ]
+    },
+    {
+      "key": "mediaBarAutoAdvance",
+      "label": "Auto Advance",
+      "group": "Home Screen",
+      "section": "Media Bar",
+      "type": "bool"
+    },
+    {
+      "key": "mediaBarIntervalMs",
+      "label": "Auto Advance Interval",
+      "group": "Home Screen",
+      "section": "Media Bar",
+      "type": "enum",
+      "options": [
+        {
+          "value": 5000,
+          "label": "5 Seconds"
+        },
+        {
+          "value": 10000,
+          "label": "10 Seconds"
+        },
+        {
+          "value": 15000,
+          "label": "15 Seconds"
+        },
+        {
+          "value": 30000,
+          "label": "30 Seconds"
+        }
+      ]
+    },
+    {
+      "key": "mediaBarOpacity",
+      "label": "Media Bar Overlay Opacity",
+      "group": "Home Screen",
+      "section": "Media Bar",
+      "type": "number",
+      "min": 0,
+      "max": 100,
+      "step": 5,
+      "default": 100
+    },
+    {
+      "key": "mediaBarOverlayColor",
+      "label": "Media Bar Overlay Color",
+      "group": "Home Screen",
+      "section": "Media Bar",
+      "type": "enum",
+      "options": [
+        {
+          "value": "black",
+          "label": "Black"
+        },
+        {
+          "value": "gray",
+          "label": "Gray"
+        },
+        {
+          "value": "darkBlue",
+          "label": "Dark Blue"
+        },
+        {
+          "value": "purple",
+          "label": "Purple"
+        },
+        {
+          "value": "teal",
+          "label": "Teal"
+        },
+        {
+          "value": "navy",
+          "label": "Navy"
+        },
+        {
+          "value": "charcoal",
+          "label": "Charcoal"
+        },
+        {
+          "value": "brown",
+          "label": "Brown"
+        },
+        {
+          "value": "darkRed",
+          "label": "Dark Red"
+        },
+        {
+          "value": "darkGreen",
+          "label": "Dark Green"
+        },
+        {
+          "value": "slate",
+          "label": "Slate"
+        },
+        {
+          "value": "indigo",
+          "label": "Indigo"
+        },
+        {
+          "value": "moonfinCyan",
+          "label": "Moonfin Cyan"
+        },
+        {
+          "value": "neonPulseMagenta",
+          "label": "Neon Pulse Magenta"
+        }
+      ]
+    },
+    {
+      "key": "mediaBarTrailerPreview",
+      "label": "Trailer Preview",
+      "group": "Home Screen",
+      "section": "Media Bar",
+      "type": "bool"
+    },
+    {
+      "key": "mediaBarTrailerAudio",
+      "label": "Trailer Audio",
+      "group": "Home Screen",
+      "section": "Media Bar",
+      "type": "bool"
+    },
+    {
+      "key": "mediaBarTrailerCaptions",
+      "label": "Trailer Captions",
+      "group": "Home Screen",
+      "section": "Media Bar",
+      "type": "bool",
+      "help": "Show closed captions on YouTube trailers when available."
+    },
+    {
+      "key": "mediaBarLibraryIds",
+      "label": "Media Bar Libraries",
+      "group": "Home Screen",
+      "section": "Media Bar",
+      "type": "list",
+      "help": "Library IDs, used when the Media Bar Source is \"library\"."
+    },
+    {
+      "key": "mediaBarCollectionIds",
+      "label": "Media Bar Collections",
+      "group": "Home Screen",
+      "section": "Media Bar",
+      "type": "list",
+      "help": "Collection IDs, used when the Media Bar Source is \"collection\"."
+    },
+    {
+      "key": "mediaBarExcludedGenres",
+      "label": "Media Bar Excluded Genres",
+      "group": "Home Screen",
+      "section": "Media Bar",
+      "type": "list",
+      "help": "Genres the media bar never shows."
+    },
+    {
+      "key": "homeRowsStyle",
+      "label": "Row Type",
+      "group": "Home Screen",
+      "section": "Looks",
+      "type": "enum",
+      "options": [
+        {
+          "value": "v1",
+          "label": "Classic"
+        },
+        {
+          "value": "v2",
+          "label": "Modern"
+        }
+      ]
+    },
+    {
+      "key": "modernCardsOnMyMediaRow",
+      "label": "Modern cards on My Media row",
+      "group": "Home Screen",
+      "section": "Looks",
+      "type": "bool",
+      "help": "Display customizable posters that expand on focus. Disable to always show landscape thumbnail."
+    },
+    {
+      "key": "classicHomeRowsPadding",
+      "label": "Home Row Padding (Classic)",
+      "group": "Home Screen",
+      "section": "Looks",
+      "type": "number",
+      "min": 10,
+      "max": 130,
+      "step": 5,
+      "default": 10
+    },
+    {
+      "key": "modernHomeRowsPadding",
+      "label": "Home Row Padding (Modern)",
+      "group": "Home Screen",
+      "section": "Looks",
+      "type": "number",
+      "min": 360,
+      "max": 560,
+      "step": 10,
+      "default": 360
+    },
+    {
+      "key": "fullScreenRows",
+      "label": "Expanded Home Rows",
+      "group": "Home Screen",
+      "section": "Looks",
+      "type": "bool"
+    },
+    {
+      "key": "posterSize",
+      "label": "Home Row Card Display Size",
+      "group": "Home Screen",
+      "section": "Looks",
+      "type": "enum",
+      "options": [
+        {
+          "value": "small",
+          "label": "Small"
+        },
+        {
+          "value": "medium",
+          "label": "Medium"
+        },
+        {
+          "value": "large",
+          "label": "Large"
+        },
+        {
+          "value": "extraLarge",
+          "label": "Extra Large"
+        },
+        {
+          "value": "grandparents",
+          "label": "Grandparents"
+        }
+      ]
+    },
+    {
+      "key": "homeImageTypeContinueWatching",
+      "label": "Continue Watching Image Type",
+      "group": "Home Screen",
+      "section": "Looks",
+      "type": "enum",
+      "options": [
+        {
+          "value": "Poster",
+          "label": "Poster"
+        },
+        {
+          "value": "Thumb",
+          "label": "Thumbnail"
+        },
+        {
+          "value": "Banner",
+          "label": "Banner"
+        }
+      ]
+    },
+    {
+      "key": "homeRowsImageTypeOverride",
+      "label": "Override Row Image Type",
+      "group": "Home Screen",
+      "section": "Looks",
+      "type": "bool",
+      "help": "Use one image type for every home row instead of each row choosing its own."
+    },
+    {
+      "key": "homeRowsImageType",
+      "label": "Row Image Type",
+      "group": "Home Screen",
+      "section": "Looks",
+      "type": "enum",
+      "options": [
+        {
+          "value": "poster",
+          "label": "Poster"
+        },
+        {
+          "value": "thumb",
+          "label": "Thumbnail"
+        },
+        {
+          "value": "banner",
+          "label": "Banner"
+        }
+      ],
+      "help": "The artwork each home row uses with the Classic row type. Only applies while Override Row Image Type is off. Continue Watching has its own setting above. A row left unset is up to the user."
+    },
+    {
+      "key": "homeImageUseSeriesImage",
+      "label": "Display Series Thumbnails",
+      "group": "Home Screen",
+      "section": "Per-Row Image Types",
+      "type": "bool"
+    },
+    {
+      "key": "homeRowInfoOverlay",
+      "label": "Home Row Info Overlay",
+      "group": "Home Screen",
+      "section": "Per-Row Image Types",
+      "type": "bool"
+    },
+    {
+      "key": "hideHomeMediaDescription",
+      "label": "Hide Descriptions on Home",
+      "group": "Home Screen",
+      "section": "Per-Row Image Types",
+      "type": "bool"
+    },
+    {
+      "key": "episodePreviewEnabled",
+      "label": "Media Preview",
+      "group": "Home Screen",
+      "section": "Per-Row Image Types",
+      "type": "bool"
+    },
+    {
+      "key": "previewAudioEnabled",
+      "label": "Preview Audio",
+      "group": "Home Screen",
+      "section": "Per-Row Image Types",
+      "type": "bool",
+      "help": "Chart rows the home sections page can offer. IMDb rows need IMDb Charts enabled above, TMDB rows need a TMDB API key."
+    },
+    {
+      "key": "homeRowImageTypes",
+      "label": "Per-Row Image Types",
+      "group": "Home Screen",
+      "section": "Per-Row Image Types",
+      "type": "string",
+      "help": "Comma-separated row:type pairs, for example \"nextup:thumb,latestmedia:poster\". Types: poster, thumb, banner. Only applies while Override Row Image Type is off."
+    },
+    {
+      "key": "seasonalRowEnabled",
+      "label": "Seasonal Row",
+      "group": "Home Screen",
+      "section": "External Sources",
+      "type": "bool",
+      "help": "A Home row of holiday movies from the library, with Seerr suggestions when the user is signed in to Seerr. Suggestions and the parental filtering of outside titles need the server-wide TMDB API key."
+    },
+    {
+      "key": "seasonalRowCountry",
+      "label": "Seasonal Row Country",
+      "group": "Home Screen",
+      "section": "External Sources",
+      "type": "enum",
+      "options": [
+        {
+          "value": "auto",
+          "label": "Automatic"
+        },
+        {
+          "value": "US",
+          "label": "United States"
+        },
+        {
+          "value": "CA",
+          "label": "Canada"
+        },
+        {
+          "value": "other",
+          "label": "Other"
+        }
+      ]
+    },
+    {
+      "key": "mediaTypeBadgeBehavior",
+      "label": "Media Type Badges",
+      "group": "Home Screen",
+      "section": "External Sources",
+      "type": "enum",
+      "options": [
+        {
+          "value": "always",
+          "label": "Always"
+        },
+        {
+          "value": "mixedRowsOnly",
+          "label": "Mixed Rows Only"
+        },
+        {
+          "value": "never",
+          "label": "Never"
+        }
+      ]
+    },
+    {
+      "key": "homeRowOrder",
+      "label": "Home Row Order",
+      "group": "Home Screen",
+      "section": "Rows",
+      "type": "list",
+      "suggestions": [
+        {
+          "value": "smalllibrarytiles",
+          "label": "My Media"
+        },
+        {
+          "value": "resume",
+          "label": "Continue Watching"
+        },
+        {
+          "value": "nextup",
+          "label": "Next Up"
+        },
+        {
+          "value": "latestmedia",
+          "label": "Recently Added Media"
+        },
+        {
+          "value": "recentlyreleased",
+          "label": "Recently Released"
+        },
+        {
+          "value": "livetv",
+          "label": "Live TV"
+        },
+        {
+          "value": "onnow",
+          "label": "On Now"
+        },
+        {
+          "value": "librarybuttons",
+          "label": "Library Buttons"
+        },
+        {
+          "value": "resumeaudio",
+          "label": "Resume Audio"
+        },
+        {
+          "value": "resumebook",
+          "label": "Resume Books"
+        },
+        {
+          "value": "activerecordings",
+          "label": "Active Recordings"
+        },
+        {
+          "value": "collections",
+          "label": "Collections"
+        },
+        {
+          "value": "favoritemovies",
+          "label": "Favorite Movies"
+        },
+        {
+          "value": "favoriteseries",
+          "label": "Favorite Series"
+        },
+        {
+          "value": "favoriteepisodes",
+          "label": "Favorite Episodes"
+        },
+        {
+          "value": "favoritepeople",
+          "label": "Favorite People"
+        },
+        {
+          "value": "favoriteartists",
+          "label": "Favorite Artists"
+        },
+        {
+          "value": "favoritemusicvideos",
+          "label": "Favorite Music Videos"
+        },
+        {
+          "value": "favoritealbums",
+          "label": "Favorite Albums"
+        },
+        {
+          "value": "favoritesongs",
+          "label": "Favorite Songs"
+        },
+        {
+          "value": "genres",
+          "label": "Genres"
+        },
+        {
+          "value": "playlists",
+          "label": "Playlists"
+        },
+        {
+          "value": "sinceyouwatched1",
+          "label": "Since You Watched 1"
+        },
+        {
+          "value": "sinceyouwatched2",
+          "label": "Since You Watched 2"
+        },
+        {
+          "value": "sinceyouwatched3",
+          "label": "Since You Watched 3"
+        },
+        {
+          "value": "sinceyouwatched4",
+          "label": "Since You Watched 4"
+        },
+        {
+          "value": "sinceyouwatched5",
+          "label": "Since You Watched 5"
+        },
+        {
+          "value": "rewatch",
+          "label": "Rewatch"
+        },
+        {
+          "value": "radarr_calendar",
+          "label": "Radarr Upcoming"
+        },
+        {
+          "value": "sonarr_calendar",
+          "label": "Sonarr Upcoming"
+        }
+      ],
+      "help": "Row ids in display order. Must be set together with Home Sections (a pair)."
+    },
+    {
+      "key": "homeSections",
+      "label": "Home Sections",
+      "group": "Home Screen",
+      "section": "Rows",
+      "type": "json",
+      "help": "Full home layout objects. Must be set together with Home Row Order (a pair). Build it in a Moonfin client and copy the value, or leave unset."
+    },
+    {
+      "key": "enableMultiServerLibraries",
+      "label": "Enable Multi-Server Libraries",
+      "group": "Libraries",
+      "section": "Libraries",
+      "type": "bool"
+    },
+    {
+      "key": "libraryStyle",
+      "label": "Video library style",
+      "group": "Libraries",
+      "section": "Library Pages",
+      "type": "enum",
+      "options": [
+        {
+          "value": "classic",
+          "label": "Classic"
+        },
+        {
+          "value": "modern",
+          "label": "Modern"
+        },
+        {
+          "value": "docked",
+          "label": "Docked"
+        }
+      ],
+      "help": "Default layout for the controls at the top of library pages. Keep Not set to let users choose."
+    },
+    {
+      "key": "bookLibraryStyle",
+      "label": "Book library style",
+      "group": "Libraries",
+      "section": "Library Pages",
+      "type": "enum",
+      "options": [
+        {
+          "value": "classic",
+          "label": "Classic"
+        },
+        {
+          "value": "readingRoom",
+          "label": "Reading Room"
+        },
+        {
+          "value": "bookstore",
+          "label": "Bookstore"
+        }
+      ],
+      "help": "Default layout for book and audiobook libraries. Keep Not set to let users choose."
+    },
+    {
+      "key": "musicLibraryStyle",
+      "label": "Music library style",
+      "group": "Libraries",
+      "section": "Library Pages",
+      "type": "enum",
+      "options": [
+        {
+          "value": "classic",
+          "label": "Classic"
+        },
+        {
+          "value": "quickAccess",
+          "label": "Quick Access"
+        },
+        {
+          "value": "immersive",
+          "label": "Immersive"
+        }
+      ],
+      "help": "Default layout for music libraries. Keep Not set to let users choose."
+    },
+    {
+      "key": "groupItemsIntoCollections",
+      "label": "Group Items into Collections",
+      "group": "Libraries",
+      "section": "Library Pages",
+      "type": "bool"
+    },
+    {
+      "key": "showMediaDetailsOnLibraryPage",
+      "label": "Show Media Details",
+      "group": "Libraries",
+      "section": "Library Pages",
+      "type": "bool"
+    },
+    {
+      "key": "useDetailedSubHeadings",
+      "label": "Use Detailed Subheadings",
+      "group": "Libraries",
+      "section": "Library Pages",
+      "type": "bool"
+    },
+    {
+      "key": "hideBackdropsInLibraries",
+      "label": "Hide Backdrops in Libraries",
+      "group": "Libraries",
+      "section": "Library Pages",
+      "type": "bool"
+    },
+    {
+      "key": "libraryPosterSize",
+      "label": "Library Card Size",
+      "group": "Libraries",
+      "section": "Library Pages",
+      "type": "enum",
+      "options": [
+        {
+          "value": "small",
+          "label": "Small"
+        },
+        {
+          "value": "medium",
+          "label": "Medium"
+        },
+        {
+          "value": "large",
+          "label": "Large"
+        },
+        {
+          "value": "extraLarge",
+          "label": "Extra Large"
+        }
+      ]
+    },
+    {
+      "key": "playlistPosterSize",
+      "label": "Playlist Card Size",
+      "group": "Libraries",
+      "section": "Library Pages",
+      "type": "enum",
+      "options": [
+        {
+          "value": "small",
+          "label": "Small"
+        },
+        {
+          "value": "medium",
+          "label": "Medium"
+        },
+        {
+          "value": "large",
+          "label": "Large"
+        },
+        {
+          "value": "extraLarge",
+          "label": "Extra Large"
+        }
+      ]
+    },
+    {
+      "key": "favoritesViewStyle",
+      "label": "Favorites View",
+      "group": "Libraries",
+      "section": "Library Pages",
+      "type": "enum",
+      "options": [
+        {
+          "value": "home",
+          "label": "Home Rows"
+        },
+        {
+          "value": "library",
+          "label": "Library Grid"
+        }
+      ]
+    },
+    {
+      "key": "allGenresImageType",
+      "label": "Genres Page Image Type",
+      "group": "Libraries",
+      "section": "Library Pages",
+      "type": "enum",
+      "options": [
+        {
+          "value": "poster",
+          "label": "Poster"
+        },
+        {
+          "value": "thumb",
+          "label": "Thumbnail"
+        },
+        {
+          "value": "banner",
+          "label": "Banner"
+        }
+      ]
+    },
+    {
+      "key": "displayAudioLatest",
+      "label": "Latest Row",
+      "group": "Libraries",
+      "section": "Music Library",
+      "type": "bool"
+    },
+    {
+      "key": "displayAudioLastPlayed",
+      "label": "Recently Played Row",
+      "group": "Libraries",
+      "section": "Music Library",
+      "type": "bool"
+    },
+    {
+      "key": "displayAudioFavorites",
+      "label": "Favorites Row",
+      "group": "Libraries",
+      "section": "Music Library",
+      "type": "bool"
+    },
+    {
+      "key": "displayAudioPlaylists",
+      "label": "Playlists Row",
+      "group": "Libraries",
+      "section": "Music Library",
+      "type": "bool"
+    },
+    {
+      "key": "displayAudioAlbumArtists",
+      "label": "Album Artists Row",
+      "group": "Libraries",
+      "section": "Music Library",
+      "type": "bool"
+    },
+    {
+      "key": "displayAudioArtists",
+      "label": "Artists Row",
+      "group": "Libraries",
+      "section": "Music Library",
+      "type": "bool"
+    },
+    {
+      "key": "displayAudioAlbums",
+      "label": "Albums Row",
+      "group": "Libraries",
+      "section": "Music Library",
+      "type": "bool"
+    },
+    {
+      "key": "audioSortOption",
+      "label": "Music Sorting",
+      "group": "Libraries",
+      "section": "Music Library",
+      "type": "enum",
+      "options": [
+        {
+          "value": "name",
+          "label": "Name"
+        },
+        {
+          "value": "release_year",
+          "label": "Release Year"
+        },
+        {
+          "value": "date_added",
+          "label": "Date Added"
+        }
+      ]
+    },
+    {
+      "key": "liveTvChannelSortBy",
+      "label": "Channel Sorting",
+      "group": "Libraries",
+      "section": "Live TV",
+      "type": "enum",
+      "options": [
+        {
+          "value": "number",
+          "label": "Channel Number"
+        },
+        {
+          "value": "name",
+          "label": "Name"
+        },
+        {
+          "value": "favoritesFirst",
+          "label": "Favorites First"
+        }
+      ]
+    },
+    {
+      "key": "epgMobileView",
+      "label": "Guide View (mobile)",
+      "group": "Libraries",
+      "section": "Live TV",
+      "type": "enum",
+      "options": [
+        {
+          "value": "list",
+          "label": "List"
+        },
+        {
+          "value": "grid",
+          "label": "Grid"
+        }
+      ]
+    },
+    {
+      "key": "detailScreenStyle",
+      "label": "Detail screen style",
+      "group": "Details Page",
+      "section": "Layout",
+      "type": "enum",
+      "options": [
+        {
+          "value": "classic",
+          "label": "Classic"
+        },
+        {
+          "value": "modern",
+          "label": "Modern"
+        },
+        {
+          "value": "spotlight",
+          "label": "Spotlight"
+        },
+        {
+          "value": "nouveau",
+          "label": "Nouveau"
+        },
+        {
+          "value": "minimalist",
+          "label": "Minimalist"
+        }
+      ],
+      "help": "Default layout for item detail pages. Keep Not set to let users choose."
+    },
+    {
+      "key": "personalRatingStyle",
+      "label": "Personal Rating Style",
+      "group": "Details Page",
+      "section": "Layout",
+      "type": "enum",
+      "options": [
+        {
+          "value": "thumbs",
+          "label": "Thumbs"
+        },
+        {
+          "value": "stars",
+          "label": "Stars"
+        },
+        {
+          "value": "numeric",
+          "label": "Numeric"
+        }
+      ]
+    },
+    {
+      "key": "detailsScreenBlur",
+      "label": "Details Screen Blur",
+      "group": "Details Page",
+      "section": "Layout",
+      "type": "number",
+      "min": 0,
+      "max": 25,
+      "step": 1,
+      "default": 0,
+      "storeAs": "string"
+    },
+    {
+      "key": "detailExpandedTabs",
+      "label": "Expanded Tabs",
+      "group": "Details Page",
+      "section": "Content",
+      "type": "bool",
+      "help": "When on, detail screen tabs start expanded and moving focus between them reveals content without pressing select."
+    },
+    {
+      "key": "detailShowTechnicalDetails",
+      "label": "Show Technical Details",
+      "group": "Details Page",
+      "section": "Content",
+      "type": "bool"
+    },
+    {
+      "key": "detailTrailersExternal",
+      "label": "Open Trailers Externally",
+      "group": "Details Page",
+      "section": "Content",
+      "type": "bool",
+      "help": "Play trailers in the system browser or YouTube app instead of inside Moonfin."
+    },
+    {
+      "key": "hideDetailsMediaDescription",
+      "label": "Hide Description",
+      "group": "Details Page",
+      "section": "Content",
+      "type": "bool"
+    },
+    {
+      "key": "detailUseSeriesThumbnails",
+      "label": "Use Series Thumbnails for Episodes",
+      "group": "Details Page",
+      "section": "Content",
+      "type": "bool"
+    },
+    {
+      "key": "recommendationSystemSource",
+      "label": "Recommendation System",
+      "group": "Details Page",
+      "section": "Recommendations",
+      "type": "enum",
+      "options": [
+        {
+          "value": "local",
+          "label": "Moonfin"
+        },
+        {
+          "value": "online",
+          "label": "TMDB"
+        }
+      ],
+      "help": "Source used for recommended and similar media on detail pages."
+    },
+    {
+      "key": "mdblistEnabled",
+      "label": "MDBList Ratings",
+      "group": "Details Page",
+      "section": "Ratings",
+      "type": "bool",
+      "help": "Enable MDBList ratings by default (requires server-wide or user API key)."
+    },
+    {
+      "key": "tmdbEpisodeRatingsEnabled",
+      "label": "TMDB Episode Ratings",
+      "group": "Details Page",
+      "section": "Ratings",
+      "type": "bool",
+      "help": "Enable TMDB episode ratings by default (requires server-wide or user API key)."
+    },
+    {
+      "key": "mdblistShowRatingNames",
+      "label": "Show Rating Labels",
+      "group": "Details Page",
+      "section": "Ratings",
+      "type": "bool"
+    },
+    {
+      "key": "mdblistShowRatingBadges",
+      "label": "Show MDBList Rating Badges",
+      "group": "Details Page",
+      "section": "Ratings",
+      "type": "bool"
+    },
+    {
+      "key": "mdblistRatingSources",
+      "label": "Rating Sources",
+      "group": "Details Page",
+      "section": "Ratings",
+      "type": "list",
+      "suggestions": [
+        {
+          "value": "tomatoes",
+          "label": "Rotten Tomatoes"
+        },
+        {
+          "value": "tomatoes_audience",
+          "label": "RT Audience Score"
+        },
+        {
+          "value": "imdb",
+          "label": "IMDb"
+        },
+        {
+          "value": "tmdb",
+          "label": "TMDB"
+        },
+        {
+          "value": "metacritic",
+          "label": "Metacritic"
+        },
+        {
+          "value": "metacriticUser",
+          "label": "Metacritic User"
+        },
+        {
+          "value": "stars",
+          "label": "Stars"
+        },
+        {
+          "value": "trakt",
+          "label": "Trakt"
+        },
+        {
+          "value": "letterboxd",
+          "label": "Letterboxd"
+        },
+        {
+          "value": "myAnimeList",
+          "label": "MyAnimeList"
+        },
+        {
+          "value": "rogerEbert",
+          "label": "Roger Ebert"
+        }
+      ],
+      "help": "Which ratings to display, in order."
+    },
+    {
+      "key": "themeMusicEnabled",
+      "label": "Theme Music",
+      "group": "Details Page",
+      "section": "Theme Music",
+      "type": "bool"
+    },
+    {
+      "key": "themeMusicVolume",
+      "label": "Theme Music Volume",
+      "group": "Details Page",
+      "section": "Theme Music",
+      "type": "number",
+      "min": 0,
+      "max": 100,
+      "step": 5,
+      "default": 100
+    },
+    {
+      "key": "themeMusicOnHomeRows",
+      "label": "Play Theme Music on Home Rows",
+      "group": "Details Page",
+      "section": "Theme Music",
+      "type": "bool"
+    },
+    {
+      "key": "themeMusicLoop",
+      "label": "Loop Theme Music",
+      "group": "Details Page",
+      "section": "Theme Music",
+      "type": "bool"
+    },
+    {
+      "key": "personPageGroupItems",
+      "label": "Group Person Page by Type",
+      "group": "Details Page",
+      "section": "Person Pages",
+      "type": "bool"
+    },
+    {
+      "key": "personPageSortOption",
+      "label": "Person Page Sort",
+      "group": "Details Page",
+      "section": "Person Pages",
+      "type": "enum",
+      "options": [
+        {
+          "value": "alphabetical",
+          "label": "Alphabetical"
+        },
+        {
+          "value": "releaseDateDesc",
+          "label": "Newest First"
+        },
+        {
+          "value": "releaseDateAsc",
+          "label": "Oldest First"
+        }
+      ]
+    },
+    {
+      "key": "detailButtonOrderDesktop",
+      "label": "Action Buttons Order",
+      "group": "Details Page",
+      "section": "Action Buttons",
+      "type": "list",
+      "suggestions": [
+        {
+          "value": "shuffle",
+          "label": "Shuffle"
+        },
+        {
+          "value": "restart",
+          "label": "Restart"
+        },
+        {
+          "value": "audio",
+          "label": "Audio"
+        },
+        {
+          "value": "subtitles",
+          "label": "Subtitles"
+        },
+        {
+          "value": "version",
+          "label": "Version"
+        },
+        {
+          "value": "cast",
+          "label": "Cast"
+        },
+        {
+          "value": "trailer",
+          "label": "Trailer"
+        },
+        {
+          "value": "watchWithGroup",
+          "label": "Watch with group"
+        },
+        {
+          "value": "watched",
+          "label": "Watched"
+        },
+        {
+          "value": "favorite",
+          "label": "Favorite"
+        },
+        {
+          "value": "personalRating",
+          "label": "Rate"
+        },
+        {
+          "value": "playlist",
+          "label": "Playlist"
+        },
+        {
+          "value": "download",
+          "label": "Download"
+        },
+        {
+          "value": "deleteFiles",
+          "label": "Delete files"
+        },
+        {
+          "value": "goToSeries",
+          "label": "Go to series"
+        },
+        {
+          "value": "admin",
+          "label": "Admin"
+        }
+      ],
+      "alsoKeys": [
+        "detailButtonOrderTv",
+        "detailButtonOrderMobile"
+      ],
+      "help": "Buttons shown on detail pages, in order. Moonbase writes the same list for TV, mobile and desktop."
+    },
+    {
+      "key": "hiddenDetailButtonsDesktop",
+      "label": "Hidden Action Buttons",
+      "group": "Details Page",
+      "section": "Action Buttons",
+      "type": "list",
+      "suggestions": [
+        {
+          "value": "shuffle",
+          "label": "Shuffle"
+        },
+        {
+          "value": "restart",
+          "label": "Restart"
+        },
+        {
+          "value": "audio",
+          "label": "Audio"
+        },
+        {
+          "value": "subtitles",
+          "label": "Subtitles"
+        },
+        {
+          "value": "version",
+          "label": "Version"
+        },
+        {
+          "value": "cast",
+          "label": "Cast"
+        },
+        {
+          "value": "trailer",
+          "label": "Trailer"
+        },
+        {
+          "value": "watchWithGroup",
+          "label": "Watch with group"
+        },
+        {
+          "value": "watched",
+          "label": "Watched"
+        },
+        {
+          "value": "favorite",
+          "label": "Favorite"
+        },
+        {
+          "value": "personalRating",
+          "label": "Rate"
+        },
+        {
+          "value": "playlist",
+          "label": "Playlist"
+        },
+        {
+          "value": "download",
+          "label": "Download"
+        },
+        {
+          "value": "deleteFiles",
+          "label": "Delete files"
+        },
+        {
+          "value": "goToSeries",
+          "label": "Go to series"
+        },
+        {
+          "value": "admin",
+          "label": "Admin"
+        }
+      ],
+      "alsoKeys": [
+        "hiddenDetailButtonsTv",
+        "hiddenDetailButtonsMobile"
+      ],
+      "help": "Buttons hidden on detail pages (same list for all form factors)."
+    },
+    {
+      "key": "detailMetadataOrderDesktop",
+      "label": "Metadata Row Order",
+      "group": "Details Page",
+      "section": "Metadata Row",
+      "type": "list",
+      "suggestions": [
+        {
+          "value": "year",
+          "label": "Release Year"
+        },
+        {
+          "value": "parentalRating",
+          "label": "Parental Rating"
+        },
+        {
+          "value": "runtimeAndSeasons",
+          "label": "Runtime & Seasons"
+        },
+        {
+          "value": "status",
+          "label": "Series Status"
+        },
+        {
+          "value": "upcomingEpisodeDate",
+          "label": "Upcoming Episodes"
+        },
+        {
+          "value": "genres",
+          "label": "Genres"
+        }
+      ],
+      "alsoKeys": [
+        "detailMetadataOrderTv",
+        "detailMetadataOrderMobile"
+      ],
+      "help": "Metadata items shown on detail pages, in order (same list for all form factors)."
+    },
+    {
+      "key": "hiddenDetailMetadataDesktop",
+      "label": "Hidden Metadata Items",
+      "group": "Details Page",
+      "section": "Metadata Row",
+      "type": "list",
+      "suggestions": [
+        {
+          "value": "year",
+          "label": "Release Year"
+        },
+        {
+          "value": "parentalRating",
+          "label": "Parental Rating"
+        },
+        {
+          "value": "runtimeAndSeasons",
+          "label": "Runtime & Seasons"
+        },
+        {
+          "value": "status",
+          "label": "Series Status"
+        },
+        {
+          "value": "upcomingEpisodeDate",
+          "label": "Upcoming Episodes"
+        },
+        {
+          "value": "genres",
+          "label": "Genres"
+        }
+      ],
+      "alsoKeys": [
+        "hiddenDetailMetadataTv",
+        "hiddenDetailMetadataMobile"
+      ],
+      "help": "Metadata items hidden on detail pages (same list for all form factors)."
+    },
+    {
+      "key": "resumeSubtractDuration",
+      "label": "Resume Rewind",
+      "group": "Playback",
+      "section": "Player",
+      "type": "enum",
+      "options": [
+        {
+          "value": "0",
+          "label": "Disabled"
+        },
+        {
+          "value": "5",
+          "label": "5 seconds"
+        },
+        {
+          "value": "10",
+          "label": "10 seconds"
+        },
+        {
+          "value": "15",
+          "label": "15 seconds"
+        },
+        {
+          "value": "30",
+          "label": "30 seconds"
+        }
+      ],
+      "help": "Automatically rewinds slightly when resuming an in-progress video."
+    },
+    {
+      "key": "unpauseRewindDuration",
+      "label": "Unpause Rewind",
+      "group": "Playback",
+      "section": "Player",
+      "type": "enum",
+      "options": [
+        {
+          "value": 0,
+          "label": "Disabled"
+        },
+        {
+          "value": 5000,
+          "label": "5 seconds"
+        },
+        {
+          "value": 10000,
+          "label": "10 seconds"
+        },
+        {
+          "value": 15000,
+          "label": "15 seconds"
+        },
+        {
+          "value": 30000,
+          "label": "30 seconds"
+        }
+      ],
+      "help": "Rewinds slightly when unpausing playback."
+    },
+    {
+      "key": "skipBackLength",
+      "label": "Skip Back Length",
+      "group": "Playback",
+      "section": "Player",
+      "type": "enum",
+      "options": [
+        {
+          "value": 5000,
+          "label": "5 seconds"
+        },
+        {
+          "value": 10000,
+          "label": "10 seconds"
+        },
+        {
+          "value": 15000,
+          "label": "15 seconds"
+        },
+        {
+          "value": 30000,
+          "label": "30 seconds"
+        }
+      ]
+    },
+    {
+      "key": "skipForwardLength",
+      "label": "Skip Forward Length",
+      "group": "Playback",
+      "section": "Player",
+      "type": "enum",
+      "options": [
+        {
+          "value": 5000,
+          "label": "5 seconds"
+        },
+        {
+          "value": 10000,
+          "label": "10 seconds"
+        },
+        {
+          "value": 15000,
+          "label": "15 seconds"
+        },
+        {
+          "value": 30000,
+          "label": "30 seconds"
+        }
+      ]
+    },
+    {
+      "key": "fallbackAudioLanguage",
+      "label": "Fallback Audio Language",
+      "group": "Playback",
+      "section": "Audio",
+      "type": "enum",
+      "options": [
+        {
+          "value": "ara",
+          "label": "Arabic (ara)"
+        },
+        {
+          "value": "dan",
+          "label": "Danish (dan)"
+        },
+        {
+          "value": "deu",
+          "label": "German (deu)"
+        },
+        {
+          "value": "eng",
+          "label": "English (eng)"
+        },
+        {
+          "value": "fin",
+          "label": "Finnish (fin)"
+        },
+        {
+          "value": "fra",
+          "label": "French (fra)"
+        },
+        {
+          "value": "hin",
+          "label": "Hindi (hin)"
+        },
+        {
+          "value": "ita",
+          "label": "Italian (ita)"
+        },
+        {
+          "value": "jpn",
+          "label": "Japanese (jpn)"
+        },
+        {
+          "value": "kor",
+          "label": "Korean (kor)"
+        },
+        {
+          "value": "nld",
+          "label": "Dutch (nld)"
+        },
+        {
+          "value": "nor",
+          "label": "Norwegian (nor)"
+        },
+        {
+          "value": "pol",
+          "label": "Polish (pol)"
+        },
+        {
+          "value": "por",
+          "label": "Portuguese (por)"
+        },
+        {
+          "value": "rus",
+          "label": "Russian (rus)"
+        },
+        {
+          "value": "spa",
+          "label": "Spanish (spa)"
+        },
+        {
+          "value": "swe",
+          "label": "Swedish (swe)"
+        },
+        {
+          "value": "tha",
+          "label": "Thai (tha)"
+        },
+        {
+          "value": "tur",
+          "label": "Turkish (tur)"
+        },
+        {
+          "value": "zho",
+          "label": "Chinese (zho)"
+        },
+        {
+          "value": "afr",
+          "label": "Afrikaans (afr)"
+        },
+        {
+          "value": "aka",
+          "label": "Akan (aka)"
+        },
+        {
+          "value": "amh",
+          "label": "Amharic (amh)"
+        },
+        {
+          "value": "asm",
+          "label": "Assamese (asm)"
+        },
+        {
+          "value": "aze",
+          "label": "Azerbaijani (aze)"
+        },
+        {
+          "value": "bak",
+          "label": "Bashkir (bak)"
+        },
+        {
+          "value": "bel",
+          "label": "Belarusian (bel)"
+        },
+        {
+          "value": "bem",
+          "label": "Bemba (bem)"
+        },
+        {
+          "value": "ben",
+          "label": "Bengali (ben)"
+        },
+        {
+          "value": "bod",
+          "label": "Tibetan (bod)"
+        },
+        {
+          "value": "bos",
+          "label": "Bosnian (bos)"
+        },
+        {
+          "value": "bre",
+          "label": "Breton (bre)"
+        },
+        {
+          "value": "bul",
+          "label": "Bulgarian (bul)"
+        },
+        {
+          "value": "cat",
+          "label": "Catalan (cat)"
+        },
+        {
+          "value": "ces",
+          "label": "Czech (ces)"
+        },
+        {
+          "value": "cha",
+          "label": "Chamorro (cha)"
+        },
+        {
+          "value": "che",
+          "label": "Chechen (che)"
+        },
+        {
+          "value": "chv",
+          "label": "Chuvash (chv)"
+        },
+        {
+          "value": "cos",
+          "label": "Corsican (cos)"
+        },
+        {
+          "value": "cre",
+          "label": "Cree (cre)"
+        },
+        {
+          "value": "crh",
+          "label": "Crimean Tatar (crh)"
+        },
+        {
+          "value": "cym",
+          "label": "Welsh (cym)"
+        },
+        {
+          "value": "div",
+          "label": "Divehi (div)"
+        },
+        {
+          "value": "dzo",
+          "label": "Dzongkha (dzo)"
+        },
+        {
+          "value": "ell",
+          "label": "Greek (ell)"
+        },
+        {
+          "value": "est",
+          "label": "Estonian (est)"
+        },
+        {
+          "value": "eus",
+          "label": "Basque (eus)"
+        },
+        {
+          "value": "ewe",
+          "label": "Ewe (ewe)"
+        },
+        {
+          "value": "fao",
+          "label": "Faroese (fao)"
+        },
+        {
+          "value": "fas",
+          "label": "Persian (fas)"
+        },
+        {
+          "value": "fij",
+          "label": "Fijian (fij)"
+        },
+        {
+          "value": "fil",
+          "label": "Filipino (fil)"
+        },
+        {
+          "value": "frc",
+          "label": "French (Canada) (frc)"
+        },
+        {
+          "value": "ful",
+          "label": "Fulah (ful)"
+        },
+        {
+          "value": "gla",
+          "label": "Scottish Gaelic (gla)"
+        },
+        {
+          "value": "gle",
+          "label": "Irish (gle)"
+        },
+        {
+          "value": "glg",
+          "label": "Galician (glg)"
+        },
+        {
+          "value": "grn",
+          "label": "Guarani (grn)"
+        },
+        {
+          "value": "guj",
+          "label": "Gujarati (guj)"
+        },
+        {
+          "value": "hat",
+          "label": "Haitian Creole (hat)"
+        },
+        {
+          "value": "hau",
+          "label": "Hausa (hau)"
+        },
+        {
+          "value": "haw",
+          "label": "Hawaiian (haw)"
+        },
+        {
+          "value": "heb",
+          "label": "Hebrew (heb)"
+        },
+        {
+          "value": "hil",
+          "label": "Hiligaynon (hil)"
+        },
+        {
+          "value": "hmn",
+          "label": "Hmong (hmn)"
+        },
+        {
+          "value": "hrv",
+          "label": "Croatian (hrv)"
+        },
+        {
+          "value": "hun",
+          "label": "Hungarian (hun)"
+        },
+        {
+          "value": "hye",
+          "label": "Armenian (hye)"
+        },
+        {
+          "value": "ibo",
+          "label": "Igbo (ibo)"
+        },
+        {
+          "value": "iii",
+          "label": "Sichuan Yi (iii)"
+        },
+        {
+          "value": "iku",
+          "label": "Inuktitut (iku)"
+        },
+        {
+          "value": "ind",
+          "label": "Indonesian (ind)"
+        },
+        {
+          "value": "isl",
+          "label": "Icelandic (isl)"
+        },
+        {
+          "value": "jav",
+          "label": "Javanese (jav)"
+        },
+        {
+          "value": "kal",
+          "label": "Kalaallisut (kal)"
+        },
+        {
+          "value": "kan",
+          "label": "Kannada (kan)"
+        },
+        {
+          "value": "kas",
+          "label": "Kashmiri (kas)"
+        },
+        {
+          "value": "kat",
+          "label": "Georgian (kat)"
+        },
+        {
+          "value": "kau",
+          "label": "Kanuri (kau)"
+        },
+        {
+          "value": "kaz",
+          "label": "Kazakh (kaz)"
+        },
+        {
+          "value": "khm",
+          "label": "Khmer (khm)"
+        },
+        {
+          "value": "kik",
+          "label": "Kikuyu (kik)"
+        },
+        {
+          "value": "kin",
+          "label": "Kinyarwanda (kin)"
+        },
+        {
+          "value": "kir",
+          "label": "Kyrgyz (kir)"
+        },
+        {
+          "value": "kok",
+          "label": "Konkani (kok)"
+        },
+        {
+          "value": "kom",
+          "label": "Komi (kom)"
+        },
+        {
+          "value": "kon",
+          "label": "Kongo (kon)"
+        },
+        {
+          "value": "kua",
+          "label": "Kuanyama (kua)"
+        },
+        {
+          "value": "kur",
+          "label": "Kurdish (kur)"
+        },
+        {
+          "value": "lao",
+          "label": "Lao (lao)"
+        },
+        {
+          "value": "lat",
+          "label": "Latin (lat)"
+        },
+        {
+          "value": "lav",
+          "label": "Latvian (lav)"
+        },
+        {
+          "value": "lim",
+          "label": "Limburgish (lim)"
+        },
+        {
+          "value": "lin",
+          "label": "Lingala (lin)"
+        },
+        {
+          "value": "lit",
+          "label": "Lithuanian (lit)"
+        },
+        {
+          "value": "ltz",
+          "label": "Luxembourgish (ltz)"
+        },
+        {
+          "value": "lug",
+          "label": "Ganda (lug)"
+        },
+        {
+          "value": "luo",
+          "label": "Luo (luo)"
+        },
+        {
+          "value": "mal",
+          "label": "Malayalam (mal)"
+        },
+        {
+          "value": "mar",
+          "label": "Marathi (mar)"
+        },
+        {
+          "value": "mkd",
+          "label": "Macedonian (mkd)"
+        },
+        {
+          "value": "mlg",
+          "label": "Malagasy (mlg)"
+        },
+        {
+          "value": "mlt",
+          "label": "Maltese (mlt)"
+        },
+        {
+          "value": "mon",
+          "label": "Mongolian (mon)"
+        },
+        {
+          "value": "mri",
+          "label": "Maori (mri)"
+        },
+        {
+          "value": "msa",
+          "label": "Malay (msa)"
+        },
+        {
+          "value": "mya",
+          "label": "Burmese (mya)"
+        },
+        {
+          "value": "nav",
+          "label": "Navajo (nav)"
+        },
+        {
+          "value": "nbl",
+          "label": "South Ndebele (nbl)"
+        },
+        {
+          "value": "nde",
+          "label": "North Ndebele (nde)"
+        },
+        {
+          "value": "ndo",
+          "label": "Ndonga (ndo)"
+        },
+        {
+          "value": "nds",
+          "label": "Low German (nds)"
+        },
+        {
+          "value": "nep",
+          "label": "Nepali (nep)"
+        },
+        {
+          "value": "new",
+          "label": "Newari (new)"
+        },
+        {
+          "value": "nno",
+          "label": "Norwegian Nynorsk (nno)"
+        },
+        {
+          "value": "nob",
+          "label": "Norwegian Bokmål (nob)"
+        },
+        {
+          "value": "nya",
+          "label": "Chichewa (nya)"
+        },
+        {
+          "value": "oci",
+          "label": "Occitan (oci)"
+        },
+        {
+          "value": "oji",
+          "label": "Ojibwa (oji)"
+        },
+        {
+          "value": "ori",
+          "label": "Oriya (ori)"
+        },
+        {
+          "value": "orm",
+          "label": "Oromo (orm)"
+        },
+        {
+          "value": "oss",
+          "label": "Ossetian (oss)"
+        },
+        {
+          "value": "pan",
+          "label": "Punjabi (pan)"
+        },
+        {
+          "value": "pus",
+          "label": "Pashto (pus)"
+        },
+        {
+          "value": "que",
+          "label": "Quechua (que)"
+        },
+        {
+          "value": "roh",
+          "label": "Romansh (roh)"
+        },
+        {
+          "value": "ron",
+          "label": "Romanian (ron)"
+        },
+        {
+          "value": "run",
+          "label": "Rundi (run)"
+        },
+        {
+          "value": "san",
+          "label": "Sanskrit (san)"
+        },
+        {
+          "value": "sin",
+          "label": "Sinhala (sin)"
+        },
+        {
+          "value": "slk",
+          "label": "Slovak (slk)"
+        },
+        {
+          "value": "slv",
+          "label": "Slovenian (slv)"
+        },
+        {
+          "value": "sme",
+          "label": "Northern Sami (sme)"
+        },
+        {
+          "value": "sna",
+          "label": "Shona (sna)"
+        },
+        {
+          "value": "snd",
+          "label": "Sindhi (snd)"
+        },
+        {
+          "value": "som",
+          "label": "Somali (som)"
+        },
+        {
+          "value": "sot",
+          "label": "Southern Sotho (sot)"
+        },
+        {
+          "value": "sqi",
+          "label": "Albanian (sqi)"
+        },
+        {
+          "value": "srd",
+          "label": "Sardinian (srd)"
+        },
+        {
+          "value": "srp",
+          "label": "Serbian (srp)"
+        },
+        {
+          "value": "ssw",
+          "label": "Swati (ssw)"
+        },
+        {
+          "value": "sun",
+          "label": "Sundanese (sun)"
+        },
+        {
+          "value": "swa",
+          "label": "Swahili (swa)"
+        },
+        {
+          "value": "syr",
+          "label": "Syriac (syr)"
+        },
+        {
+          "value": "tam",
+          "label": "Tamil (tam)"
+        },
+        {
+          "value": "tat",
+          "label": "Tatar (tat)"
+        },
+        {
+          "value": "tel",
+          "label": "Telugu (tel)"
+        },
+        {
+          "value": "tgk",
+          "label": "Tajik (tgk)"
+        },
+        {
+          "value": "tgl",
+          "label": "Tagalog (tgl)"
+        },
+        {
+          "value": "tir",
+          "label": "Tigrinya (tir)"
+        },
+        {
+          "value": "tsn",
+          "label": "Tswana (tsn)"
+        },
+        {
+          "value": "tso",
+          "label": "Tsonga (tso)"
+        },
+        {
+          "value": "tuk",
+          "label": "Turkmen (tuk)"
+        },
+        {
+          "value": "uig",
+          "label": "Uyghur (uig)"
+        },
+        {
+          "value": "ukr",
+          "label": "Ukrainian (ukr)"
+        },
+        {
+          "value": "urd",
+          "label": "Urdu (urd)"
+        },
+        {
+          "value": "uzb",
+          "label": "Uzbek (uzb)"
+        },
+        {
+          "value": "vie",
+          "label": "Vietnamese (vie)"
+        },
+        {
+          "value": "wol",
+          "label": "Wolof (wol)"
+        },
+        {
+          "value": "xho",
+          "label": "Xhosa (xho)"
+        },
+        {
+          "value": "yid",
+          "label": "Yiddish (yid)"
+        },
+        {
+          "value": "yor",
+          "label": "Yoruba (yor)"
+        },
+        {
+          "value": "zha",
+          "label": "Zhuang (zha)"
+        },
+        {
+          "value": "zul",
+          "label": "Zulu (zul)"
+        }
+      ]
+    },
+    {
+      "key": "preferAudioDescription",
+      "label": "Prefer Audio Description",
+      "group": "Playback",
+      "section": "Audio",
+      "type": "bool"
+    },
+    {
+      "key": "fallbackSubtitleLanguage",
+      "label": "Fallback Subtitle Language",
+      "group": "Playback",
+      "section": "Subtitles",
+      "type": "enum",
+      "options": [
+        {
+          "value": "ara",
+          "label": "Arabic (ara)"
+        },
+        {
+          "value": "dan",
+          "label": "Danish (dan)"
+        },
+        {
+          "value": "deu",
+          "label": "German (deu)"
+        },
+        {
+          "value": "eng",
+          "label": "English (eng)"
+        },
+        {
+          "value": "fin",
+          "label": "Finnish (fin)"
+        },
+        {
+          "value": "fra",
+          "label": "French (fra)"
+        },
+        {
+          "value": "hin",
+          "label": "Hindi (hin)"
+        },
+        {
+          "value": "ita",
+          "label": "Italian (ita)"
+        },
+        {
+          "value": "jpn",
+          "label": "Japanese (jpn)"
+        },
+        {
+          "value": "kor",
+          "label": "Korean (kor)"
+        },
+        {
+          "value": "nld",
+          "label": "Dutch (nld)"
+        },
+        {
+          "value": "nor",
+          "label": "Norwegian (nor)"
+        },
+        {
+          "value": "pol",
+          "label": "Polish (pol)"
+        },
+        {
+          "value": "por",
+          "label": "Portuguese (por)"
+        },
+        {
+          "value": "rus",
+          "label": "Russian (rus)"
+        },
+        {
+          "value": "spa",
+          "label": "Spanish (spa)"
+        },
+        {
+          "value": "swe",
+          "label": "Swedish (swe)"
+        },
+        {
+          "value": "tha",
+          "label": "Thai (tha)"
+        },
+        {
+          "value": "tur",
+          "label": "Turkish (tur)"
+        },
+        {
+          "value": "zho",
+          "label": "Chinese (zho)"
+        },
+        {
+          "value": "afr",
+          "label": "Afrikaans (afr)"
+        },
+        {
+          "value": "aka",
+          "label": "Akan (aka)"
+        },
+        {
+          "value": "amh",
+          "label": "Amharic (amh)"
+        },
+        {
+          "value": "asm",
+          "label": "Assamese (asm)"
+        },
+        {
+          "value": "aze",
+          "label": "Azerbaijani (aze)"
+        },
+        {
+          "value": "bak",
+          "label": "Bashkir (bak)"
+        },
+        {
+          "value": "bel",
+          "label": "Belarusian (bel)"
+        },
+        {
+          "value": "bem",
+          "label": "Bemba (bem)"
+        },
+        {
+          "value": "ben",
+          "label": "Bengali (ben)"
+        },
+        {
+          "value": "bod",
+          "label": "Tibetan (bod)"
+        },
+        {
+          "value": "bos",
+          "label": "Bosnian (bos)"
+        },
+        {
+          "value": "bre",
+          "label": "Breton (bre)"
+        },
+        {
+          "value": "bul",
+          "label": "Bulgarian (bul)"
+        },
+        {
+          "value": "cat",
+          "label": "Catalan (cat)"
+        },
+        {
+          "value": "ces",
+          "label": "Czech (ces)"
+        },
+        {
+          "value": "cha",
+          "label": "Chamorro (cha)"
+        },
+        {
+          "value": "che",
+          "label": "Chechen (che)"
+        },
+        {
+          "value": "chv",
+          "label": "Chuvash (chv)"
+        },
+        {
+          "value": "cos",
+          "label": "Corsican (cos)"
+        },
+        {
+          "value": "cre",
+          "label": "Cree (cre)"
+        },
+        {
+          "value": "crh",
+          "label": "Crimean Tatar (crh)"
+        },
+        {
+          "value": "cym",
+          "label": "Welsh (cym)"
+        },
+        {
+          "value": "div",
+          "label": "Divehi (div)"
+        },
+        {
+          "value": "dzo",
+          "label": "Dzongkha (dzo)"
+        },
+        {
+          "value": "ell",
+          "label": "Greek (ell)"
+        },
+        {
+          "value": "est",
+          "label": "Estonian (est)"
+        },
+        {
+          "value": "eus",
+          "label": "Basque (eus)"
+        },
+        {
+          "value": "ewe",
+          "label": "Ewe (ewe)"
+        },
+        {
+          "value": "fao",
+          "label": "Faroese (fao)"
+        },
+        {
+          "value": "fas",
+          "label": "Persian (fas)"
+        },
+        {
+          "value": "fij",
+          "label": "Fijian (fij)"
+        },
+        {
+          "value": "fil",
+          "label": "Filipino (fil)"
+        },
+        {
+          "value": "frc",
+          "label": "French (Canada) (frc)"
+        },
+        {
+          "value": "ful",
+          "label": "Fulah (ful)"
+        },
+        {
+          "value": "gla",
+          "label": "Scottish Gaelic (gla)"
+        },
+        {
+          "value": "gle",
+          "label": "Irish (gle)"
+        },
+        {
+          "value": "glg",
+          "label": "Galician (glg)"
+        },
+        {
+          "value": "grn",
+          "label": "Guarani (grn)"
+        },
+        {
+          "value": "guj",
+          "label": "Gujarati (guj)"
+        },
+        {
+          "value": "hat",
+          "label": "Haitian Creole (hat)"
+        },
+        {
+          "value": "hau",
+          "label": "Hausa (hau)"
+        },
+        {
+          "value": "haw",
+          "label": "Hawaiian (haw)"
+        },
+        {
+          "value": "heb",
+          "label": "Hebrew (heb)"
+        },
+        {
+          "value": "hil",
+          "label": "Hiligaynon (hil)"
+        },
+        {
+          "value": "hmn",
+          "label": "Hmong (hmn)"
+        },
+        {
+          "value": "hrv",
+          "label": "Croatian (hrv)"
+        },
+        {
+          "value": "hun",
+          "label": "Hungarian (hun)"
+        },
+        {
+          "value": "hye",
+          "label": "Armenian (hye)"
+        },
+        {
+          "value": "ibo",
+          "label": "Igbo (ibo)"
+        },
+        {
+          "value": "iii",
+          "label": "Sichuan Yi (iii)"
+        },
+        {
+          "value": "iku",
+          "label": "Inuktitut (iku)"
+        },
+        {
+          "value": "ind",
+          "label": "Indonesian (ind)"
+        },
+        {
+          "value": "isl",
+          "label": "Icelandic (isl)"
+        },
+        {
+          "value": "jav",
+          "label": "Javanese (jav)"
+        },
+        {
+          "value": "kal",
+          "label": "Kalaallisut (kal)"
+        },
+        {
+          "value": "kan",
+          "label": "Kannada (kan)"
+        },
+        {
+          "value": "kas",
+          "label": "Kashmiri (kas)"
+        },
+        {
+          "value": "kat",
+          "label": "Georgian (kat)"
+        },
+        {
+          "value": "kau",
+          "label": "Kanuri (kau)"
+        },
+        {
+          "value": "kaz",
+          "label": "Kazakh (kaz)"
+        },
+        {
+          "value": "khm",
+          "label": "Khmer (khm)"
+        },
+        {
+          "value": "kik",
+          "label": "Kikuyu (kik)"
+        },
+        {
+          "value": "kin",
+          "label": "Kinyarwanda (kin)"
+        },
+        {
+          "value": "kir",
+          "label": "Kyrgyz (kir)"
+        },
+        {
+          "value": "kok",
+          "label": "Konkani (kok)"
+        },
+        {
+          "value": "kom",
+          "label": "Komi (kom)"
+        },
+        {
+          "value": "kon",
+          "label": "Kongo (kon)"
+        },
+        {
+          "value": "kua",
+          "label": "Kuanyama (kua)"
+        },
+        {
+          "value": "kur",
+          "label": "Kurdish (kur)"
+        },
+        {
+          "value": "lao",
+          "label": "Lao (lao)"
+        },
+        {
+          "value": "lat",
+          "label": "Latin (lat)"
+        },
+        {
+          "value": "lav",
+          "label": "Latvian (lav)"
+        },
+        {
+          "value": "lim",
+          "label": "Limburgish (lim)"
+        },
+        {
+          "value": "lin",
+          "label": "Lingala (lin)"
+        },
+        {
+          "value": "lit",
+          "label": "Lithuanian (lit)"
+        },
+        {
+          "value": "ltz",
+          "label": "Luxembourgish (ltz)"
+        },
+        {
+          "value": "lug",
+          "label": "Ganda (lug)"
+        },
+        {
+          "value": "luo",
+          "label": "Luo (luo)"
+        },
+        {
+          "value": "mal",
+          "label": "Malayalam (mal)"
+        },
+        {
+          "value": "mar",
+          "label": "Marathi (mar)"
+        },
+        {
+          "value": "mkd",
+          "label": "Macedonian (mkd)"
+        },
+        {
+          "value": "mlg",
+          "label": "Malagasy (mlg)"
+        },
+        {
+          "value": "mlt",
+          "label": "Maltese (mlt)"
+        },
+        {
+          "value": "mon",
+          "label": "Mongolian (mon)"
+        },
+        {
+          "value": "mri",
+          "label": "Maori (mri)"
+        },
+        {
+          "value": "msa",
+          "label": "Malay (msa)"
+        },
+        {
+          "value": "mya",
+          "label": "Burmese (mya)"
+        },
+        {
+          "value": "nav",
+          "label": "Navajo (nav)"
+        },
+        {
+          "value": "nbl",
+          "label": "South Ndebele (nbl)"
+        },
+        {
+          "value": "nde",
+          "label": "North Ndebele (nde)"
+        },
+        {
+          "value": "ndo",
+          "label": "Ndonga (ndo)"
+        },
+        {
+          "value": "nds",
+          "label": "Low German (nds)"
+        },
+        {
+          "value": "nep",
+          "label": "Nepali (nep)"
+        },
+        {
+          "value": "new",
+          "label": "Newari (new)"
+        },
+        {
+          "value": "nno",
+          "label": "Norwegian Nynorsk (nno)"
+        },
+        {
+          "value": "nob",
+          "label": "Norwegian Bokmål (nob)"
+        },
+        {
+          "value": "nya",
+          "label": "Chichewa (nya)"
+        },
+        {
+          "value": "oci",
+          "label": "Occitan (oci)"
+        },
+        {
+          "value": "oji",
+          "label": "Ojibwa (oji)"
+        },
+        {
+          "value": "ori",
+          "label": "Oriya (ori)"
+        },
+        {
+          "value": "orm",
+          "label": "Oromo (orm)"
+        },
+        {
+          "value": "oss",
+          "label": "Ossetian (oss)"
+        },
+        {
+          "value": "pan",
+          "label": "Punjabi (pan)"
+        },
+        {
+          "value": "pus",
+          "label": "Pashto (pus)"
+        },
+        {
+          "value": "que",
+          "label": "Quechua (que)"
+        },
+        {
+          "value": "roh",
+          "label": "Romansh (roh)"
+        },
+        {
+          "value": "ron",
+          "label": "Romanian (ron)"
+        },
+        {
+          "value": "run",
+          "label": "Rundi (run)"
+        },
+        {
+          "value": "san",
+          "label": "Sanskrit (san)"
+        },
+        {
+          "value": "sin",
+          "label": "Sinhala (sin)"
+        },
+        {
+          "value": "slk",
+          "label": "Slovak (slk)"
+        },
+        {
+          "value": "slv",
+          "label": "Slovenian (slv)"
+        },
+        {
+          "value": "sme",
+          "label": "Northern Sami (sme)"
+        },
+        {
+          "value": "sna",
+          "label": "Shona (sna)"
+        },
+        {
+          "value": "snd",
+          "label": "Sindhi (snd)"
+        },
+        {
+          "value": "som",
+          "label": "Somali (som)"
+        },
+        {
+          "value": "sot",
+          "label": "Southern Sotho (sot)"
+        },
+        {
+          "value": "sqi",
+          "label": "Albanian (sqi)"
+        },
+        {
+          "value": "srd",
+          "label": "Sardinian (srd)"
+        },
+        {
+          "value": "srp",
+          "label": "Serbian (srp)"
+        },
+        {
+          "value": "ssw",
+          "label": "Swati (ssw)"
+        },
+        {
+          "value": "sun",
+          "label": "Sundanese (sun)"
+        },
+        {
+          "value": "swa",
+          "label": "Swahili (swa)"
+        },
+        {
+          "value": "syr",
+          "label": "Syriac (syr)"
+        },
+        {
+          "value": "tam",
+          "label": "Tamil (tam)"
+        },
+        {
+          "value": "tat",
+          "label": "Tatar (tat)"
+        },
+        {
+          "value": "tel",
+          "label": "Telugu (tel)"
+        },
+        {
+          "value": "tgk",
+          "label": "Tajik (tgk)"
+        },
+        {
+          "value": "tgl",
+          "label": "Tagalog (tgl)"
+        },
+        {
+          "value": "tir",
+          "label": "Tigrinya (tir)"
+        },
+        {
+          "value": "tsn",
+          "label": "Tswana (tsn)"
+        },
+        {
+          "value": "tso",
+          "label": "Tsonga (tso)"
+        },
+        {
+          "value": "tuk",
+          "label": "Turkmen (tuk)"
+        },
+        {
+          "value": "uig",
+          "label": "Uyghur (uig)"
+        },
+        {
+          "value": "ukr",
+          "label": "Ukrainian (ukr)"
+        },
+        {
+          "value": "urd",
+          "label": "Urdu (urd)"
+        },
+        {
+          "value": "uzb",
+          "label": "Uzbek (uzb)"
+        },
+        {
+          "value": "vie",
+          "label": "Vietnamese (vie)"
+        },
+        {
+          "value": "wol",
+          "label": "Wolof (wol)"
+        },
+        {
+          "value": "xho",
+          "label": "Xhosa (xho)"
+        },
+        {
+          "value": "yid",
+          "label": "Yiddish (yid)"
+        },
+        {
+          "value": "yor",
+          "label": "Yoruba (yor)"
+        },
+        {
+          "value": "zha",
+          "label": "Zhuang (zha)"
+        },
+        {
+          "value": "zul",
+          "label": "Zulu (zul)"
+        }
+      ]
+    },
+    {
+      "key": "preferSdhSubtitles",
+      "label": "Prefer SDH Subtitles",
+      "group": "Playback",
+      "section": "Subtitles",
+      "type": "bool"
+    },
+    {
+      "key": "preferTextSubtitles",
+      "label": "Prefer Text Subtitles",
+      "group": "Playback",
+      "section": "Subtitles",
+      "type": "bool"
+    },
+    {
+      "key": "preferExternalSubtitles",
+      "label": "Prefer External Subtitles",
+      "group": "Playback",
+      "section": "Subtitles",
+      "type": "bool",
+      "help": "What a client does when playback reaches a segment. Needs a plugin that provides segments, such as Intro Skipper. A type left unset does nothing."
+    },
+    {
+      "key": "mediaSegmentCountdown",
+      "label": "Skip Button Countdown",
+      "group": "Playback",
+      "section": "Segments",
+      "type": "enum",
+      "options": [
+        {
+          "value": "progressBar",
+          "label": "Progress bar"
+        },
+        {
+          "value": "timer",
+          "label": "Timer"
+        },
+        {
+          "value": "both",
+          "label": "Both"
+        },
+        {
+          "value": "none",
+          "label": "None"
+        }
+      ]
+    },
+    {
+      "key": "mediaSegmentAutoHide",
+      "label": "Hide Skip Button After",
+      "group": "Playback",
+      "section": "Segments",
+      "type": "enum",
+      "options": [
+        {
+          "value": "s5",
+          "label": "5 seconds"
+        },
+        {
+          "value": "s10",
+          "label": "10 seconds"
+        },
+        {
+          "value": "off",
+          "label": "Never"
+        }
+      ]
+    },
+    {
+      "key": "mediaSegmentActions",
+      "label": "Segment Actions",
+      "group": "Playback",
+      "section": "Segments",
+      "type": "string",
+      "help": "Comma-separated type:action pairs, for example \"intro:skip,outro:askToSkip\". Types: intro, recap, preview, commercial, outro. Actions: doNothing, skip, askToSkip. Needs a source of segments."
+    },
+    {
+      "key": "cinemaModeEnabled",
+      "label": "Cinema Mode",
+      "group": "Playback",
+      "section": "Pre-roll",
+      "type": "bool"
+    },
+    {
+      "key": "cinemaModeEpisodesEnabled",
+      "label": "Cinema Mode for Episodes",
+      "group": "Playback",
+      "section": "Pre-roll",
+      "type": "bool"
+    },
+    {
+      "key": "nextUpTimeout",
+      "label": "Next Up Timeout",
+      "group": "Playback",
+      "section": "Autoplay",
+      "type": "enum",
+      "options": [
+        {
+          "value": 5000,
+          "label": "5 seconds"
+        },
+        {
+          "value": 7000,
+          "label": "7 seconds"
+        },
+        {
+          "value": 10000,
+          "label": "10 seconds"
+        },
+        {
+          "value": 15000,
+          "label": "15 seconds"
+        },
+        {
+          "value": 30000,
+          "label": "30 seconds"
+        }
+      ]
+    },
+    {
+      "key": "replaceSkipOutroWithNextUp",
+      "label": "Replace Skip Outro with Next Up",
+      "group": "Playback",
+      "section": "Autoplay",
+      "type": "bool",
+      "help": "Only applies when the outro asks before skipping and Next Up is on."
+    },
+    {
+      "key": "stillWatchingBehavior",
+      "label": "Still Watching Prompt",
+      "group": "Playback",
+      "section": "Autoplay",
+      "type": "enum",
+      "options": [
+        {
+          "value": "disabled",
+          "label": "Off"
+        },
+        {
+          "value": "short_",
+          "label": "After 2 episodes"
+        },
+        {
+          "value": "medium",
+          "label": "After 3 episodes"
+        },
+        {
+          "value": "long_",
+          "label": "After 5 episodes"
+        },
+        {
+          "value": "veryLong",
+          "label": "After 8 episodes"
+        }
+      ]
+    },
+    {
+      "key": "osdButtonOrderDesktop",
+      "label": "Player Buttons Order",
+      "group": "Playback",
+      "section": "Player Buttons",
+      "type": "list",
+      "suggestions": [
+        {
+          "value": "syncPlay",
+          "label": "SyncPlay"
+        },
+        {
+          "value": "favorite",
+          "label": "Favorite"
+        },
+        {
+          "value": "speed",
+          "label": "Playback Speed"
+        },
+        {
+          "value": "chapters",
+          "label": "Chapters"
+        },
+        {
+          "value": "subtitles",
+          "label": "Subtitles"
+        },
+        {
+          "value": "audio",
+          "label": "Audio"
+        },
+        {
+          "value": "castAndCrew",
+          "label": "Cast & Crew"
+        },
+        {
+          "value": "cast",
+          "label": "Cast"
+        },
+        {
+          "value": "volume",
+          "label": "Volume"
+        },
+        {
+          "value": "quality",
+          "label": "Quality"
+        },
+        {
+          "value": "zoom",
+          "label": "Zoom"
+        },
+        {
+          "value": "orientation",
+          "label": "Orientation"
+        },
+        {
+          "value": "info",
+          "label": "Info"
+        },
+        {
+          "value": "fullscreen",
+          "label": "Fullscreen"
+        },
+        {
+          "value": "floatOnTop",
+          "label": "Float on Top"
+        }
+      ],
+      "alsoKeys": [
+        "osdButtonOrderTv",
+        "osdButtonOrderMobile"
+      ],
+      "help": "Buttons shown around the player controls, in order. Play, pause and seek are always shown (same list for all form factors)."
+    },
+    {
+      "key": "hiddenOsdButtonsDesktop",
+      "label": "Hidden Player Buttons",
+      "group": "Playback",
+      "section": "Player Buttons",
+      "type": "list",
+      "suggestions": [
+        {
+          "value": "syncPlay",
+          "label": "SyncPlay"
+        },
+        {
+          "value": "favorite",
+          "label": "Favorite"
+        },
+        {
+          "value": "speed",
+          "label": "Playback Speed"
+        },
+        {
+          "value": "chapters",
+          "label": "Chapters"
+        },
+        {
+          "value": "subtitles",
+          "label": "Subtitles"
+        },
+        {
+          "value": "audio",
+          "label": "Audio"
+        },
+        {
+          "value": "castAndCrew",
+          "label": "Cast & Crew"
+        },
+        {
+          "value": "cast",
+          "label": "Cast"
+        },
+        {
+          "value": "volume",
+          "label": "Volume"
+        },
+        {
+          "value": "quality",
+          "label": "Quality"
+        },
+        {
+          "value": "zoom",
+          "label": "Zoom"
+        },
+        {
+          "value": "orientation",
+          "label": "Orientation"
+        },
+        {
+          "value": "info",
+          "label": "Info"
+        },
+        {
+          "value": "fullscreen",
+          "label": "Fullscreen"
+        },
+        {
+          "value": "floatOnTop",
+          "label": "Float on Top"
+        }
+      ],
+      "alsoKeys": [
+        "hiddenOsdButtonsTv",
+        "hiddenOsdButtonsMobile"
+      ],
+      "help": "Player buttons that are hidden (same list for all form factors)."
+    }
+  ],
+  "excluded": [
+    {
+      "key": "showSeerrButton",
+      "label": "Show Seerr Button",
+      "group": "Appearance",
+      "reason": "Seerr integration is not implemented in Remux"
+    },
+    {
+      "key": "showDownloadsButton",
+      "label": "Show Downloads Button",
+      "group": "Appearance",
+      "reason": "Active downloads (Moonbase transcode list) is not implemented in Remux"
+    },
+    {
+      "key": "showServerMessagesButton",
+      "label": "Show Messages Button",
+      "group": "Appearance",
+      "reason": "Server messages and friends are not implemented in Remux"
+    },
+    {
+      "key": "showFriendsButton",
+      "label": "Show Friends Button",
+      "group": "Appearance",
+      "reason": "Server messages and friends are not implemented in Remux"
+    },
+    {
+      "key": "imdbTop250MoviesEnabled",
+      "label": "IMDb Top 250 Movies",
+      "group": "Home Screen",
+      "reason": "IMDb chart rows are not implemented in Remux"
+    },
+    {
+      "key": "imdbTop250TvShowsEnabled",
+      "label": "IMDb Top 250 TV Shows",
+      "group": "Home Screen",
+      "reason": "IMDb chart rows are not implemented in Remux"
+    },
+    {
+      "key": "imdbMostPopularMoviesEnabled",
+      "label": "IMDb Most Popular Movies",
+      "group": "Home Screen",
+      "reason": "IMDb chart rows are not implemented in Remux"
+    },
+    {
+      "key": "imdbMostPopularTvShowsEnabled",
+      "label": "IMDb Most Popular TV Shows",
+      "group": "Home Screen",
+      "reason": "IMDb chart rows are not implemented in Remux"
+    },
+    {
+      "key": "imdbTopEnglishMoviesEnabled",
+      "label": "IMDb Top English Movies",
+      "group": "Home Screen",
+      "reason": "IMDb chart rows are not implemented in Remux"
+    },
+    {
+      "key": "imdbLowestRatedMoviesEnabled",
+      "label": "IMDb Lowest Rated Movies",
+      "group": "Home Screen",
+      "reason": "IMDb chart rows are not implemented in Remux"
+    },
+    {
+      "key": "tmdbTrendingAllWeeklyEnabled",
+      "label": "TMDB Trending This Week",
+      "group": "Home Screen",
+      "reason": "TMDB list rows are not implemented in Remux"
+    },
+    {
+      "key": "tmdbTrendingMovieDailyEnabled",
+      "label": "TMDB Trending Movies Today",
+      "group": "Home Screen",
+      "reason": "TMDB list rows are not implemented in Remux"
+    },
+    {
+      "key": "tmdbTrendingMovieWeeklyEnabled",
+      "label": "TMDB Trending Movies This Week",
+      "group": "Home Screen",
+      "reason": "TMDB list rows are not implemented in Remux"
+    },
+    {
+      "key": "tmdbTrendingTvDailyEnabled",
+      "label": "TMDB Trending TV Today",
+      "group": "Home Screen",
+      "reason": "TMDB list rows are not implemented in Remux"
+    },
+    {
+      "key": "tmdbTrendingTvWeeklyEnabled",
+      "label": "TMDB Trending TV This Week",
+      "group": "Home Screen",
+      "reason": "TMDB list rows are not implemented in Remux"
+    },
+    {
+      "key": "tmdbPopularMoviesEnabled",
+      "label": "TMDB Popular Movies",
+      "group": "Home Screen",
+      "reason": "TMDB list rows are not implemented in Remux"
+    },
+    {
+      "key": "tmdbPopularTvEnabled",
+      "label": "TMDB Popular TV",
+      "group": "Home Screen",
+      "reason": "TMDB list rows are not implemented in Remux"
+    },
+    {
+      "key": "tmdbTopRatedMoviesEnabled",
+      "label": "TMDB Top Rated Movies",
+      "group": "Home Screen",
+      "reason": "TMDB list rows are not implemented in Remux"
+    },
+    {
+      "key": "tmdbTopRatedTvEnabled",
+      "label": "TMDB Top Rated TV",
+      "group": "Home Screen",
+      "reason": "TMDB list rows are not implemented in Remux"
+    },
+    {
+      "key": "tmdbNowPlayingMoviesEnabled",
+      "label": "TMDB Now Playing Movies",
+      "group": "Home Screen",
+      "reason": "TMDB list rows are not implemented in Remux"
+    },
+    {
+      "key": "tmdbUpcomingMoviesEnabled",
+      "label": "TMDB Upcoming Movies",
+      "group": "Home Screen",
+      "reason": "TMDB list rows are not implemented in Remux"
+    },
+    {
+      "key": "tmdbAiringTodayTvEnabled",
+      "label": "TMDB Airing Today",
+      "group": "Home Screen",
+      "reason": "TMDB list rows are not implemented in Remux"
+    },
+    {
+      "key": "tmdbOnTheAirTvEnabled",
+      "label": "TMDB On The Air",
+      "group": "Home Screen",
+      "reason": "TMDB list rows are not implemented in Remux"
+    },
+    {
+      "key": "enableRadarrCalendar",
+      "label": "Radarr Calendar",
+      "group": "Home Screen",
+      "reason": "Radarr/Sonarr calendars are not implemented in Remux"
+    },
+    {
+      "key": "enableSonarrCalendar",
+      "label": "Sonarr Calendar",
+      "group": "Home Screen",
+      "reason": "Radarr/Sonarr calendars are not implemented in Remux"
+    },
+    {
+      "key": "mergeRadarrSonarrCalendars",
+      "label": "Merge Radarr and Sonarr Calendars",
+      "group": "Home Screen",
+      "reason": "Radarr/Sonarr calendars are not implemented in Remux"
+    },
+    {
+      "key": "radarrCalendarShowCinema",
+      "label": "Radarr: Show Cinema Releases",
+      "group": "Home Screen",
+      "reason": "Radarr/Sonarr calendars are not implemented in Remux"
+    },
+    {
+      "key": "radarrCalendarShowDigital",
+      "label": "Radarr: Show Digital Releases",
+      "group": "Home Screen",
+      "reason": "Radarr/Sonarr calendars are not implemented in Remux"
+    },
+    {
+      "key": "radarrCalendarShowPhysical",
+      "label": "Radarr: Show Physical Releases",
+      "group": "Home Screen",
+      "reason": "Radarr/Sonarr calendars are not implemented in Remux"
+    },
+    {
+      "key": "radarrCalendarShowDate",
+      "label": "Radarr: Show Release Date",
+      "group": "Home Screen",
+      "reason": "Radarr/Sonarr calendars are not implemented in Remux"
+    },
+    {
+      "key": "sonarrCalendarShowDate",
+      "label": "Sonarr: Show Air Date",
+      "group": "Home Screen",
+      "reason": "Radarr/Sonarr calendars are not implemented in Remux"
+    },
+    {
+      "key": "sonarrCalendarShowEpisodeInfo",
+      "label": "Sonarr: Show Episode Info",
+      "group": "Home Screen",
+      "reason": "Radarr/Sonarr calendars are not implemented in Remux"
+    },
+    {
+      "key": "showBookDiscoverTab",
+      "label": "Show Book Library Discovery",
+      "group": "Libraries",
+      "reason": "Book discovery tab is backed by Seerr, which Remux does not implement"
+    },
+    {
+      "key": "defaultAudioLanguage",
+      "label": "Default Audio Language",
+      "group": "Playback",
+      "reason": "Managed by Remux user settings; the server refuses it as an admin default"
+    },
+    {
+      "key": "preferDefaultAudioTrack",
+      "label": "Prefer Default Audio Track",
+      "group": "Playback",
+      "reason": "Managed by Remux user settings; the server refuses it as an admin default"
+    },
+    {
+      "key": "subtitleMode",
+      "label": "Subtitle Mode",
+      "group": "Playback",
+      "reason": "Managed by Remux user settings; the server refuses it as an admin default"
+    },
+    {
+      "key": "defaultSubtitleLanguage",
+      "label": "Default Subtitle Language",
+      "group": "Playback",
+      "reason": "Managed by Remux user settings; the server refuses it as an admin default"
+    },
+    {
+      "key": "autoplayNextEpisode",
+      "label": "Autoplay Next Episode",
+      "group": "Playback",
+      "reason": "Managed by Remux user settings; the server refuses it as an admin default"
+    },
+    {
+      "key": "seerrBlockNsfw",
+      "label": "Seerr Block NSFW",
+      "group": "Integrations",
+      "reason": "Seerr integration is not implemented in Remux"
+    },
+    {
+      "key": "seerrShowMissingCollectionItems",
+      "label": "Show Missing Collection Items",
+      "group": "Integrations",
+      "reason": "Seerr integration is not implemented in Remux"
+    },
+    {
+      "key": "showSeerrAvailabilityBadges",
+      "label": "Show Seerr Availability Badges",
+      "group": "Integrations",
+      "reason": "Seerr integration is not implemented in Remux"
+    },
+    {
+      "key": "seerrRows",
+      "label": "Seerr Discovery Rows",
+      "group": "Integrations",
+      "reason": "Seerr integration is not implemented in Remux"
+    }
+  ]
+}

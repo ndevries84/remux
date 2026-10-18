@@ -19,6 +19,15 @@ Moonfin Plugin (Moonbase) - GPL-3.0
   Both files keep their GPL-3.0 license. GPL-3.0 section 13 permits
   combining GPL-3.0 and AGPL-3.0 works.
 
+  Data: crates/remux-server/assets/moonfin/default-options.json is the list
+  of default settings options (keys, labels, groups, choices and help
+  text) for the admin page forms. It is DERIVED from Moonbase
+  Jellyfin/backend/Pages/configPage.html and
+  Jellyfin/backend/Models/MoonfinSettingsProfile.cs at commit
+  7ccfd6bc9d043c34eb2b00efcf8fb68679e354ee, reshaped into JSON, with options
+  for features Remux lacks moved to its "excluded" list. It stays under
+  GPL-3.0 and is separate from the AGPL-3.0 server code that reads it.
+
   The Moonfin API served by Remux (/Moonfin/...) is an independent
   reimplementation written for client compatibility; it is not a copy of
   the Moonbase server code.
