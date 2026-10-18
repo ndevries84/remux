@@ -399,12 +399,20 @@
 
   // ---- themes ----------------------------------------------------------
 
+  // The first 8 hex digits; the full SHA-256 is in the tooltip.
+  function checksumCell(sum) {
+    var full = typeof sum === 'string' ? sum : '';
+    var td = el('td', { text: full ? full.slice(0, 8) : '' });
+    if (full) { td.className = 'mono'; td.title = full; }
+    return td;
+  }
+
   function loadThemes() {
     return api('GET', '/moonfin/admin/themes').then(function (d) {
       var tbody = $('themes-table').querySelector('tbody');
       clear(tbody);
       var items = d.items || [];
-      if (!items.length) tbody.appendChild(el('tr', null, [el('td', { text: 'No themes uploaded.', colspan: '5' })]));
+      if (!items.length) tbody.appendChild(el('tr', null, [el('td', { text: 'No themes uploaded.', colspan: '6' })]));
       items.forEach(function (t) {
         var del = el('button', { type: 'button', class: 'danger', text: 'Delete' });
         del.addEventListener('click', function () {
@@ -418,6 +426,7 @@
           el('td', null, [el('code', { text: t.id })]),
           el('td', { text: fmtBytes(t.sizeBytes) }),
           el('td', { text: fmtTime(t.uploadedAtUtc) }),
+          checksumCell(t.checksumSha256),
           el('td', null, [del])
         ]));
       });

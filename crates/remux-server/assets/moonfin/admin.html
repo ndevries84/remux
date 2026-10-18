@@ -48,6 +48,17 @@
     <section class="card" id="defaults-section">
       <div class="head"><h2>Default client settings</h2></div>
       <p class="muted">Settings applied to every user as the lowest layer. Users' own settings override them. A setting you leave unset keeps the app's built-in default. The home rows (<code>homeSections</code> and <code>homeRowOrder</code>) are defaults that must be set together as a pair.</p>
+      <div class="note" id="settings-explainer">
+        <strong>How settings combine</strong>
+        <p class="muted">For each setting, Moonfin uses the first value it finds in this order:</p>
+        <ol>
+          <li>The device's own settings (the desktop, mobile or TV profile)</li>
+          <li>The user's global settings</li>
+          <li><strong>These admin defaults</strong></li>
+          <li>The app's built-in defaults</li>
+        </ol>
+        <p class="muted">Settings that Remux owns, listed below, are not part of this order. They come from each user's Remux settings.</p>
+      </div>
       <p id="blocked" class="muted" hidden></p>
 
       <div id="defaults-forms">
@@ -127,11 +138,13 @@
       <div class="head"><h2>Themes</h2><button id="themes-refresh" type="button">Refresh</button></div>
       <div class="scroll">
         <table id="themes-table">
-          <thead><tr><th>Name</th><th>Id</th><th>Size</th><th>Uploaded</th><th></th></tr></thead>
+          <thead><tr><th>Name</th><th>Id</th><th>Size</th><th>Uploaded</th><th>Checksum</th><th></th></tr></thead>
           <tbody></tbody>
         </table>
       </div>
       <h3>Add a theme</h3>
+      <p><a href="https://moonfin.io/theme-editor" target="_blank" rel="noopener noreferrer">Open the Moonfin theme editor</a></p>
+      <p class="muted">Design a theme there (it opens moonfin.io in a new tab), export it as JSON, then upload the file here.</p>
       <label class="file">From a .json file <input id="theme-file" type="file" accept=".json,application/json"></label>
       <textarea id="theme-text" spellcheck="false" rows="8" aria-label="Theme JSON" placeholder="Or paste theme JSON here"></textarea>
       <div class="row"><button id="theme-upload" type="button" class="primary">Upload theme</button></div>

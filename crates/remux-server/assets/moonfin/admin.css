@@ -129,3 +129,7 @@ li.other.bad .other-main { color: var(--danger); }
 .savebar { position: sticky; bottom: 0; z-index: 2; display: flex; flex-wrap: wrap; gap: 8px; align-items: center;
   background: var(--card); border-top: 1px solid var(--line); padding: 10px 0; margin-top: 12px; }
 @media (max-width: 600px) { .savebar span { flex-basis: 100%; } }
+.note { border: 1px solid var(--line); border-radius: 8px; padding: 8px 12px; margin: 8px 0 12px; }
+.note p { margin: 4px 0; }
+.note ol { margin: 4px 0; padding-left: 22px; }
+td.mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 0.8rem; }

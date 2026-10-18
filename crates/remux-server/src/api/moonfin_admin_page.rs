@@ -233,8 +233,25 @@ mod tests {
                 .contains("<script>"),
             "inline script in HTML"
         );
+        // The one external link the page may carry: the Moonfin theme editor.
+        // It is a plain navigation link (opens in a new tab with no opener or
+        // referrer); the page itself still loads nothing from other origins.
+        const THEME_EDITOR: &str = "https://moonfin.io/theme-editor";
+        assert_eq!(
+            html.matches("https://")
+                .count(),
+            1,
+            "html may contain only the theme editor URL"
+        );
+        assert!(
+            html.contains(&format!(
+                "<a href=\"{THEME_EDITOR}\" target=\"_blank\" rel=\"noopener noreferrer\">"
+            )),
+            "the theme editor link must open in a new tab with rel=noopener noreferrer"
+        );
+        let html_without_link = html.replace(THEME_EDITOR, "");
         for (name, text) in [
-            ("html", html),
+            ("html", html_without_link.as_str()),
             ("js", super::PAGE_JS),
             ("defaults-js", super::PAGE_DEFAULTS_JS),
             ("css", super::PAGE_CSS),
