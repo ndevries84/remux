@@ -11,6 +11,10 @@
 //! * `POST` replaces the order and answers `204`; `[]` clears it. Ids are
 //!   stored verbatim (dashless or hyphenated, whatever the client sent) so
 //!   `GET` echoes exactly what was saved.
+//! * `POST` of a non-empty order requires `collectionId` to be an existing
+//!   collection the user's policy lets them see (`404` otherwise), and a user
+//!   holds at most `MAX_ORDERS_PER_USER` orders (`413`). Clearing (`[]`) is
+//!   always allowed so stale rows for deleted collections can be removed.
 //! * Orders are per user and independent of the native, admin-only,
 //!   global `move` endpoint.
 
@@ -27,11 +31,13 @@ use uuid::Uuid;
 use crate::{
     AppState,
     api::moonfin_settings::{error_response, internal_error},
-    db::auth::AuthSession,
+    db::{self, auth::AuthSession},
 };
 
 /// Most ids accepted in one order.
 const MAX_IDS: usize = 20_000;
+/// Most collections one user may hold a stored order for.
+const MAX_ORDERS_PER_USER: i64 = 1000;
 /// Largest accepted body (a full list of dashed UUIDs is ~750 KB).
 const MAX_BODY_BYTES: usize = 2 * 1024 * 1024;
 
@@ -57,6 +63,39 @@ impl CollectionOrder {
         }
         Ok(Self(ids))
     }
+}
+
+/// Whether `collection_id` is a collection the session user may see, with
+/// the policy's `CollectionId` hide/allow rules applied like browse views do.
+async fn collection_visible(
+    state: &AppState,
+    session: &AuthSession,
+    collection_id: Uuid,
+) -> anyhow::Result<bool> {
+    let policy_filter = session
+        .user
+        .policy
+        .as_ref()
+        .and_then(|p| {
+            p.0.filter_rules
+                .clone()
+        });
+    let found = db::Media::get_by_filter(
+        &state
+            .ctx
+            .db,
+        &db::MediaFilter {
+            id: Some(vec![collection_id]),
+            kind: Some(vec![db::MediaKind::Collection]),
+            policy_filter,
+            limit: Some(1),
+            ..Default::default()
+        },
+    )
+    .await?;
+    Ok(!found
+        .records
+        .is_empty())
 }
 
 #[get("/moonfin/collections/{collection_id}/order")]
@@ -110,6 +149,18 @@ pub async fn moonfin_collection_order_save(
     let db = &state
         .ctx
         .db;
+    if !order
+        .0
+        .is_empty()
+    {
+        match collection_visible(&state, &session, collection_id).await {
+            Ok(true) => {}
+            Ok(false) => {
+                return error_response(StatusCode::NOT_FOUND, "Collection not found");
+            }
+            Err(e) => return internal_error(e),
+        }
+    }
     let result = if order
         .0
         .is_empty()
@@ -126,7 +177,11 @@ pub async fn moonfin_collection_order_save(
         sqlx::query(
             "INSERT INTO moonfin_collection_order \
              (user_id, collection_id, item_ids, updated_at) \
-             VALUES (?1, ?2, ?3, ?4) \
+             SELECT ?1, ?2, ?3, ?4 \
+             WHERE EXISTS (SELECT 1 FROM moonfin_collection_order \
+                           WHERE user_id = ?1 AND collection_id = ?2) \
+                OR (SELECT COUNT(*) FROM moonfin_collection_order \
+                    WHERE user_id = ?1) < ?5 \
              ON CONFLICT (user_id, collection_id) DO UPDATE SET \
              item_ids = excluded.item_ids, updated_at = excluded.updated_at",
         )
@@ -134,10 +189,23 @@ pub async fn moonfin_collection_order_save(
         .bind(collection_id)
         .bind(serde_json::to_string(&order.0).unwrap_or_else(|_| "[]".into()))
         .bind(chrono::Utc::now().timestamp_millis())
+        .bind(MAX_ORDERS_PER_USER)
         .execute(db)
         .await
     };
     match result {
+        // The guarded insert wrote nothing: the per-user cap was hit.
+        Ok(done)
+            if done.rows_affected() == 0
+                && !order
+                    .0
+                    .is_empty() =>
+        {
+            error_response(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                format!("at most {MAX_ORDERS_PER_USER} collection orders per user"),
+            )
+        }
         Ok(_) => StatusCode::NO_CONTENT.into_response(),
         Err(e) => internal_error(e),
     }
@@ -151,6 +219,30 @@ mod tests {
 
     const COL: &str = "0b7c1e2a9f3d5a6b8c7d112233445566";
     const COL2: &str = "1b7c1e2a9f3d5a6b8c7d112233445566";
+
+    /// Harness with COL and COL2 seeded as real collections.
+    async fn harness() -> Harness {
+        let h = Harness::new().await;
+        seed_collection(&h, COL).await;
+        seed_collection(&h, COL2).await;
+        h
+    }
+
+    async fn seed_collection(h: &Harness, id: &str) {
+        db::Media {
+            id: Uuid::parse_str(id).unwrap(),
+            title: format!("collection {id}"),
+            kind: db::MediaKind::Collection,
+            collection_kind: Some(db::CollectionKind::Manual),
+            ..Default::default()
+        }
+        .save(
+            &h.ctx
+                .db,
+        )
+        .await
+        .unwrap();
+    }
 
     fn ids(n: usize) -> Vec<String> {
         (1..=n)
@@ -197,7 +289,7 @@ mod tests {
 
     #[tokio::test]
     async fn saved_order_round_trips_in_order_and_verbatim() {
-        let h = Harness::new().await;
+        let h = harness().await;
         let mut sent = ids(3);
         sent.reverse();
         // One hyphenated id: stored in the form the client sent.
@@ -211,7 +303,7 @@ mod tests {
 
     #[tokio::test]
     async fn collection_id_form_does_not_matter() {
-        let h = Harness::new().await;
+        let h = harness().await;
         h.post(&h.token, &path(COL), &json!(ids(2)))
             .await
             .assert_status(StatusCode::NO_CONTENT);
@@ -223,7 +315,7 @@ mod tests {
 
     #[tokio::test]
     async fn orders_are_per_user() {
-        let h = Harness::new().await;
+        let h = harness().await;
         let other = h
             .second_user()
             .await;
@@ -243,7 +335,7 @@ mod tests {
 
     #[tokio::test]
     async fn collections_are_independent_and_save_overwrites() {
-        let h = Harness::new().await;
+        let h = harness().await;
         h.post(&h.token, &path(COL), &json!(ids(3)))
             .await;
         h.post(&h.token, &path(COL2), &json!(ids(1)))
@@ -257,7 +349,7 @@ mod tests {
 
     #[tokio::test]
     async fn empty_array_clears_the_order() {
-        let h = Harness::new().await;
+        let h = harness().await;
         h.post(&h.token, &path(COL), &json!(ids(3)))
             .await;
         h.post(&h.token, &path(COL), &json!([]))
@@ -277,7 +369,7 @@ mod tests {
 
     #[tokio::test]
     async fn invalid_bodies_are_400_and_store_nothing() {
-        let h = Harness::new().await;
+        let h = harness().await;
         h.post(&h.token, &path(COL), &json!(ids(2)))
             .await;
         for bad in [
@@ -311,7 +403,7 @@ mod tests {
 
     #[tokio::test]
     async fn deleting_a_user_removes_their_orders() {
-        let h = Harness::new().await;
+        let h = harness().await;
         let other = h
             .second_user()
             .await;
@@ -342,5 +434,158 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(rows, 0);
+    }
+
+    #[tokio::test]
+    async fn saving_an_order_for_an_unknown_collection_is_404_and_stores_nothing() {
+        let h = Harness::new().await;
+        h.post(&h.token, &path(COL), &json!(ids(2)))
+            .await
+            .assert_status(StatusCode::NOT_FOUND);
+        assert_eq!(order(&h, &h.token, COL).await, json!([]));
+        assert_eq!(row_count(&h).await, 0);
+    }
+
+    #[tokio::test]
+    async fn saving_an_order_for_a_non_collection_item_is_404() {
+        let h = Harness::new().await;
+        let movie =
+            crate::api::moonfin_test_support::seed_movie(&h.ctx, "M", 9101).await;
+        h.post(&h.token, &path(&movie), &json!(ids(2)))
+            .await
+            .assert_status(StatusCode::NOT_FOUND);
+        assert_eq!(row_count(&h).await, 0);
+    }
+
+    #[tokio::test]
+    async fn clearing_an_order_for_a_missing_collection_is_allowed() {
+        let h = Harness::new().await;
+        sqlx::query(
+            "INSERT INTO moonfin_collection_order VALUES (\
+             (SELECT id FROM users LIMIT 1), ?1, '[]', 0)",
+        )
+        .bind(Uuid::parse_str(COL).unwrap())
+        .execute(
+            &h.ctx
+                .db,
+        )
+        .await
+        .unwrap();
+        h.post(&h.token, &path(COL), &json!([]))
+            .await
+            .assert_status(StatusCode::NO_CONTENT);
+        assert_eq!(row_count(&h).await, 0);
+    }
+
+    #[tokio::test]
+    async fn collection_hidden_by_the_users_policy_is_404() {
+        let h = harness().await;
+        let kid = h
+            .second_user()
+            .await;
+        let users = h
+            .get(&h.token, "/Users")
+            .await
+            .json::<Value>();
+        let second = users
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|u| u["Name"] == "second")
+            .unwrap();
+        let id = second["Id"]
+            .as_str()
+            .unwrap();
+        let mut policy = second["Policy"].clone();
+        policy["FilterRules"] =
+            serde_json::to_value(remux_sdks::remux::CollectionFilter {
+                groups: vec![remux_sdks::remux::FilterGroup {
+                    rules: vec![remux_sdks::remux::FilterRule::CollectionId {
+                        op: remux_sdks::remux::SetOp::IsNot,
+                        ids: vec![Uuid::parse_str(COL).unwrap()],
+                    }],
+                    ..Default::default()
+                }],
+                ..Default::default()
+            })
+            .unwrap();
+        h.post(&h.token, &format!("/Users/{id}/Policy"), &policy)
+            .await
+            .assert_status(StatusCode::NO_CONTENT);
+
+        h.post(&kid, &path(COL), &json!(ids(2)))
+            .await
+            .assert_status(StatusCode::NOT_FOUND);
+        assert_eq!(order(&h, &kid, COL).await, json!([]));
+        // Other collections, and the unrestricted admin, are unaffected.
+        h.post(&kid, &path(COL2), &json!(ids(2)))
+            .await
+            .assert_status(StatusCode::NO_CONTENT);
+        h.post(&h.token, &path(COL), &json!(ids(2)))
+            .await
+            .assert_status(StatusCode::NO_CONTENT);
+    }
+
+    #[tokio::test]
+    async fn orders_per_user_are_capped_but_existing_rows_stay_updatable() {
+        let h = harness().await;
+        let user: Uuid = sqlx::query_scalar("SELECT id FROM users LIMIT 1")
+            .fetch_one(
+                &h.ctx
+                    .db,
+            )
+            .await
+            .unwrap();
+        // Fill the quota with stale rows directly (cheaper than 1000 collections).
+        for i in 0..MAX_ORDERS_PER_USER {
+            sqlx::query(
+                "INSERT INTO moonfin_collection_order VALUES (?1, ?2, '[]', 0)",
+            )
+            .bind(user)
+            .bind(Uuid::from_u128(1_000_000 + i as u128))
+            .execute(
+                &h.ctx
+                    .db,
+            )
+            .await
+            .unwrap();
+        }
+        h.post(&h.token, &path(COL), &json!(ids(2)))
+            .await
+            .assert_status(StatusCode::PAYLOAD_TOO_LARGE);
+        assert_eq!(order(&h, &h.token, COL).await, json!([]));
+        // Another user has their own quota.
+        let other = h
+            .second_user()
+            .await;
+        h.post(&other, &path(COL), &json!(ids(2)))
+            .await
+            .assert_status(StatusCode::NO_CONTENT);
+        // Freeing a slot lets the save through, and then it can be rewritten.
+        sqlx::query("DELETE FROM moonfin_collection_order WHERE collection_id = ?1")
+            .bind(Uuid::from_u128(1_000_000))
+            .execute(
+                &h.ctx
+                    .db,
+            )
+            .await
+            .unwrap();
+        h.post(&h.token, &path(COL), &json!(ids(2)))
+            .await
+            .assert_status(StatusCode::NO_CONTENT);
+        h.post(&h.token, &path(COL), &json!(ids(3)))
+            .await
+            .assert_status(StatusCode::NO_CONTENT);
+        assert_eq!(order(&h, &h.token, COL).await, json!(ids(3)));
+    }
+
+    async fn row_count(h: &Harness) -> i64 {
+        sqlx::query_scalar("SELECT COUNT(*) FROM moonfin_collection_order")
+            .fetch_one(
+                &h.ctx
+                    .db,
+            )
+            .await
+            .unwrap()
     }
 }
