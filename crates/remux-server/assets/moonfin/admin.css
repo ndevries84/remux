@@ -133,3 +133,22 @@ li.other.bad .other-main { color: var(--danger); }
 .note p { margin: 4px 0; }
 .note ol { margin: 4px 0; padding-left: 22px; }
 td.mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 0.8rem; }
+
+/* Home row builder. */
+.sr-only { position: absolute; width: 1px; height: 1px; margin: -1px; padding: 0; overflow: hidden;
+  clip: rect(0, 0, 0, 0); white-space: nowrap; border: 0; }
+.hb-list { list-style: none; margin: 8px 0; padding: 0; }
+.hb-row { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 8px; padding: 6px 8px;
+  border: 1px solid var(--line); border-radius: 8px; margin: 4px 0; background: var(--card); }
+.hb-row.off .hb-name { color: var(--muted); text-decoration: line-through; }
+.hb-row.dragging { opacity: 0.6; border-color: var(--accent); }
+.hb-row.drop-before { box-shadow: 0 -3px 0 0 var(--accent); }
+.hb-row.drop-after { box-shadow: 0 3px 0 0 var(--accent); }
+.hb-handle { cursor: grab; touch-action: none; user-select: none; min-width: 40px; min-height: 40px;
+  padding: 2px 8px; font-size: 1.1rem; line-height: 1; }
+.hb-handle:active { cursor: grabbing; }
+.hb-row input[type=checkbox] { width: 22px; height: 22px; margin: 0; flex: none; }
+.hb-name { flex: 1 1 140px; min-width: 0; overflow-wrap: anywhere; }
+.hb-actions { display: inline-flex; gap: 4px; margin-left: auto; }
+.hb-actions button { min-width: 40px; min-height: 40px; padding: 2px 8px; }
+.home-builder select { max-width: 100%; }

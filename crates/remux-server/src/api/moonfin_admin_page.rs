@@ -19,6 +19,7 @@ use remux_macros::get;
 const PAGE_HTML: &str = include_str!("../../assets/moonfin/admin.html");
 const PAGE_JS: &str = include_str!("../../assets/moonfin/admin.js");
 const PAGE_DEFAULTS_JS: &str = include_str!("../../assets/moonfin/admin-defaults.js");
+const PAGE_HOME_ROWS_JS: &str = include_str!("../../assets/moonfin/admin-home-rows.js");
 const PAGE_CSS: &str = include_str!("../../assets/moonfin/admin.css");
 /// The option schema behind the default settings forms. Derived from Moonbase
 /// (see NOTICE); data only.
@@ -69,6 +70,11 @@ pub async fn moonfin_admin_script() -> Response {
 #[get("/moonfin/admin/admin-defaults.js")]
 pub async fn moonfin_admin_defaults_script() -> Response {
     with_headers("text/javascript; charset=utf-8", PAGE_DEFAULTS_JS, false)
+}
+
+#[get("/moonfin/admin/admin-home-rows.js")]
+pub async fn moonfin_admin_home_rows_script() -> Response {
+    with_headers("text/javascript; charset=utf-8", PAGE_HOME_ROWS_JS, false)
 }
 
 #[get("/moonfin/admin/admin.css")]
@@ -154,6 +160,21 @@ mod tests {
             "text/javascript; charset=utf-8"
         );
         assert_eq!(hdr(&defaults_js, "x-content-type-options"), "nosniff");
+        let home_rows_js = h
+            .server
+            .get("/Moonfin/Admin/admin-home-rows.js")
+            .await;
+        home_rows_js.assert_status_ok();
+        assert_eq!(
+            hdr(&home_rows_js, "content-type"),
+            "text/javascript; charset=utf-8"
+        );
+        assert_eq!(hdr(&home_rows_js, "x-content-type-options"), "nosniff");
+        assert!(
+            home_rows_js
+                .text()
+                .contains("MoonfinHomeRows")
+        );
         let css = h
             .server
             .get("/Moonfin/Admin/admin.css")
@@ -254,13 +275,18 @@ mod tests {
             ("html", html_without_link.as_str()),
             ("js", super::PAGE_JS),
             ("defaults-js", super::PAGE_DEFAULTS_JS),
+            ("home-rows-js", super::PAGE_HOME_ROWS_JS),
             ("css", super::PAGE_CSS),
         ] {
             assert!(!text.contains("http://"), "{name} references http://");
             assert!(!text.contains("https://"), "{name} references https://");
             assert!(!text.contains("//cdn"), "{name} references a CDN");
         }
-        for js in [super::PAGE_JS, super::PAGE_DEFAULTS_JS] {
+        for js in [
+            super::PAGE_JS,
+            super::PAGE_DEFAULTS_JS,
+            super::PAGE_HOME_ROWS_JS,
+        ] {
             assert!(
                 !js.contains("innerHTML")
                     && !js.contains("insertAdjacentHTML")

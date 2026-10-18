@@ -301,6 +301,235 @@
     return { def: def, node: node, sync: sync, state: state, hay: hay, section: null };
   }
 
+  // ---- home row builder ------------------------------------------------
+  // A visual editor for the homeSections / homeRowOrder pair. The pure logic
+  // (ordering, serialising) is in admin-home-rows.js; this only draws it and
+  // writes the result back into the shared settings object, so the other
+  // forms and the Advanced JSON panel stay in step.
+
+  var HOME_KEYS = ['homeSections', 'homeRowOrder'];
+
+  function buildHomeBuilder() {
+    var HR = window.MoonfinHomeRows;
+    var def = { key: 'homeSections', alsoKeys: ['homeRowOrder'], label: 'Home rows' };
+    var node = H.el('div', { class: 'opt home-builder' });
+    var badge = H.el('span', { class: 'badge' });
+    var note = H.el('p', { class: 'warn', hidden: 'hidden' });
+    var list = H.el('ol', { class: 'hb-list', 'aria-label': 'Home rows in display order' });
+    var empty = H.el('p', { class: 'muted', text: 'No rows are set, so apps use their own built-in home rows.' });
+    var live = H.el('div', { class: 'sr-only', role: 'status', 'aria-live': 'polite' });
+    var addSel = H.el('select', { 'aria-label': 'Row to add' });
+    var addBtn = H.el('button', { type: 'button', text: 'Add row' });
+    var startBtn = H.el('button', { type: 'button', text: 'Start from the app default rows' });
+    var resetBtn = H.el('button', { type: 'button', class: 'reset', text: 'Reset to app default' });
+    var rowsNow = [];
+    var focusAfter = null;
+    var drag = null;
+
+    function current() { return HR.parse(settings.homeSections, settings.homeRowOrder); }
+
+    // Writes the rows as the pair, or unsets both when there are none.
+    function commit(rows, message) {
+      var pair = HR.serialize(rows);
+      if (pair) {
+        settings.homeSections = clone(pair.homeSections);
+        settings.homeRowOrder = clone(pair.homeRowOrder);
+      } else {
+        HOME_KEYS.forEach(function (k) { delete settings[k]; });
+      }
+      changed();
+      paint();
+      live.textContent = message || '';
+    }
+
+    function say(rows, i, verb) {
+      return verb + ' ' + rows[i].label + ': position ' + (i + 1) + ' of ' + rows.length + '.';
+    }
+
+    function moveBy(i, delta, which) {
+      var to = i + delta;
+      if (to < 0 || to >= rowsNow.length) return;
+      var next = HR.move(rowsNow, i, to);
+      focusAfter = { index: to, which: which };
+      commit(next, say(next, to, 'Moved'));
+    }
+
+    function endDrag(commitIt) {
+      if (!drag) return;
+      var d = drag;
+      drag = null;
+      Array.prototype.forEach.call(list.children, function (li) {
+        li.classList.remove('dragging', 'drop-before', 'drop-after');
+      });
+      if (commitIt) {
+        var to = HR.dropIndex(d.from, d.slot);
+        if (to !== d.from) {
+          var next = HR.move(rowsNow, d.from, to);
+          focusAfter = { index: to, which: 'handle' };
+          commit(next, say(next, to, 'Moved'));
+        }
+      }
+    }
+
+    function slotAt(y) {
+      var kids = list.children;
+      for (var k = 0; k < kids.length; k++) {
+        var r = kids[k].getBoundingClientRect();
+        if (y < r.top + r.height / 2) return k;
+      }
+      return kids.length;
+    }
+
+    function markDrop(slot) {
+      var kids = list.children;
+      Array.prototype.forEach.call(kids, function (li) { li.classList.remove('drop-before', 'drop-after'); });
+      if (slot < kids.length) kids[slot].classList.add('drop-before');
+      else if (kids.length) kids[kids.length - 1].classList.add('drop-after');
+    }
+
+    function rowNode(row, i) {
+      var n = rowsNow.length;
+      var li = H.el('li', { class: 'hb-row' + (row.enabled ? '' : ' off') });
+      var handle = H.el('button', {
+        type: 'button', class: 'hb-handle', text: '⠿', 'data-role': 'handle',
+        'aria-label': 'Drag to reorder ' + row.label, title: 'Drag to reorder'
+      });
+      handle.addEventListener('pointerdown', function (e) {
+        if (e.button !== undefined && e.button > 0) return;
+        e.preventDefault();
+        if (handle.setPointerCapture) { try { handle.setPointerCapture(e.pointerId); } catch (x) { /* ignore */ } }
+        drag = { from: i, slot: i, pointer: e.pointerId };
+        li.classList.add('dragging');
+        markDrop(i);
+      });
+      handle.addEventListener('pointermove', function (e) {
+        if (!drag || e.pointerId !== drag.pointer) return;
+        drag.slot = slotAt(e.clientY);
+        markDrop(drag.slot);
+      });
+      handle.addEventListener('pointerup', function (e) {
+        if (!drag || e.pointerId !== drag.pointer) return;
+        endDrag(true);
+      });
+      handle.addEventListener('pointercancel', function () { endDrag(false); });
+      handle.addEventListener('keydown', function (e) {
+        if (e.key === 'Escape') endDrag(false);
+        else if (e.key === 'ArrowUp') { e.preventDefault(); moveBy(i, -1, 'handle'); }
+        else if (e.key === 'ArrowDown') { e.preventDefault(); moveBy(i, 1, 'handle'); }
+      });
+
+      var cb = H.el('input', { type: 'checkbox', 'aria-label': 'Show ' + row.label });
+      cb.checked = row.enabled;
+      cb.addEventListener('change', function () {
+        var next = HR.toggle(rowsNow, i, cb.checked);
+        commit(next, row.label + (cb.checked ? ' is shown.' : ' is hidden.'));
+      });
+
+      var name = H.el('span', { class: 'hb-name', text: row.label });
+      var kids = [handle, cb, name];
+      if (row.kind === 'pluginDynamic') kids.push(H.el('span', { class: 'badge', text: 'Dynamic row' }));
+      else if (!row.supported) kids.push(H.el('span', { class: 'badge odd', text: 'Not available in Remux' }));
+
+      var up = H.el('button', { type: 'button', text: '↑', 'aria-label': 'Move ' + row.label + ' up', title: 'Move up' });
+      var down = H.el('button', { type: 'button', text: '↓', 'aria-label': 'Move ' + row.label + ' down', title: 'Move down' });
+      var del = H.el('button', { type: 'button', text: '×', 'aria-label': 'Remove ' + row.label, title: 'Remove' });
+      up.disabled = i === 0;
+      down.disabled = i === n - 1;
+      up.addEventListener('click', function () { moveBy(i, -1, 'up'); });
+      down.addEventListener('click', function () { moveBy(i, 1, 'down'); });
+      del.addEventListener('click', function () {
+        commit(HR.remove(rowsNow, i), 'Removed ' + row.label + '.');
+      });
+      var actions = H.el('span', { class: 'hb-actions' }, [up, down, del]);
+      kids.push(actions);
+      kids.forEach(function (k) { li.appendChild(k); });
+      return li;
+    }
+
+    function paint() {
+      rowsNow = current();
+      H.clear(list);
+      rowsNow.forEach(function (row, i) { list.appendChild(rowNode(row, i)); });
+      empty.hidden = rowsNow.length > 0;
+      list.hidden = rowsNow.length === 0;
+
+      var avail = HR.available(rowsNow);
+      H.clear(addSel);
+      addSel.appendChild(H.el('option', { value: '', text: avail.length ? 'Choose a row to add' : 'Every row is already in the list' }));
+      avail.forEach(function (a) { addSel.appendChild(H.el('option', { value: a.type, text: a.label })); });
+      addSel.disabled = !avail.length;
+      addBtn.disabled = true;
+
+      var isSet = has(settings, 'homeSections') || has(settings, 'homeRowOrder');
+      var shown = rowsNow.filter(function (r) { return r.enabled; }).length;
+      startBtn.hidden = rowsNow.length > 0;
+      resetBtn.hidden = !isSet;
+      node.className = 'opt home-builder' + (isSet ? ' is-set' : '');
+      if (!isSet) { badge.className = 'badge unset'; badge.textContent = 'App default (not set)'; }
+      else if (!rowsNow.length) { badge.className = 'badge odd'; badge.textContent = 'Set as default (unrecognised value)'; }
+      else { badge.className = 'badge set'; badge.textContent = 'Set as default: ' + rowsNow.length + (rowsNow.length === 1 ? ' row, ' : ' rows, ') + shown + ' shown'; }
+
+      var msg = '';
+      if (isSet && !rowsNow.length) {
+        msg = 'The stored home layout is not a list of rows this builder understands. Edit it in Advanced (JSON) or reset it.';
+      } else if (rowsNow.length) {
+        var pair = HR.serialize(rowsNow);
+        if (!has(settings, 'homeSections')) msg = 'Only homeRowOrder is set. Changing the rows here writes both keys.';
+        else if (!has(settings, 'homeRowOrder') || !same(pair.homeRowOrder, settings.homeRowOrder)) {
+          msg = 'homeSections and homeRowOrder do not agree. Changing the rows here rewrites both so they match.';
+        }
+      }
+      note.textContent = msg;
+      note.hidden = !msg;
+
+      if (focusAfter) {
+        var li = list.children[focusAfter.index];
+        var f = focusAfter;
+        focusAfter = null;
+        if (li) {
+          var target = f.which === 'handle' ? li.querySelector('[data-role=handle]')
+            : li.querySelectorAll('.hb-actions button')[f.which === 'up' ? 0 : 1];
+          if (target && target.disabled) target = li.querySelectorAll('.hb-actions button')[f.which === 'up' ? 1 : 0];
+          if (target) target.focus();
+        }
+      }
+    }
+
+    addSel.addEventListener('change', function () { addBtn.disabled = addSel.value === ''; });
+    addBtn.addEventListener('click', function () {
+      var type = addSel.value;
+      if (!type) return;
+      var next = HR.add(rowsNow, type);
+      var label = next.length ? next[next.length - 1].label : type;
+      commit(next, 'Added ' + label + ' at the end.');
+    });
+    startBtn.addEventListener('click', function () { commit(HR.defaultRows(), 'Started from the app default rows.'); });
+    resetBtn.addEventListener('click', function () {
+      HOME_KEYS.forEach(function (k) { delete settings[k]; });
+      changed();
+      paint();
+      live.textContent = 'Home rows reset to the app default.';
+    });
+
+    node.appendChild(H.el('div', { class: 'opt-head' }, [
+      H.el('span', { class: 'opt-label', text: 'Home rows' }),
+      H.el('code', { text: 'homeSections' }), H.el('code', { text: 'homeRowOrder' })
+    ]));
+    node.appendChild(H.el('p', { class: 'muted help', text: 'Pick which rows the home screen shows and in what order. Drag a row by its handle, or use the arrow buttons. Both settings are written together. Rows for Seerr, IMDb, TMDB lists and the Radarr/Sonarr calendars are not offered because Remux does not implement them.' }));
+    node.appendChild(empty);
+    node.appendChild(list);
+    node.appendChild(H.el('div', { class: 'row' }, [addSel, addBtn]));
+    node.appendChild(H.el('div', { class: 'row' }, [startBtn]));
+    node.appendChild(H.el('div', { class: 'opt-meta' }, [badge, resetBtn]));
+    node.appendChild(note);
+    node.appendChild(live);
+
+    return {
+      def: def, node: node, sync: paint, state: paint,
+      hay: 'home rows layout order sections homesections homeroworder reorder', section: null
+    };
+  }
+
   // ---- building the page -----------------------------------------------
 
   function buildForms() {
@@ -329,7 +558,8 @@
           if (secName) secNode.appendChild(H.el('h4', { text: secName }));
           panel.appendChild(secNode);
         }
-        var row = buildRow(def);
+        if (def.key === 'homeRowOrder') return; // drawn by the home row builder
+        var row = def.key === 'homeSections' ? buildHomeBuilder() : buildRow(def);
         row.section = secNode;
         row.group = g;
         rows.push(row);
