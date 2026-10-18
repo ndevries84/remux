@@ -338,14 +338,21 @@ pub async fn ensure_unpacked(
         .entry(game_id.to_string())
         .or_default()
         .clone();
-    let _guard = lock
-        .lock()
+    // The guard is owned by the blocking closure, not this future: if the
+    // request is dropped mid-extraction the thread keeps running, so the
+    // lock must stay held until it finishes. A retry then waits and finds
+    // the finished entry instead of wiping the directory under it.
+    let guard = lock
+        .lock_owned()
         .await;
     let dir = cache_root.join(game_id);
     let archive = archive.to_path_buf();
-    tokio::task::spawn_blocking(move || unpack_blocking(&dir, &archive, max_bytes))
-        .await
-        .map_err(|e| ArchiveError::Io(io::Error::other(e)))?
+    tokio::task::spawn_blocking(move || {
+        let _guard = guard;
+        unpack_blocking(&dir, &archive, max_bytes)
+    })
+    .await
+    .map_err(|e| ArchiveError::Io(io::Error::other(e)))?
 }
 
 fn stamp_head(archive: &Path) -> Result<String, ArchiveError> {
@@ -389,6 +396,8 @@ fn unpack_blocking(
     }
     // Stale or missing: start from an empty directory so a ROM that was
     // renamed inside a replaced archive does not leave the old file behind.
+    #[cfg(test)]
+    test_gate::reached(dir);
     let _ = fs::remove_dir_all(dir);
     fs::create_dir_all(dir)?;
     let result = extract_into_cache(dir, archive, &head, max_bytes);
@@ -423,6 +432,69 @@ fn extract_into_cache(
         name: rom.name,
         size: rom.size,
     })
+}
+
+/// Test hook that parks a real extraction (cache miss) until released, so a
+/// test can drop the requesting future while the blocking thread is running.
+#[cfg(test)]
+pub(crate) mod test_gate {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Condvar, Mutex};
+
+    pub struct Gate {
+        pub entered: tokio::sync::Notify,
+        pub runs: AtomicUsize,
+        released: Mutex<bool>,
+        cv: Condvar,
+    }
+
+    impl Gate {
+        pub fn release(&self) {
+            *self
+                .released
+                .lock()
+                .unwrap() = true;
+            self.cv
+                .notify_all();
+        }
+    }
+
+    static GATES: LazyLock<DashMap<PathBuf, Arc<Gate>>> = LazyLock::new(DashMap::new);
+
+    pub fn install(dir: &Path) -> Arc<Gate> {
+        let gate = Arc::new(Gate {
+            entered: tokio::sync::Notify::new(),
+            runs: AtomicUsize::new(0),
+            released: Mutex::new(false),
+            cv: Condvar::new(),
+        });
+        GATES.insert(dir.to_path_buf(), gate.clone());
+        gate
+    }
+
+    pub fn reached(dir: &Path) {
+        let Some(gate) = GATES
+            .get(dir)
+            .map(|g| g.clone())
+        else {
+            return;
+        };
+        gate.runs
+            .fetch_add(1, Ordering::SeqCst);
+        gate.entered
+            .notify_one();
+        let mut released = gate
+            .released
+            .lock()
+            .unwrap();
+        while !*released {
+            released = gate
+                .cv
+                .wait(released)
+                .unwrap();
+        }
+    }
 }
 
 #[cfg(test)]
@@ -790,6 +862,51 @@ mod tests {
             !cache
                 .join("tiny")
                 .exists()
+        );
+    }
+
+    #[tokio::test]
+    async fn dropped_request_keeps_the_lock_until_unpacking_finishes() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir
+            .path()
+            .join("g.zip");
+        write_zip(&p, &[("Game.nes", b"payload")]);
+        let cache = dir
+            .path()
+            .join("cache");
+        let gate = test_gate::install(&cache.join("dropgame1"));
+
+        let first = tokio::spawn({
+            let (cache, p) = (cache.clone(), p.clone());
+            async move { ensure_unpacked(&cache, "dropgame1", &p, 1 << 20).await }
+        });
+        // The extraction is now running on the blocking thread.
+        gate.entered
+            .notified()
+            .await;
+        first.abort();
+        let _ = first.await;
+
+        let second = tokio::spawn({
+            let (cache, p) = (cache.clone(), p.clone());
+            async move { ensure_unpacked(&cache, "dropgame1", &p, 1 << 20).await }
+        });
+        // Let the second request reach the lock queue, then finish the first
+        // extraction. Correctness does not depend on the ordering.
+        tokio::task::yield_now().await;
+        gate.release();
+
+        let got = second
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(fs::read(&got.path).unwrap(), b"payload");
+        assert_eq!(
+            gate.runs
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the retry must reuse the finished extraction"
         );
     }
 }
