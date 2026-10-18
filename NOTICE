@@ -1,0 +1,62 @@
+Remux is licensed under the GNU Affero General Public License v3.0 (see
+LICENSE). This file lists third-party code and data sources used by the
+Moonfin and Games features.
+
+Bundled code
+------------
+
+Moonfin Plugin (Moonbase) - GPL-3.0
+  https://github.com/Moonfin-Client/Plugin (LICENSE: GNU GPL v3; README
+  states GPL-3.0)
+  Files, taken from Jellyfin/backend/EmulatorJS/ at commit
+  9b9ee1e35a7b6d23f496c9866246b0ccb2e234dd:
+    crates/remux-server/assets/moonfin/player.html
+      MODIFIED by Remux: data-path and CSP-nonce placeholders are
+      substituted at serve time, inline scripts carry the CSP nonce, and
+      the EmulatorJS update check is disabled.
+    crates/remux-server/assets/moonfin/moonfin-bridge.js
+      Content unmodified; only an origin comment line was added at the top.
+  Both files keep their GPL-3.0 license. GPL-3.0 section 13 permits
+  combining GPL-3.0 and AGPL-3.0 works.
+
+  The Moonfin API served by Remux (/Moonfin/...) is an independent
+  reimplementation written for client compatibility; it is not a copy of
+  the Moonbase server code.
+
+Downloaded at runtime (not bundled)
+-----------------------------------
+
+EmulatorJS - GPL-3.0
+  https://github.com/EmulatorJS/EmulatorJS (license verified: GPL-3.0,
+  v4.2.3 LICENSE file). The server downloads and self-hosts a pinned
+  release, version 4.2.3, on the operator's request; the files are not
+  part of this repository. Emulator cores fetched with it carry their own
+  licenses.
+
+libretro database - CC-BY-SA-4.0
+  https://github.com/libretro/libretro-database (license verified via the
+  GitHub license API: CC-BY-SA-4.0). The per-system .rdb files are
+  downloaded and cached at runtime for game metadata. Attribution is owed
+  to the libretro database contributors; derived data is share-alike.
+
+libretro thumbnails
+  https://github.com/libretro-thumbnails/libretro-thumbnails, served from
+  https://thumbnails.libretro.com. Game box art is fetched at runtime. NOT
+  VERIFIED: no license file was found for this repository or its README,
+  so terms of use are unconfirmed. Individual images belong to their
+  respective rights holders.
+
+Optional external services
+--------------------------
+
+LaunchBox Games Database
+  https://gamesdb.launchbox-app.com/Metadata.zip. Opt-in
+  (games_launchbox_enabled) and disabled by default; fetched at runtime and
+  reduced to a local index. LaunchBox publishes no terms for this download
+  (NOT VERIFIED beyond that), so whoever enables it is responsible for
+  complying with LaunchBox's terms.
+
+MDBList API
+  https://api.mdblist.com. Used for ratings with an API key supplied by the
+  admin (server-wide) or the user; subject to MDBList's terms of service,
+  which were not reviewed here.
