@@ -4,6 +4,8 @@
 //! * `GET|PUT /Moonfin/Admin/Defaults`: the admin default settings, the
 //!   lowest layer when a user's settings are resolved. A schemaless JSON
 //!   object, except that keys Remux owns ([`ADMIN_BLOCKED_KEYS`]) are refused.
+//! * `POST /Moonfin/Admin/Defaults/Apply`: push the defaults into users'
+//!   stored profiles (merge or overwrite, for everyone or one user).
 //! * `GET /Moonfin/Admin/Users`: every user with a summary of the Moonfin
 //!   settings stored for them and the Moonfin devices they signed in with.
 //! * `GET|DELETE /Moonfin/Admin/Users/{userId}/settings`: the stored and
@@ -18,14 +20,15 @@ use axum::{
     http::{HeaderMap, Request, StatusCode},
     response::{IntoResponse, Response},
 };
-use remux_macros::{delete, get, put};
+use remux_macros::{delete, get, post, put};
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
 use uuid::Uuid;
 
 use super::moonfin_settings::{
-    ADMIN_BLOCKED_KEYS, MAX_SAVE_BYTES, StreamEvent, VALID_PROFILES, blocked_keys_in,
-    internal_error, load_defaults, load_profiles, parse_profile, ping_body,
+    ADMIN_BLOCKED_KEYS, MAX_PROFILE_BYTES, MAX_PROFILE_KEYS, MAX_SAVE_BYTES, Profile,
+    StreamEvent, VALID_PROFILES, blocked_keys_in, internal_error, load_defaults,
+    load_profiles, merge_profile, now_ms, parse_profile, parse_stored, ping_body,
     resolved_profile, save_defaults,
 };
 use crate::{AppState, db::auth::AuthSession, games};
@@ -360,6 +363,267 @@ pub async fn moonfin_admin_user_settings_reset(
                 hub.notify(id, StreamEvent::SettingsUpdated);
             }
             Json(json!({ "success": true, "deleted": deleted })).into_response()
+        }
+        Err(e) => internal_error(e),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Apply defaults to existing users
+// ---------------------------------------------------------------------------
+
+/// Moonfin apps upload all their settings on first sign-in, so new defaults
+/// only reach users who have never synced. This pushes them into stored
+/// profiles on demand.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum ApplyScope {
+    All,
+    User,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum ApplyMode {
+    /// Fill in default keys the user has no value for.
+    Merge,
+    /// Set every default key, replacing the user's values.
+    Overwrite,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ApplyRequest {
+    scope: ApplyScope,
+    user_id: Option<String>,
+    mode: ApplyMode,
+    profile: Option<String>,
+}
+
+/// The home layout (`homeSections` + `homeRowOrder`) is one setting that
+/// resolves as a pair from a single layer, so merging treats it as a unit.
+const HOME_LAYOUT_KEYS: [&str; 2] = ["homeSections", "homeRowOrder"];
+
+fn has_value(profile: &Profile, key: &str) -> bool {
+    profile
+        .get(key)
+        .is_some_and(|v| !v.is_null())
+}
+
+/// `stored` after applying `defaults`. Blocked keys and nulls in `defaults`
+/// are never written; keys outside `defaults` are never touched.
+///
+/// * Merge: a default key is written only where the user has no value. The
+///   home layout pair is written only when the user has neither half.
+/// * Overwrite: every default key replaces the user's value (with the same
+///   rules as a normal save, e.g. a blank API key is ignored).
+fn apply_defaults(stored: &Profile, defaults: &Profile, mode: ApplyMode) -> Profile {
+    let mut incoming = Profile::new();
+    let user_has_layout = HOME_LAYOUT_KEYS
+        .iter()
+        .any(|k| has_value(stored, k));
+    for (key, value) in defaults {
+        if value.is_null() || ADMIN_BLOCKED_KEYS.contains(&key.as_str()) {
+            continue;
+        }
+        if mode == ApplyMode::Merge {
+            let is_layout = HOME_LAYOUT_KEYS.contains(&key.as_str());
+            if has_value(stored, key) || (is_layout && user_has_layout) {
+                continue;
+            }
+        }
+        incoming.insert(key.clone(), value.clone());
+    }
+    let mut after = stored.clone();
+    if mode == ApplyMode::Overwrite {
+        merge_profile(&mut after, &incoming);
+    } else {
+        for (key, value) in incoming {
+            after.insert(key, value);
+        }
+    }
+    after
+}
+
+/// Number of top-level keys that differ between two profiles.
+fn changed_keys(before: &Profile, after: &Profile) -> usize {
+    after
+        .iter()
+        .filter(|(k, v)| before.get(*k) != Some(*v))
+        .count()
+        + before
+            .keys()
+            .filter(|k| !after.contains_key(*k))
+            .count()
+}
+
+/// Pushes the admin defaults into users' stored profile, for everyone or one
+/// user. Merge only touches users that already have the profile stored (a
+/// user with none resolves to the defaults anyway, and copying them would
+/// freeze them against later default changes); overwrite also creates it.
+/// Users whose result would exceed the profile size caps are skipped and
+/// counted in `usersSkipped`.
+#[post("/moonfin/admin/defaults/apply")]
+pub async fn moonfin_admin_defaults_apply(
+    State(state): State<AppState>,
+    session: AuthSession,
+    req: Request<Body>,
+) -> Response {
+    if let Some(denied) = require_admin(&session) {
+        return denied;
+    }
+    let bytes = match axum::body::to_bytes(req.into_body(), MAX_SAVE_BYTES).await {
+        Ok(b) => b,
+        Err(_) => {
+            return json_error(StatusCode::PAYLOAD_TOO_LARGE, "Request body too large");
+        }
+    };
+    let request: ApplyRequest = match serde_json::from_slice(&bytes) {
+        Ok(r) => r,
+        Err(e) => {
+            return json_error(
+                StatusCode::BAD_REQUEST,
+                format!(
+                    "Body must be {{\"scope\": \"all\"|\"user\", \"userId\"?, \"mode\": \"merge\"|\"overwrite\", \"profile\"?}}: {e}"
+                ),
+            );
+        }
+    };
+    let profile = match request
+        .profile
+        .as_deref()
+        .map(|p| parse_profile(p).ok_or(p))
+        .transpose()
+    {
+        Ok(p) => p.unwrap_or_else(|| "global".to_string()),
+        Err(bad) => {
+            return json_error(
+                StatusCode::BAD_REQUEST,
+                format!(
+                    "Invalid profile: {bad}. Valid profiles: global, desktop, mobile, tv"
+                ),
+            );
+        }
+    };
+    let targets: Vec<Uuid> = match request.scope {
+        ApplyScope::User => {
+            let Some(raw) = request
+                .user_id
+                .as_deref()
+            else {
+                return json_error(StatusCode::BAD_REQUEST, "userId is required");
+            };
+            let id = match parse_user(raw) {
+                Ok(id) => id,
+                Err(resp) => return resp,
+            };
+            match user_name(&state, id).await {
+                Ok(Some(_)) => vec![id],
+                Ok(None) => return json_error(StatusCode::NOT_FOUND, "User not found"),
+                Err(e) => return internal_error(e),
+            }
+        }
+        ApplyScope::All => {
+            match sqlx::query_scalar::<_, Uuid>("SELECT id FROM users")
+                .fetch_all(
+                    &state
+                        .ctx
+                        .db,
+                )
+                .await
+            {
+                Ok(ids) => ids,
+                Err(e) => return internal_error(e),
+            }
+        }
+    };
+
+    let hub = &state
+        .ctx
+        .moonfin_settings;
+    let _write = hub
+        .write_lock()
+        .await;
+    let db = &state
+        .ctx
+        .db;
+    let defaults = match load_defaults(db).await {
+        Ok(d) => d
+            .map(|d| d.settings)
+            .unwrap_or_default(),
+        Err(e) => return internal_error(e),
+    };
+    let client_id = match request.mode {
+        ApplyMode::Merge => "admin-default-merge",
+        ApplyMode::Overwrite => "admin-default-overwrite",
+    };
+
+    let result: Result<(Vec<Uuid>, usize, usize), sqlx::Error> = async {
+        let mut tx = db
+            .begin()
+            .await?;
+        let mut affected = Vec::new();
+        let mut keys_written = 0;
+        let mut skipped = 0;
+        for user in targets {
+            let row: Option<String> = sqlx::query_scalar(
+                "SELECT data FROM moonfin_settings WHERE user_id = ?1 AND profile = ?2",
+            )
+            .bind(user)
+            .bind(&profile)
+            .fetch_optional(&mut *tx)
+            .await?;
+            if row.is_none() && request.mode == ApplyMode::Merge {
+                continue;
+            }
+            let before = row
+                .as_deref()
+                .map(parse_stored)
+                .unwrap_or_default();
+            let after = apply_defaults(&before, &defaults, request.mode);
+            let changed = changed_keys(&before, &after);
+            if changed == 0 {
+                continue;
+            }
+            let too_many_keys = after.len() > MAX_PROFILE_KEYS;
+            let serialized = Value::Object(after).to_string();
+            if too_many_keys || serialized.len() > MAX_PROFILE_BYTES {
+                skipped += 1;
+                continue;
+            }
+            sqlx::query(
+                "INSERT INTO moonfin_settings (user_id, profile, data, updated_at, updated_by) \
+                 VALUES (?1, ?2, ?3, ?4, ?5) \
+                 ON CONFLICT(user_id, profile) DO UPDATE SET \
+                 data = excluded.data, updated_at = excluded.updated_at, \
+                 updated_by = excluded.updated_by",
+            )
+            .bind(user)
+            .bind(&profile)
+            .bind(&serialized)
+            .bind(now_ms())
+            .bind(client_id)
+            .execute(&mut *tx)
+            .await?;
+            keys_written += changed;
+            affected.push(user);
+        }
+        tx.commit()
+            .await?;
+        Ok((affected, keys_written, skipped))
+    }
+    .await;
+    match result {
+        Ok((affected, keys_written, skipped)) => {
+            for user in &affected {
+                hub.notify(*user, StreamEvent::SettingsUpdated);
+            }
+            Json(json!({
+                "usersAffected": affected.len(),
+                "keysWritten": keys_written,
+                "usersSkipped": skipped,
+            }))
+            .into_response()
         }
         Err(e) => internal_error(e),
     }
@@ -1143,5 +1407,331 @@ mod tests {
         assert_eq!(body["webApp"]["version"], Value::Null);
         assert_eq!(body["webApp"]["forcedServerUrl"], Value::Null);
         assert_eq!(body["defaultsKeyCount"], 0);
+    }
+
+    async fn apply(h: &Harness, token: &str, body: Value) -> axum_test::TestResponse {
+        h.post(token, "/Moonfin/Admin/Defaults/Apply", &body)
+            .await
+    }
+
+    async fn stored(h: &Harness, id: Uuid, profile: &str) -> Option<Value> {
+        let body = h
+            .get(
+                &h.token,
+                &format!("/Moonfin/Admin/Users/{}/Settings", simple(id)),
+            )
+            .await
+            .json::<Value>();
+        let settings = body["profiles"][profile]["settings"].clone();
+        (!settings.is_null()).then_some(settings)
+    }
+
+    async fn set_defaults(h: &Harness, settings: Value) {
+        put_defaults(h, &h.token, json!({ "settings": settings }))
+            .await
+            .assert_status_ok();
+    }
+
+    #[test]
+    fn apply_defaults_merge_keeps_user_values_and_overwrite_replaces_them() {
+        let obj = |v: Value| {
+            v.as_object()
+                .unwrap()
+                .clone()
+        };
+        let stored = obj(json!({ "a": "mine", "own": 1, "n": null }));
+        let defaults = obj(json!({
+            "a": "default", "b": "new", "n": "filled", "nothing": null,
+            "subtitleMode": "always",
+        }));
+        let merged = apply_defaults(&stored, &defaults, ApplyMode::Merge);
+        assert_eq!(
+            Value::Object(merged),
+            json!({ "a": "mine", "own": 1, "b": "new", "n": "filled" })
+        );
+        let over = apply_defaults(&stored, &defaults, ApplyMode::Overwrite);
+        assert_eq!(
+            Value::Object(over),
+            json!({ "a": "default", "own": 1, "b": "new", "n": "filled" })
+        );
+    }
+
+    #[test]
+    fn apply_defaults_treats_the_home_layout_as_a_pair() {
+        let obj = |v: Value| {
+            v.as_object()
+                .unwrap()
+                .clone()
+        };
+        let defaults =
+            obj(json!({ "homeSections": [{ "type": "x" }], "homeRowOrder": ["x"] }));
+        // The user has one half: merge leaves the layout alone entirely.
+        let stored = obj(json!({ "homeSections": [{ "type": "mine" }] }));
+        let merged = apply_defaults(&stored, &defaults, ApplyMode::Merge);
+        assert_eq!(merged, stored);
+        // With neither half, both arrive.
+        let merged = apply_defaults(&obj(json!({})), &defaults, ApplyMode::Merge);
+        assert_eq!(Value::Object(merged), Value::Object(defaults.clone()));
+    }
+
+    #[tokio::test]
+    async fn merge_fills_gaps_for_existing_users_only_and_reports_counts() {
+        let h = Harness::new().await;
+        let other = h
+            .second_user()
+            .await;
+        let second = user_id(&h, "second").await;
+        let admin = user_id(&h, "test").await;
+        // The second user has synced; the admin never has.
+        push(&h, &other, "global", json!({ "a": "mine" })).await;
+        push(&h, &other, "tv", json!({ "a": "tv" })).await;
+        set_defaults(&h, json!({ "a": "default", "b": 1, "c": 2 })).await;
+
+        let resp =
+            apply(&h, &h.token, json!({ "scope": "all", "mode": "merge" })).await;
+        resp.assert_status_ok();
+        assert_eq!(
+            resp.json::<Value>(),
+            json!({ "usersAffected": 1, "keysWritten": 2, "usersSkipped": 0 })
+        );
+        assert_eq!(
+            stored(&h, second, "global")
+                .await
+                .unwrap(),
+            json!({ "a": "mine", "b": 1, "c": 2 })
+        );
+        // Other profiles are untouched, and a user with nothing stored still
+        // just resolves to the defaults.
+        assert_eq!(
+            stored(&h, second, "tv")
+                .await
+                .unwrap(),
+            json!({ "a": "tv" })
+        );
+        assert!(
+            stored(&h, admin, "global")
+                .await
+                .is_none()
+        );
+
+        // A second run has nothing left to fill.
+        let again = apply(&h, &h.token, json!({ "scope": "all", "mode": "merge" }))
+            .await
+            .json::<Value>();
+        assert_eq!(again["usersAffected"], 0);
+        assert_eq!(again["keysWritten"], 0);
+    }
+
+    #[tokio::test]
+    async fn overwrite_sets_default_keys_keeps_the_rest_and_creates_missing_profiles() {
+        let h = Harness::new().await;
+        let other = h
+            .second_user()
+            .await;
+        let second = user_id(&h, "second").await;
+        let admin = user_id(&h, "test").await;
+        push(&h, &other, "global", json!({ "a": "mine", "own": true })).await;
+        set_defaults(&h, json!({ "a": "default", "b": 1 })).await;
+
+        let resp =
+            apply(&h, &h.token, json!({ "scope": "all", "mode": "overwrite" })).await;
+        resp.assert_status_ok();
+        // second: a changed + b added; admin: a + b created.
+        assert_eq!(
+            resp.json::<Value>(),
+            json!({ "usersAffected": 2, "keysWritten": 4, "usersSkipped": 0 })
+        );
+        assert_eq!(
+            stored(&h, second, "global")
+                .await
+                .unwrap(),
+            json!({ "a": "default", "b": 1, "own": true })
+        );
+        assert_eq!(
+            stored(&h, admin, "global")
+                .await
+                .unwrap(),
+            json!({ "a": "default", "b": 1 })
+        );
+    }
+
+    #[tokio::test]
+    async fn apply_to_one_user_and_a_chosen_profile() {
+        let h = Harness::new().await;
+        let other = h
+            .second_user()
+            .await;
+        let second = user_id(&h, "second").await;
+        let admin = user_id(&h, "test").await;
+        push(&h, &other, "tv", json!({ "own": 1 })).await;
+        set_defaults(&h, json!({ "b": 1 })).await;
+
+        let resp = apply(
+            &h,
+            &h.token,
+            json!({
+                "scope": "user", "userId": simple(second),
+                "mode": "merge", "profile": "TV",
+            }),
+        )
+        .await;
+        resp.assert_status_ok();
+        assert_eq!(resp.json::<Value>()["usersAffected"], 1);
+        assert_eq!(
+            stored(&h, second, "tv")
+                .await
+                .unwrap(),
+            json!({ "own": 1, "b": 1 })
+        );
+        assert!(
+            stored(&h, admin, "tv")
+                .await
+                .is_none()
+        );
+
+        for (body, status) in [
+            (json!({ "scope": "user", "mode": "merge" }), 400),
+            (
+                json!({ "scope": "user", "userId": "nope", "mode": "merge" }),
+                400,
+            ),
+            (
+                json!({ "scope": "user", "userId": simple(Uuid::new_v4()), "mode": "merge" }),
+                404,
+            ),
+            (json!({ "scope": "all", "mode": "replace" }), 400),
+            (
+                json!({ "scope": "all", "mode": "merge", "profile": "watch" }),
+                400,
+            ),
+            (json!({ "mode": "merge" }), 400),
+        ] {
+            assert_eq!(
+                apply(&h, &h.token, body.clone())
+                    .await
+                    .status_code(),
+                status,
+                "{body}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn apply_tells_only_the_users_it_changed() {
+        let h = Harness::new().await;
+        let other = h
+            .second_user()
+            .await;
+        let second = user_id(&h, "second").await;
+        push(&h, &other, "global", json!({ "a": 1 })).await;
+        set_defaults(&h, json!({ "b": 1 })).await;
+        let mut theirs = h
+            .ctx
+            .moonfin_settings
+            .subscribe(second);
+        let mut admins = h
+            .ctx
+            .moonfin_settings
+            .subscribe(user_id(&h, "test").await);
+        // Defaults saved above already notified; start from a clean slate.
+        while theirs
+            .try_event()
+            .is_some()
+        {}
+        while admins
+            .try_event()
+            .is_some()
+        {}
+
+        apply(&h, &h.token, json!({ "scope": "all", "mode": "merge" }))
+            .await
+            .assert_status_ok();
+        assert_eq!(theirs.try_event(), Some(StreamEvent::SettingsUpdated));
+        assert_eq!(admins.try_event(), None);
+
+        // Nothing changes the second time, so nobody is told.
+        apply(&h, &h.token, json!({ "scope": "all", "mode": "merge" }))
+            .await
+            .assert_status_ok();
+        assert_eq!(theirs.try_event(), None);
+    }
+
+    #[tokio::test]
+    async fn apply_skips_users_whose_profile_would_exceed_the_caps() {
+        let h = Harness::new().await;
+        let other = h
+            .second_user()
+            .await;
+        let second = user_id(&h, "second").await;
+        // Fill the second user's profile to the key cap directly.
+        let full: serde_json::Map<String, Value> = (0..MAX_PROFILE_KEYS)
+            .map(|i| (format!("k{i}"), json!(1)))
+            .collect();
+        sqlx::query(
+            "INSERT INTO moonfin_settings (user_id, profile, data, updated_at, updated_by) \
+             VALUES (?1, 'global', ?2, 0, 'test')",
+        )
+        .bind(second)
+        .bind(Value::Object(full).to_string())
+        .execute(&h.ctx.db)
+        .await
+        .unwrap();
+        let _ = other;
+        set_defaults(&h, json!({ "extra": 1 })).await;
+
+        let body = apply(&h, &h.token, json!({ "scope": "all", "mode": "overwrite" }))
+            .await
+            .json::<Value>();
+        // Only the admin (no stored profile) got the default.
+        assert_eq!(body["usersAffected"], 1);
+        assert_eq!(body["usersSkipped"], 1);
+        let kept = stored(&h, second, "global")
+            .await
+            .unwrap();
+        assert!(
+            kept.get("extra")
+                .is_none()
+        );
+        assert_eq!(
+            kept.as_object()
+                .unwrap()
+                .len(),
+            MAX_PROFILE_KEYS
+        );
+    }
+
+    #[tokio::test]
+    async fn apply_with_no_defaults_changes_nothing() {
+        let h = Harness::new().await;
+        let body = apply(&h, &h.token, json!({ "scope": "all", "mode": "overwrite" }))
+            .await
+            .json::<Value>();
+        assert_eq!(
+            body,
+            json!({ "usersAffected": 0, "keysWritten": 0, "usersSkipped": 0 })
+        );
+    }
+
+    #[tokio::test]
+    async fn apply_needs_an_admin() {
+        let h = Harness::new().await;
+        let other = h
+            .second_user()
+            .await;
+        let body = json!({ "scope": "all", "mode": "merge" });
+        assert_eq!(
+            h.server
+                .post("/Moonfin/Admin/Defaults/Apply")
+                .json(&body)
+                .await
+                .status_code(),
+            401
+        );
+        assert_eq!(
+            apply(&h, &other, body)
+                .await
+                .status_code(),
+            403
+        );
     }
 }

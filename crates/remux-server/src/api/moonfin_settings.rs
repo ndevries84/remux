@@ -45,10 +45,10 @@ use crate::{AppContext, AppState, Config, db::auth::AuthSession};
 pub(crate) const MAX_SAVE_BYTES: usize = 1024 * 1024;
 /// Cap on the serialized size of a merged (stored) profile. Each save is
 /// capped at `MAX_SAVE_BYTES`, but merges add keys forever without this.
-const MAX_PROFILE_BYTES: usize = MAX_SAVE_BYTES;
+pub(crate) const MAX_PROFILE_BYTES: usize = MAX_SAVE_BYTES;
 /// Cap on top-level keys in a merged profile. The Moonfin client syncs a
 /// few hundred settings, so this is generous headroom, not a working limit.
-const MAX_PROFILE_KEYS: usize = 2000;
+pub(crate) const MAX_PROFILE_KEYS: usize = 2000;
 /// Longest `clientId` stored in `updated_by`; longer values are truncated.
 const MAX_CLIENT_ID_CHARS: usize = 128;
 /// SSE heartbeat; the client treats 75 s of silence as a dead stream.
@@ -230,12 +230,12 @@ pub(crate) fn parse_profile(raw: &str) -> Option<String> {
         .then_some(lower)
 }
 
-fn now_ms() -> i64 {
+pub(crate) fn now_ms() -> i64 {
     chrono::Utc::now().timestamp_millis()
 }
 
 /// Merges `incoming` into `stored` (top-level keys, whole-value replace).
-fn merge_profile(stored: &mut Profile, incoming: &Profile) {
+pub(crate) fn merge_profile(stored: &mut Profile, incoming: &Profile) {
     let present = |k: &str| {
         incoming
             .get(k)
@@ -366,7 +366,7 @@ fn resolve(layers: &[&Profile]) -> Profile {
 // Storage
 // ---------------------------------------------------------------------------
 
-fn parse_stored(data: &str) -> Profile {
+pub(crate) fn parse_stored(data: &str) -> Profile {
     match serde_json::from_str::<Value>(data) {
         Ok(Value::Object(map)) => map,
         _ => Profile::new(),
