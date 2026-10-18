@@ -104,6 +104,22 @@ impl StreamEvent {
     }
 }
 
+/// SSE frames for one receive result; `None` once the channel is closed.
+/// A lagged receiver missed an unknown mix of events, which carry no data,
+/// so it gets one of every kind: over-notifying only costs a refetch.
+fn frames_for(
+    msg: Result<StreamEvent, broadcast::error::RecvError>,
+) -> Option<Vec<Bytes>> {
+    match msg {
+        Ok(event) => Some(vec![event.frame()]),
+        Err(broadcast::error::RecvError::Lagged(_)) => Some(vec![
+            StreamEvent::SettingsUpdated.frame(),
+            StreamEvent::ThemesChanged.frame(),
+        ]),
+        Err(broadcast::error::RecvError::Closed) => None,
+    }
+}
+
 #[derive(Default)]
 struct HubInner {
     /// One broadcast channel per user with at least one open stream.
@@ -935,13 +951,13 @@ pub async fn moonfin_settings_stream(
         loop {
             let Some(rx) = guard.rx.as_mut() else { break };
             tokio::select! {
-                msg = rx.recv() => match msg {
-                    Ok(event) => yield Ok(event.frame()),
-                    // A lagged receiver missed events; one refresh covers them.
-                    Err(broadcast::error::RecvError::Lagged(_)) => {
-                        yield Ok(StreamEvent::SettingsUpdated.frame());
+                msg = rx.recv() => match frames_for(msg) {
+                    Some(frames) => {
+                        for frame in frames {
+                            yield Ok(frame);
+                        }
                     }
-                    Err(broadcast::error::RecvError::Closed) => break,
+                    None => break,
                 },
                 // Silence for a full interval: keep the connection alive.
                 _ = tokio::time::sleep(HEARTBEAT) => {
@@ -2462,6 +2478,51 @@ mod tests {
                 .await,
             "{:?}",
             sse.seen
+        );
+    }
+
+    #[tokio::test]
+    async fn lagging_stream_is_resent_every_event_kind() {
+        let hub = super::SettingsHub::default();
+        let user = uuid::Uuid::new_v4();
+        let mut guard = hub.subscribe(user);
+        // Overflow the 16-slot channel without reading; only themes change,
+        // so a settingsUpdated-only recovery would lose them.
+        for _ in 0..40 {
+            hub.notify(user, super::StreamEvent::ThemesChanged);
+        }
+        let first = guard
+            .rx
+            .as_mut()
+            .unwrap()
+            .recv()
+            .await;
+        assert!(matches!(
+            first,
+            Err(tokio::sync::broadcast::error::RecvError::Lagged(_))
+        ));
+        let frames = super::frames_for(first).unwrap();
+        assert_eq!(
+            frames,
+            vec![
+                super::StreamEvent::SettingsUpdated.frame(),
+                super::StreamEvent::ThemesChanged.frame()
+            ]
+        );
+        // Queued events after the lag are delivered normally.
+        let next = guard
+            .rx
+            .as_mut()
+            .unwrap()
+            .recv()
+            .await;
+        assert_eq!(
+            super::frames_for(next).unwrap(),
+            vec![super::StreamEvent::ThemesChanged.frame()]
+        );
+        assert!(
+            super::frames_for(Err(tokio::sync::broadcast::error::RecvError::Closed))
+                .is_none()
         );
     }
 }
