@@ -26,12 +26,14 @@ use std::{
 
 use axum::{
     Json,
+    body::Body,
     extract::{Query, State},
+    http::Request,
     http::StatusCode,
     response::{IntoResponse, Response},
 };
 use dashmap::DashMap;
-use remux_macros::get;
+use remux_macros::{get, post};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sqlx::SqlitePool;
@@ -723,6 +725,244 @@ pub async fn moonfin_mdblist_ratings(
     }
 }
 
+// ---------------------------------------------------------------------------
+// Admin tools: key test and cache clear
+// ---------------------------------------------------------------------------
+
+/// Largest accepted admin test body (it carries at most one key).
+const MAX_ADMIN_BODY_BYTES: usize = 16 * 1024;
+
+/// Outcome of asking MDBList about a key.
+#[derive(Debug, PartialEq)]
+pub(crate) enum KeyCheck {
+    Ok { limits: Value },
+    Failed(String),
+}
+
+fn header_i64(resp: &reqwest::Response, name: &str) -> Option<i64> {
+    resp.headers()
+        .get(name)?
+        .to_str()
+        .ok()?
+        .trim()
+        .parse()
+        .ok()
+}
+
+impl MdbListService {
+    /// One cheap call, `GET /user`, which reports the plan, its limits and the
+    /// request counters, and carries `X-RateLimit-*` headers. It bypasses the
+    /// ratings failure/rate-limit state on purpose: an admin testing a key
+    /// wants a live answer. The key is only sent upstream, never returned.
+    pub(crate) async fn check_key(&self, config: &Config, api_key: &str) -> KeyCheck {
+        let Ok(mut url) = reqwest::Url::parse(&format!(
+            "{}/user",
+            config
+                .mdblist_base_url
+                .trim_end_matches('/')
+        )) else {
+            return KeyCheck::Failed("MDBList is not configured correctly".into());
+        };
+        url.query_pairs_mut()
+            .append_pair("apikey", api_key);
+        let resp = match self
+            .inner
+            .client
+            .get(url)
+            .send()
+            .await
+        {
+            Ok(r) => r,
+            Err(e) => {
+                warn!(err = %e.without_url(), "MDBList key test failed");
+                return KeyCheck::Failed("Could not reach MDBList".into());
+            }
+        };
+        let status = resp.status();
+        if status == reqwest::StatusCode::UNAUTHORIZED
+            || status == reqwest::StatusCode::FORBIDDEN
+        {
+            return KeyCheck::Failed("MDBList rejected the API key".into());
+        }
+        if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+            return KeyCheck::Failed(RATE_LIMIT_MESSAGE.into());
+        }
+        if !status.is_success() {
+            return KeyCheck::Failed(format!(
+                "MDBList returned status {}",
+                status.as_u16()
+            ));
+        }
+        let header_limits = json!({
+            "limit": header_i64(&resp, "x-ratelimit-limit"),
+            "remaining": header_i64(&resp, "x-ratelimit-remaining"),
+            "reset": header_i64(&resp, "x-ratelimit-reset"),
+        });
+        let body = resp
+            .json::<Value>()
+            .await
+            .unwrap_or(Value::Null);
+        let mut limits = serde_json::Map::new();
+        limits.insert("rateLimit".into(), header_limits);
+        // Plan details, when the response has them; never anything else.
+        for (src, dst) in [
+            ("limits", "plan"),
+            ("api_requests", "apiRequests"),
+            ("api_requests_count", "apiRequestsCount"),
+        ] {
+            if let Some(v) = body.get(src) {
+                limits.insert(dst.into(), v.clone());
+            }
+        }
+        KeyCheck::Ok {
+            limits: Value::Object(limits),
+        }
+    }
+
+    /// Forgets every remembered failure and rate-limit gate; returns how many
+    /// (title failures, key failures, rate-limit gates) were dropped.
+    pub(crate) fn clear_memory(&self) -> (usize, usize, usize) {
+        let counts = (
+            self.inner
+                .title_failures
+                .iter()
+                .count(),
+            self.inner
+                .key_failures
+                .iter()
+                .count(),
+            self.inner
+                .rate_limited
+                .len(),
+        );
+        self.inner
+            .title_failures
+            .invalidate_all();
+        self.inner
+            .key_failures
+            .invalidate_all();
+        self.inner
+            .rate_limited
+            .clear();
+        counts
+    }
+}
+
+/// Tests an MDBList key without echoing it: the candidate `{"apiKey": "..."}`
+/// in the body, else the effective server key. Always `200 {ok, error?,
+/// limits?}`; `401`/`403` for non-admins.
+#[post("/moonfin/admin/mdblist/test")]
+pub async fn moonfin_admin_mdblist_test(
+    State(state): State<AppState>,
+    session: AuthSession,
+    req: Request<Body>,
+) -> Response {
+    use super::moonfin_admin::{json_error, require_admin};
+    if let Some(denied) = require_admin(&session) {
+        return denied;
+    }
+    let bytes = match axum::body::to_bytes(req.into_body(), MAX_ADMIN_BODY_BYTES).await
+    {
+        Ok(b) => b,
+        Err(_) => {
+            return json_error(StatusCode::PAYLOAD_TOO_LARGE, "Request body too large");
+        }
+    };
+    let candidate = if bytes
+        .iter()
+        .all(u8::is_ascii_whitespace)
+    {
+        None
+    } else {
+        match serde_json::from_slice::<Value>(&bytes) {
+            Ok(Value::Object(body)) => match body.get("apiKey") {
+                None | Some(Value::Null) => None,
+                Some(Value::String(k)) => Some(
+                    k.trim()
+                        .to_string(),
+                )
+                .filter(|k| !k.is_empty()),
+                Some(_) => {
+                    return json_error(
+                        StatusCode::BAD_REQUEST,
+                        "apiKey must be a string",
+                    );
+                }
+            },
+            _ => {
+                return json_error(
+                    StatusCode::BAD_REQUEST,
+                    "Body must be a JSON object",
+                );
+            }
+        }
+    };
+    let key = match candidate {
+        Some(k) => k,
+        None => match super::moonfin_server_settings::effective(&state)
+            .await
+            .mdblist_key
+        {
+            Some((k, _)) => k,
+            None => {
+                return Json(json!({
+                    "ok": false,
+                    "error": "No MDBList API key configured",
+                }))
+                .into_response();
+            }
+        },
+    };
+    let body = match state
+        .ctx
+        .mdblist
+        .check_key(
+            &state
+                .ctx
+                .config,
+            &key,
+        )
+        .await
+    {
+        KeyCheck::Ok { limits } => json!({ "ok": true, "limits": limits }),
+        KeyCheck::Failed(error) => json!({ "ok": false, "error": error }),
+    };
+    Json(body).into_response()
+}
+
+/// Empties the ratings cache and forgets in-memory failures and rate-limit
+/// gates, so the next lookups go upstream again.
+#[post("/moonfin/admin/mdblist/clear-cache")]
+pub async fn moonfin_admin_mdblist_clear_cache(
+    State(state): State<AppState>,
+    session: AuthSession,
+) -> Response {
+    if let Some(denied) = super::moonfin_admin::require_admin(&session) {
+        return denied;
+    }
+    let cleared = match sqlx::query("DELETE FROM mdblist_ratings_cache")
+        .execute(
+            &state
+                .ctx
+                .db,
+        )
+        .await
+    {
+        Ok(done) => done.rows_affected(),
+        Err(e) => return super::moonfin_settings::internal_error(e),
+    };
+    let (titles, keys, gates) = state
+        .ctx
+        .mdblist
+        .clear_memory();
+    Json(json!({
+        "clearedRatings": cleared,
+        "clearedFailures": titles + keys,
+        "clearedRateLimits": gates,
+    }))
+    .into_response()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1302,6 +1542,158 @@ mod tests {
             .await;
         assert_eq!(body["success"], true);
         m.assert_hits(1);
+    }
+
+    fn admin_post(h: &Harness, token: &str, path: &str) -> axum_test::TestRequest {
+        h.server
+            .post(path)
+            .add_header(
+                header::AUTHORIZATION,
+                http::HeaderValue::from_str(&auth_header_with_token(token)).unwrap(),
+            )
+    }
+
+    #[tokio::test]
+    async fn key_test_reports_limits_without_echoing_the_key() {
+        let mock = MockServer::start();
+        let m = mock.mock(|when, then| {
+            when.method(GET)
+                .path("/user")
+                .query_param("apikey", KEY);
+            then.status(200)
+                .header("X-RateLimit-Limit", "1000")
+                .header("X-RateLimit-Remaining", "990")
+                .header("X-RateLimit-Reset", "1790000000")
+                .json_body(json!({ "api_requests": 1000, "api_requests_count": 10, "email": "x@y.z" }));
+        });
+        let h = harness(Some(KEY), mock.base_url()).await;
+        // Effective key, empty body.
+        let resp = admin_post(&h, &h.token, "/moonfin/admin/mdblist/test").await;
+        resp.assert_status_ok();
+        assert!(
+            !resp
+                .text()
+                .contains(KEY)
+        );
+        assert!(
+            !resp
+                .text()
+                .contains("x@y.z")
+        );
+        let body = resp.json::<Value>();
+        assert_eq!(body["ok"], true);
+        assert_eq!(body["limits"]["rateLimit"]["limit"], 1000);
+        assert_eq!(body["limits"]["rateLimit"]["remaining"], 990);
+        assert_eq!(body["limits"]["apiRequests"], 1000);
+        m.assert_hits(1);
+    }
+
+    #[tokio::test]
+    async fn key_test_uses_a_candidate_key_and_reports_rejection() {
+        let mock = MockServer::start();
+        let rejected = mock.mock(|when, then| {
+            when.method(GET)
+                .path("/user")
+                .query_param("apikey", BAD);
+            then.status(403);
+        });
+        let h = harness(Some(KEY), mock.base_url()).await;
+        let resp = admin_post(&h, &h.token, "/moonfin/admin/mdblist/test")
+            .json(&json!({ "apiKey": BAD }))
+            .await;
+        let text = resp.text();
+        assert!(!text.contains(BAD));
+        let body: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(body["ok"], false);
+        assert_eq!(body["error"], "MDBList rejected the API key");
+        rejected.assert_hits(1);
+
+        // Malformed bodies are a client error.
+        let bad = admin_post(&h, &h.token, "/moonfin/admin/mdblist/test")
+            .json(&json!({ "apiKey": 5 }))
+            .await;
+        assert_eq!(bad.status_code(), 400);
+    }
+
+    #[tokio::test]
+    async fn key_test_without_any_key_says_so() {
+        let h = harness(None, "http://127.0.0.1:1".into()).await;
+        let body = admin_post(&h, &h.token, "/moonfin/admin/mdblist/test")
+            .await
+            .json::<Value>();
+        assert_eq!(body["ok"], false);
+        assert_eq!(body["error"], "No MDBList API key configured");
+    }
+
+    #[tokio::test]
+    async fn clear_cache_empties_the_cache_and_forgets_failures() {
+        let mock = MockServer::start();
+        let ok = mock.mock(|when, then| {
+            when.method(GET)
+                .path("/tmdb/movie/603");
+            then.status(200)
+                .json_body(upstream_body());
+        });
+        let h = harness(Some(KEY), mock.base_url()).await;
+        h.seed_movies(&[603, 604])
+            .await;
+        h.json(URL_603)
+            .await;
+        ok.assert_hits(1);
+        // A failure for another title is remembered ...
+        let fail = mock.mock(|when, then| {
+            when.method(GET)
+                .path("/tmdb/movie/604");
+            then.status(500);
+        });
+        let first = h
+            .json("/Moonfin/MdbList/Ratings?type=movie&tmdbId=604")
+            .await;
+        assert_eq!(first["success"], false);
+        h.json("/Moonfin/MdbList/Ratings?type=movie&tmdbId=604")
+            .await;
+        fail.assert_hits(1);
+
+        let resp = admin_post(&h, &h.token, "/moonfin/admin/mdblist/clear-cache").await;
+        resp.assert_status_ok();
+        let body = resp.json::<Value>();
+        assert_eq!(body["clearedRatings"], 1);
+        assert_eq!(body["clearedFailures"], 1);
+        assert_eq!(body["clearedRateLimits"], 0);
+
+        // ... and goes upstream again once cleared.
+        h.json(URL_603)
+            .await;
+        h.json("/Moonfin/MdbList/Ratings?type=movie&tmdbId=604")
+            .await;
+        ok.assert_hits(2);
+        fail.assert_hits(2);
+    }
+
+    #[tokio::test]
+    async fn mdblist_admin_tools_need_an_admin() {
+        let h = harness(Some(KEY), "http://127.0.0.1:1".into()).await;
+        let other = h
+            .second_user()
+            .await;
+        for path in [
+            "/moonfin/admin/mdblist/test",
+            "/moonfin/admin/mdblist/clear-cache",
+        ] {
+            assert_eq!(
+                h.server
+                    .post(path)
+                    .await
+                    .status_code(),
+                401
+            );
+            assert_eq!(
+                admin_post(&h, &other, path)
+                    .await
+                    .status_code(),
+                403
+            );
+        }
     }
 
     fn mock_ok<'a>(mock: &'a MockServer, path: &str, key: &str) -> httpmock::Mock<'a> {
