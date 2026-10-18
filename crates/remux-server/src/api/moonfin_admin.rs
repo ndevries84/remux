@@ -30,12 +30,12 @@ use super::moonfin_settings::{
 };
 use crate::{AppState, db::auth::AuthSession, games};
 
-fn json_error(status: StatusCode, message: impl Into<String>) -> Response {
+pub(crate) fn json_error(status: StatusCode, message: impl Into<String>) -> Response {
     (status, Json(json!({ "error": message.into() }))).into_response()
 }
 
 /// `Some(403)` response unless the caller is an admin.
-fn require_admin(session: &AuthSession) -> Option<Response> {
+pub(crate) fn require_admin(session: &AuthSession) -> Option<Response> {
     (!session
         .user
         .is_admin)
@@ -386,6 +386,7 @@ pub async fn moonfin_admin_status(
 async fn status(state: &AppState) -> Result<Value, sqlx::Error> {
     let ctx = &state.ctx;
     let config = &ctx.config;
+    let eff = super::moonfin_server_settings::effective(state).await;
 
     let roots = config
         .games_roots
@@ -421,7 +422,7 @@ async fn status(state: &AppState) -> Result<Value, sqlx::Error> {
             .is_ok_and(|m| m.is_file());
 
     Ok(json!({
-        "ping": ping_body(config),
+        "ping": ping_body(eff.mdblist_key.is_some()),
         "games": {
             "enabled": config.games_enabled,
             "active": active,
@@ -437,8 +438,9 @@ async fn status(state: &AppState) -> Result<Value, sqlx::Error> {
                 "index": ctx.game_meta.launchbox_status(),
             },
         },
-        // Whether a key is set, never the key.
-        "mdblistConfigured": config.mdblist_key().is_some(),
+        // Whether a key is set and where it comes from, never the key.
+        "mdblistConfigured": eff.mdblist_key.is_some(),
+        "mdblistKeySource": eff.mdblist_key.as_ref().map(|(_, s)| s),
         "webAppPresent": web_app,
         "themesCount": themes,
         "defaultsKeyCount": defaults_keys,

@@ -547,16 +547,16 @@ pub async fn moonfin_ping(
     State(state): State<AppState>,
     _session: AuthSession,
 ) -> Response {
-    Json(ping_body(
-        &state
-            .ctx
-            .config,
-    ))
-    .into_response()
+    let mdblist = super::moonfin_server_settings::effective(&state)
+        .await
+        .mdblist_key
+        .is_some();
+    Json(ping_body(mdblist)).into_response()
 }
 
 /// The `Ping` payload: which optional Moonfin features this server offers.
-pub(crate) fn ping_body(config: &Config) -> Value {
+/// `mdblist_available` is whether an effective server MDBList key exists.
+pub(crate) fn ping_body(mdblist_available: bool) -> Value {
     json!({
         "installed": true,
         "version": env!("CARGO_PKG_VERSION"),
@@ -564,7 +564,7 @@ pub(crate) fn ping_body(config: &Config) -> Value {
         "serverName": "Remux",
         "seerrEnabled": false,
         "seerrUrl": null,
-        "mdblistAvailable": config.mdblist_key().is_some(),
+        "mdblistAvailable": mdblist_available,
         "tmdbAvailable": false,
         "tmdbThumbsSupported": false,
         "messagesSupported": false,

@@ -668,7 +668,8 @@ pub async fn moonfin_mdblist_ratings(
         .and_then(Value::as_str)
         .map(str::trim)
         .filter(|k| !k.is_empty());
-    let Some(api_key) = own_key.or_else(|| config.mdblist_key()) else {
+    let server_key = super::moonfin_server_settings::effective(&state).await;
+    let Some(api_key) = own_key.or_else(|| server_key.mdblist_key()) else {
         return Json(RatingsResponse::failed(NO_KEY_MESSAGE)).into_response();
     };
     // The shared server key's quota is only spent on titles in this library;
@@ -1272,6 +1273,35 @@ mod tests {
                 .await["mdblistAvailable"],
             false
         );
+    }
+
+    #[tokio::test]
+    async fn proxy_uses_the_key_an_admin_set_at_runtime() {
+        let mock = MockServer::start();
+        let m = mock_ok(&mock, "/tmdb/movie/603", KEY);
+        // No environment key: the proxy only works once the admin sets one.
+        let h = harness(None, mock.base_url()).await;
+        h.seed_movies(&[603])
+            .await;
+        assert_eq!(
+            h.json(URL_603)
+                .await["success"],
+            false
+        );
+        h.server
+            .put("/moonfin/admin/server-settings")
+            .add_header(
+                header::AUTHORIZATION,
+                http::HeaderValue::from_str(&auth_header_with_token(&h.token)).unwrap(),
+            )
+            .json(&json!({ "mdblistApiKey": KEY }))
+            .await
+            .assert_status_ok();
+        let body = h
+            .json(URL_603)
+            .await;
+        assert_eq!(body["success"], true);
+        m.assert_hits(1);
     }
 
     fn mock_ok<'a>(mock: &'a MockServer, path: &str, key: &str) -> httpmock::Mock<'a> {

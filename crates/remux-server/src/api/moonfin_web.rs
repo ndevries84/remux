@@ -339,29 +339,27 @@ fn request_origin(headers: &HeaderMap) -> Option<String> {
 
 #[get("/moonfin/web/config.json")]
 pub async fn web_config(State(state): State<AppState>, headers: HeaderMap) -> Response {
-    let cfg = &state
-        .ctx
-        .config;
-    let default_url = cfg
-        .moonfin_web_default_server_url
-        .as_deref()
-        .map(|u| {
+    let eff = super::moonfin_server_settings::effective(&state).await;
+    let default_url = eff
+        .web_default_server_url
+        .as_ref()
+        .map(|(u, _)| {
             u.trim()
                 .trim_end_matches('/')
                 .to_string()
         })
         .filter(|u| !u.is_empty())
         .or_else(|| request_origin(&headers));
-    let forced = cfg
-        .moonfin_web_forced_server_url
-        .as_deref()
-        .map(normalize_forced_url)
+    let forced = eff
+        .web_forced_server_url
+        .as_ref()
+        .map(|(u, _)| normalize_forced_url(u))
         .filter(|u| !u.is_empty());
     let body = json!({
         "schemaVersion": 1,
         "defaultServerUrl": default_url,
         "discoveryProxyUrl": null,
-        "enableWebRtcScan": cfg.moonfin_web_enable_webrtc_scan,
+        "enableWebRtcScan": eff.web_enable_webrtc_scan.0,
         "brandingName": "Moonfin",
         "pluginMode": true,
         "forcedServerUrl": forced,
