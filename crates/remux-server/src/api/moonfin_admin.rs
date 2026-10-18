@@ -429,6 +429,7 @@ async fn status(state: &AppState) -> Result<Value, sqlx::Error> {
             "gameCount": game_count,
         },
         "cores": ctx.cores.status(config).await,
+        "emulatorjsCdnFallback": config.games_emulatorjs_cdn_fallback,
         "metadata": {
             "libretro": config.games_metadata_enabled,
             "launchbox": {
@@ -1046,12 +1047,23 @@ mod tests {
         assert_eq!(body["games"]["rootsCount"], 1);
         assert_eq!(body["games"]["gameCount"], 0);
         assert_eq!(body["cores"]["installed"], false);
+        assert_eq!(body["emulatorjsCdnFallback"], false);
         assert_eq!(body["metadata"]["launchbox"]["enabled"], false);
         assert_eq!(body["metadata"]["launchbox"]["index"]["indexed"], false);
         assert!(body["metadata"]["libretro"].is_boolean());
         assert_eq!(body["webAppPresent"], true);
         assert_eq!(body["themesCount"], 0);
         assert_eq!(body["defaultsKeyCount"], 2);
+    }
+
+    #[tokio::test]
+    async fn status_reports_the_emulatorjs_cdn_fallback_flag() {
+        let h = Harness::new_with(|c| c.games_emulatorjs_cdn_fallback = true).await;
+        let body = h
+            .get(&h.token, "/Moonfin/Admin/Status")
+            .await
+            .json::<Value>();
+        assert_eq!(body["emulatorjsCdnFallback"], true);
     }
 
     #[tokio::test]

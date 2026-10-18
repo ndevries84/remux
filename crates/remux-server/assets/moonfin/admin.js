@@ -246,8 +246,25 @@
         var link = el('a', { href: '/Moonfin/Web/', text: 'Open /Moonfin/Web/' });
         body.appendChild(el('div', { class: 'tile' }, [el('div', { class: 'k', text: 'Web app' }), link]));
       }
+      t('EmulatorJS CDN fallback', s.emulatorjsCdnFallback);
       renderCores(s.cores || {});
+      renderCdnNote(s);
     }).catch(handleError);
+  }
+
+  function renderCdnNote(s) {
+    var note = $('cdn-note');
+    clear(note);
+    var installed = !!(s.cores && s.cores.installed);
+    note.className = 'muted';
+    if (installed) {
+      note.appendChild(document.createTextNode('The web player uses the installed cores; the CDN fallback is not used.'));
+    } else if (s.emulatorjsCdnFallback) {
+      note.appendChild(document.createTextNode('Cores are not installed, so the web player loads EmulatorJS from cdn.emulatorjs.org. The CDN scripts run on this origin, next to stored sign-in tokens, so a compromised CDN could steal them. Install the cores to turn this off.'));
+    } else {
+      note.className = 'bad';
+      note.appendChild(document.createTextNode("The web player won't work until the cores are installed. Install them below. (GAMES_EMULATORJS_CDN_FALLBACK=true would load them from the CDN instead, which is not recommended.)"));
+    }
   }
 
   function renderCores(c) {

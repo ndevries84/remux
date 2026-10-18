@@ -219,6 +219,17 @@ pub fn spawn_games_warmup(ctx: &AppContext) {
             .cleanup_stale(&cleanup_ctx.config)
             .await;
     });
+    if ctx
+        .config
+        .games_emulatorjs_cdn_fallback
+    {
+        warn!(
+            "GAMES_EMULATORJS_CDN_FALLBACK is on: while the self-hosted EmulatorJS \
+             cores are not installed, the web player loads scripts from \
+             cdn.emulatorjs.org on this origin (no SRI). A compromised CDN could \
+             steal jellyfin-web tokens; install the cores from /Moonfin/Admin instead."
+        );
+    }
     if !games::is_active(&ctx.config) {
         return;
     }
@@ -786,6 +797,15 @@ pub struct Config {
     /// terms for the download, so enabling it makes you responsible for them.
     #[serde(default)]
     pub games_launchbox_enabled: bool,
+    /// When the self-hosted EmulatorJS bundle is not installed, let the web
+    /// player load EmulatorJS from `cdn.emulatorjs.org` instead of refusing to
+    /// start. Off by default (`GAMES_EMULATORJS_CDN_FALLBACK`). RISK: the
+    /// player runs on the Remux origin, which shares localStorage with
+    /// jellyfin-web (access tokens) and needs `'unsafe-eval'`; the CDN scripts
+    /// are not covered by SRI, so a compromised CDN could steal tokens. Prefer
+    /// installing the cores from `/Moonfin/Admin`. Ignored once cores are installed.
+    #[serde(default)]
+    pub games_emulatorjs_cdn_fallback: bool,
     /// Where to fetch the LaunchBox `Metadata.zip` (an http(s) URL), or the
     /// path of a local copy of it.
     #[serde(default = "default_games_launchbox_url")]
@@ -1126,6 +1146,7 @@ impl Default for Config {
             games_metadata_retry_secs: default_games_metadata_retry_secs(),
             games_metadata_max_hash_bytes: default_games_metadata_max_hash_bytes(),
             games_launchbox_enabled: false,
+            games_emulatorjs_cdn_fallback: false,
             games_launchbox_url: default_games_launchbox_url(),
             games_launchbox_refresh_days: default_games_launchbox_refresh_days(),
             games_cores_url: None,

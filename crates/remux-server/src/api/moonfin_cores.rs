@@ -323,7 +323,10 @@ mod tests {
             .await
     }
 
-    async fn player_uses_cdn(h: &Harness) -> bool {
+    /// True when the player is not self-hosted. Since the CDN is opt-in, a
+    /// server without installed cores serves the "not installed" page (no CDN
+    /// in the body or the CSP) instead of the CDN player.
+    async fn player_not_installed(h: &Harness) -> bool {
         let r = h
             .server
             .get(PLAYER)
@@ -335,13 +338,15 @@ mod tests {
             .to_str()
             .unwrap()
             .to_string();
-        let cdn = csp.contains("cdn.emulatorjs.org");
+        assert!(!csp.contains("cdn.emulatorjs.org"));
+        let body = r.text();
+        assert!(!body.contains("https://cdn.emulatorjs.org"));
+        let self_hosted = body.contains("window.EJS_pathtodata = './data/'");
         assert_eq!(
-            cdn,
-            r.text()
-                .contains("https://cdn.emulatorjs.org/4.2.3/data/")
+            !self_hosted,
+            body.contains("Emulator files aren't installed on this server")
         );
-        cdn
+        !self_hosted
     }
 
     fn leftovers(h: &Harness) -> Vec<String> {
@@ -435,7 +440,7 @@ mod tests {
         let mock = mount(&server, &archive, Duration::from_millis(300)).await;
         let url = server.url("/cores.7z");
         let h = harness_for(&url, &sha_hex(&archive), Some(archive.len() as u64)).await;
-        assert!(player_uses_cdn(&h).await);
+        assert!(player_not_installed(&h).await);
 
         let resp = h
             .post_empty(&h.token, INSTALL)
@@ -479,7 +484,7 @@ mod tests {
         );
         assert!(leftovers(&h).is_empty(), "{:?}", leftovers(&h));
 
-        assert!(!player_uses_cdn(&h).await);
+        assert!(!player_not_installed(&h).await);
         assert!(
             h.server
                 .get(PLAYER)
@@ -520,7 +525,7 @@ mod tests {
             .exists()
         );
         assert!(leftovers(&h).is_empty(), "{:?}", leftovers(&h));
-        assert!(player_uses_cdn(&h).await);
+        assert!(player_not_installed(&h).await);
     }
 
     #[tokio::test]
@@ -646,7 +651,7 @@ mod tests {
         let s = wait_settled(&h).await;
         assert_eq!(s["state"], "installed");
         assert_eq!(s["filesInstalled"], 4);
-        assert!(!player_uses_cdn(&h).await);
+        assert!(!player_not_installed(&h).await);
 
         // A zip whose root is the data folder itself replaces the install.
         let flat: Vec<(String, Vec<u8>)> = vec![
@@ -799,7 +804,7 @@ mod tests {
                 .unwrap()
                 .contains("emulator.min.css")
         );
-        assert!(player_uses_cdn(&h).await);
+        assert!(player_not_installed(&h).await);
 
         upload(
             &h,
@@ -824,7 +829,7 @@ mod tests {
             )
             .exists()
         );
-        assert!(player_uses_cdn(&h).await);
+        assert!(player_not_installed(&h).await);
         // A later success clears the error.
         upload(
             &h,
@@ -885,7 +890,7 @@ mod tests {
         let s = status(&h).await;
         assert_eq!(s["installed"], false);
         assert_eq!(s["filesInstalled"], 0);
-        assert!(player_uses_cdn(&h).await);
+        assert!(player_not_installed(&h).await);
     }
 
     #[tokio::test]

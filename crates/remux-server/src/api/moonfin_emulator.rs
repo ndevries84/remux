@@ -4,8 +4,11 @@
 //! static, anonymous documents (the webview sends no auth headers; the ROM,
 //! BIOS and save URLs it fetches carry their own `ApiKey`). EmulatorJS itself
 //! is loaded from the self-hosted `<data_dir>/games/emulatorjs/data/` folder
-//! when present, otherwise from the EmulatorJS CDN. Like Moonbase, these
-//! routes are not gated on the games feature being enabled.
+//! when installed. Otherwise the player refuses to start (a static "not
+//! installed" page) unless the operator opted into the EmulatorJS CDN with
+//! `games_emulatorjs_cdn_fallback`: the player shares an origin with
+//! jellyfin-web's stored tokens, so un-pinned CDN scripts are opt-in only.
+//! Like Moonbase, these routes are not gated on the games feature being enabled.
 
 use std::{
     path::{Component, Path as FsPath, PathBuf},
@@ -30,6 +33,10 @@ use crate::{
 };
 
 const PLAYER_HTML: &str = include_str!("../../assets/moonfin/player.html");
+/// Shown (with status 200, see `emulator_player`) when no cores are installed
+/// and the CDN fallback is off. No scripts, no external URLs.
+const UNAVAILABLE_HTML: &str =
+    include_str!("../../assets/moonfin/player-unavailable.html");
 const BRIDGE_JS: &str = include_str!("../../assets/moonfin/moonfin-bridge.js");
 
 /// Placeholder in `player.html` replaced with the EmulatorJS data URL.
@@ -125,6 +132,35 @@ fn content_security_policy(data_origin: &str, nonce: &str) -> String {
     )
 }
 
+/// Where the player gets EmulatorJS from. Decided once per request.
+enum PlayerSource {
+    /// Installed bundle served by this server.
+    SelfHosted,
+    /// Operator opted in to the CDN (`games_emulatorjs_cdn_fallback`).
+    Cdn,
+    /// Nothing to load from: show the "not installed" page.
+    Unavailable,
+}
+
+impl PlayerSource {
+    fn resolve(installed: bool, cdn_fallback: bool) -> Self {
+        match (installed, cdn_fallback) {
+            (true, _) => Self::SelfHosted,
+            (false, true) => Self::Cdn,
+            (false, false) => Self::Unavailable,
+        }
+    }
+}
+
+/// CSP for the "not installed" page: no scripts at all, a nonce'd style only.
+fn unavailable_content_security_policy(nonce: &str) -> String {
+    format!(
+        "default-src 'none'; style-src 'nonce-{nonce}'; \
+         object-src 'none'; base-uri 'none'; form-action 'none'; \
+         frame-ancestors 'self'"
+    )
+}
+
 #[get("/moonfin/emulatorjs/player.html")]
 pub async fn emulator_player(
     State(state): State<AppState>,
@@ -145,22 +181,38 @@ pub async fn emulator_player(
     };
     // A half-extracted or stale folder must not flip the player to a broken
     // self-hosted mode: it needs the required files and a matching version.
-    let self_hosted = games::cores::data_installed(&data_root(&state)).await;
-    let (data_url, script_origin) = if self_hosted {
-        (SELF_HOSTED_DATA_URL.to_string(), "'self'")
-    } else {
-        (
-            format!("{CDN_ORIGIN}/{EMULATORJS_VERSION}/data/"),
-            CDN_ORIGIN,
-        )
-    };
+    let installed = games::cores::data_installed(&data_root(&state)).await;
+    let source = PlayerSource::resolve(
+        installed,
+        state
+            .ctx
+            .config
+            .games_emulatorjs_cdn_fallback,
+    );
     let mut nonce_bytes = [0u8; 16];
     rand::thread_rng().fill_bytes(&mut nonce_bytes);
     let nonce = base64::engine::general_purpose::STANDARD.encode(nonce_bytes);
-    let html = PLAYER_HTML
-        .replace(PATHTODATA_PLACEHOLDER, &data_url)
-        .replace(NONCE_PLACEHOLDER, &nonce);
-    let csp = content_security_policy(script_origin, &nonce);
+    let (html, csp) = match source {
+        PlayerSource::Unavailable => (
+            UNAVAILABLE_HTML.replace(NONCE_PLACEHOLDER, &nonce),
+            unavailable_content_security_policy(&nonce),
+        ),
+        PlayerSource::SelfHosted | PlayerSource::Cdn => {
+            let (data_url, script_origin) = match source {
+                PlayerSource::Cdn => (
+                    format!("{CDN_ORIGIN}/{EMULATORJS_VERSION}/data/"),
+                    CDN_ORIGIN,
+                ),
+                _ => (SELF_HOSTED_DATA_URL.to_string(), "'self'"),
+            };
+            (
+                PLAYER_HTML
+                    .replace(PATHTODATA_PLACEHOLDER, &data_url)
+                    .replace(NONCE_PLACEHOLDER, &nonce),
+                content_security_policy(script_origin, &nonce),
+            )
+        }
+    };
     let mut resp = (
         [(
             header::CONTENT_TYPE,
@@ -270,7 +322,15 @@ mod tests {
     use tower::util::MapRequestLayer;
 
     async fn server(data: &tempfile::TempDir) -> (TestServer, TestGuard) {
+        server_with(data, false).await
+    }
+
+    async fn server_with(
+        data: &tempfile::TempDir,
+        cdn_fallback: bool,
+    ) -> (TestServer, TestGuard) {
         let (router, ctx) = init_app_with_ctx(Config {
+            games_emulatorjs_cdn_fallback: cdn_fallback,
             database_url: Some("sqlite::memory:".into()),
             torrent_http_port: None,
             torrent_peer_port: None,
@@ -302,9 +362,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn player_served_anonymously_with_cdn_default() {
+    async fn player_served_anonymously_in_cdn_mode_when_opted_in() {
         let data = tempfile::tempdir().unwrap();
-        let (s, _g) = server(&data).await;
+        let (s, _g) = server_with(&data, true).await;
         let resp = s
             .get("/Moonfin/EmulatorJS/player.html?core=nes&rom=http%3A%2F%2Fx%2From")
             .await;
@@ -446,7 +506,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn partial_or_stale_install_keeps_the_cdn() {
+    async fn partial_or_stale_install_is_not_self_hosted() {
         let data = tempfile::tempdir().unwrap();
         let root = data
             .path()
@@ -455,7 +515,7 @@ mod tests {
         // Only two of the three required files.
         std::fs::write(root.join("loader.js"), "x").unwrap();
         std::fs::write(root.join("emulator.min.js"), "x").unwrap();
-        let (s, _g) = server(&data).await;
+        let (s, _g) = server_with(&data, true).await;
         let page = "/Moonfin/EmulatorJS/player.html?core=nes&rom=x";
         let body = s
             .get(page)
@@ -483,6 +543,63 @@ mod tests {
             .await
             .text();
         assert!(body.contains("window.EJS_pathtodata = './data/'"));
+    }
+
+    #[tokio::test]
+    async fn not_installed_by_default_shows_message_without_cdn() {
+        let data = tempfile::tempdir().unwrap();
+        let (s, _g) = server(&data).await;
+        let resp = s
+            .get("/Moonfin/EmulatorJS/player.html?core=nes&rom=x")
+            .await;
+        // 200 so the webview renders the message (a non-2xx main frame only
+        // yields the app's generic "Could not load the emulator (HTTP n)").
+        resp.assert_status_ok();
+        let csp = hdr(&resp, "content-security-policy").unwrap();
+        assert!(!csp.contains("cdn.emulatorjs.org"));
+        assert!(!csp.contains("script-src"));
+        assert!(csp.contains("default-src 'none'"));
+        let body = resp.text();
+        assert!(!body.contains("emulatorjs.org"));
+        assert!(!body.contains("http"));
+        assert!(!body.contains("<script"));
+        assert!(!body.contains(NONCE_PLACEHOLDER));
+        assert!(body.contains(
+            "Emulator files aren't installed on this server. An admin can install \
+             them from /Moonfin/Admin."
+        ));
+        let nonce = csp
+            .split("'nonce-")
+            .nth(1)
+            .unwrap()
+            .split('\'')
+            .next()
+            .unwrap();
+        assert!(body.contains(&format!("<style nonce=\"{nonce}\">")));
+    }
+
+    #[tokio::test]
+    async fn installed_is_self_hosted_regardless_of_cdn_flag() {
+        let data = tempfile::tempdir().unwrap();
+        let root = data
+            .path()
+            .join("games/emulatorjs/data");
+        std::fs::create_dir_all(&root).unwrap();
+        for f in games::cores::REQUIRED_FILES {
+            std::fs::write(root.join(f), "x").unwrap();
+        }
+        for flag in [false, true] {
+            let (s, _g) = server_with(&data, flag).await;
+            let resp = s
+                .get("/Moonfin/EmulatorJS/player.html?core=nes&rom=x")
+                .await;
+            let csp = hdr(&resp, "content-security-policy").unwrap();
+            assert!(!csp.contains("cdn.emulatorjs.org"), "flag={flag}");
+            let body = resp.text();
+            // (player.html's update-check comment names the CDN host, so check the URL.)
+            assert!(!body.contains("https://cdn.emulatorjs.org"), "flag={flag}");
+            assert!(body.contains("window.EJS_pathtodata = './data/'"));
+        }
     }
 
     #[tokio::test]
