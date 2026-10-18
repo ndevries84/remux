@@ -150,6 +150,49 @@ struct Inner {
     /// `scanned_at` of the snapshot last used to pre-load databases.
     prewarmed: Mutex<Option<Instant>>,
     launchbox: LaunchBox,
+    /// Test hook: the next database load panics.
+    #[cfg(test)]
+    panic_next_load: std::sync::atomic::AtomicBool,
+}
+
+/// Resets a database slot if its load task unwinds, so the slot does not stay
+/// `Loading` (and every caller stuck on it) forever. A refresh keeps serving
+/// the index it already had.
+struct LoadGuard {
+    inner: Arc<Inner>,
+    platform: &'static str,
+    keep: Option<Arc<RdbIndex>>,
+    retry: Duration,
+    armed: bool,
+}
+
+impl Drop for LoadGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let until = Instant::now() + self.retry;
+        let slot = match self
+            .keep
+            .take()
+        {
+            Some(index) => Slot::Ready {
+                index,
+                next_check: until,
+            },
+            None => Slot::Failed { until },
+        };
+        warn!(
+            platform = self.platform,
+            "games: metadata database load panicked"
+        );
+        lock(
+            &self
+                .inner
+                .slots,
+        )
+        .insert(self.platform, slot);
+    }
 }
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -186,6 +229,8 @@ impl Default for MetaService {
                 crc_inflight: DashMap::new(),
                 prewarmed: Mutex::new(None),
                 launchbox: LaunchBox::default(),
+                #[cfg(test)]
+                panic_next_load: std::sync::atomic::AtomicBool::new(false),
             }),
         }
     }
@@ -467,7 +512,15 @@ impl MetaService {
             .clone();
         let keep = previous.clone();
         let handle = tokio::spawn(async move {
+            let mut guard = LoadGuard {
+                inner: inner.clone(),
+                platform,
+                keep: keep.clone(),
+                retry: st.retry,
+                armed: true,
+            };
             let out = load_platform(&inner, &st, platform).await;
+            guard.armed = false;
             let now = Instant::now();
             let slot = match out
                 .index
@@ -746,6 +799,13 @@ fn sidecar(path: &Path, ext: &str) -> PathBuf {
 }
 
 async fn load_platform(inner: &Inner, st: &Settings, platform: &str) -> Outcome {
+    #[cfg(test)]
+    if inner
+        .panic_next_load
+        .swap(false, std::sync::atomic::Ordering::SeqCst)
+    {
+        panic!("injected database load panic");
+    }
     let failed = |index| Outcome {
         index,
         next_check_in: st.retry,
@@ -1270,6 +1330,52 @@ mod tests {
         assert_eq!(
             db_url("https://x/rdb/", "Sega - Mega Drive - Genesis"),
             "https://x/rdb/Sega%20-%20Mega%20Drive%20-%20Genesis.rdb"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_panicking_database_load_recovers_on_the_next_call() {
+        let mut fx = warm_fixture();
+        fx.config
+            .games_launchbox_enabled = false;
+        let game = &fx
+            .snap
+            .games[0];
+        let svc = MetaService::default();
+
+        svc.inner
+            .panic_next_load
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        svc.warm(&fx.config, &fx.snap)
+            .await;
+        {
+            // The slot recorded a failure (backoff) instead of staying
+            // `Loading`; let the backoff lapse without waiting for it.
+            let mut slots = lock(
+                &svc.inner
+                    .slots,
+            );
+            assert!(!slots.is_empty());
+            for slot in slots.values_mut() {
+                assert!(
+                    matches!(slot, Slot::Failed { .. }),
+                    "a dead load must not leave the slot loading"
+                );
+                *slot = Slot::Failed {
+                    until: Instant::now(),
+                };
+            }
+        }
+
+        // The next call loads the database for real.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+        let meta = svc
+            .get_until(&fx.config, game, deadline)
+            .await;
+        assert_eq!(
+            meta.genre
+                .as_deref(),
+            Some("RPG")
         );
     }
 }

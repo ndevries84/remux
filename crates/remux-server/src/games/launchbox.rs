@@ -932,6 +932,59 @@ struct Inner {
     maps: Mutex<HashMap<Core, MapSlot>>,
     /// Signalled whenever a background update finishes.
     settled: tokio::sync::Notify,
+    /// Test hook: the next background update panics.
+    #[cfg(test)]
+    panic_next_update: std::sync::atomic::AtomicBool,
+}
+
+/// Ends a background update when its task unwinds: clears `running` (else
+/// `prewarm` never starts again and `settled()` never returns), schedules a
+/// backed-off retry and wakes waiters.
+struct UpdateGuard {
+    inner: Arc<Inner>,
+    retry: Duration,
+    armed: bool,
+}
+
+impl Drop for UpdateGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        finish_update(&self.inner, self.retry, Err("update task panicked".into()));
+    }
+}
+
+/// Records the outcome of a background update and wakes `settled()` waiters.
+fn finish_update(inner: &Inner, retry: Duration, result: Result<Duration, String>) {
+    let mut s = lock(&inner.schedule);
+    s.running = false;
+    let now = Instant::now();
+    match result {
+        Ok(next) => {
+            s.failures = 0;
+            s.retry_at = None;
+            s.next_check = Some(now + next);
+        }
+        Err(e) => {
+            s.failures = s
+                .failures
+                .saturating_add(1);
+            let factor = 1u32
+                << s.failures
+                    .saturating_sub(1)
+                    .min(16);
+            let wait = retry
+                .saturating_mul(factor)
+                .min(MAX_BACKOFF);
+            s.retry_at = Some(now + wait);
+            warn!(error = %e, retry_in_secs = wait.as_secs(), "games: LaunchBox metadata update failed");
+        }
+    }
+    drop(s);
+    inner
+        .settled
+        .notify_waiters();
 }
 
 /// Coarse LaunchBox index state, for status displays.
@@ -958,6 +1011,8 @@ impl Default for LaunchBox {
                 schedule: Mutex::new(Schedule::default()),
                 maps: Mutex::new(HashMap::new()),
                 settled: tokio::sync::Notify::new(),
+                #[cfg(test)]
+                panic_next_update: std::sync::atomic::AtomicBool::new(false),
             }),
         }
     }
@@ -1036,39 +1091,24 @@ impl LaunchBox {
         let me = self.clone();
         let client = client.clone();
         tokio::spawn(async move {
-            let result = maintain(&me.inner, &client, &st, &wanted).await;
-            let mut s = lock(
-                &me.inner
-                    .schedule,
-            );
-            s.running = false;
-            let now = Instant::now();
-            match result {
-                Ok(next) => {
-                    s.failures = 0;
-                    s.retry_at = None;
-                    s.next_check = Some(now + next);
-                }
-                Err(e) => {
-                    s.failures = s
-                        .failures
-                        .saturating_add(1);
-                    let factor = 1u32
-                        << s.failures
-                            .saturating_sub(1)
-                            .min(16);
-                    let wait = st
-                        .retry
-                        .saturating_mul(factor)
-                        .min(MAX_BACKOFF);
-                    s.retry_at = Some(now + wait);
-                    warn!(error = %e, retry_in_secs = wait.as_secs(), "games: LaunchBox metadata update failed");
-                }
+            let mut guard = UpdateGuard {
+                inner: me
+                    .inner
+                    .clone(),
+                retry: st.retry,
+                armed: true,
+            };
+            #[cfg(test)]
+            if me
+                .inner
+                .panic_next_update
+                .swap(false, std::sync::atomic::Ordering::SeqCst)
+            {
+                panic!("injected update panic");
             }
-            drop(s);
-            me.inner
-                .settled
-                .notify_waiters();
+            let result = maintain(&me.inner, &client, &st, &wanted).await;
+            guard.armed = false;
+            finish_update(&me.inner, st.retry, result.map_err(|e| e.to_string()));
         });
     }
 
@@ -2192,6 +2232,74 @@ mod tests {
             read_stamp(dir.path())
                 .await
                 .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_panicking_update_does_not_wedge_the_schedule() {
+        let data = tempfile::tempdir().unwrap();
+        let config = Config {
+            data_dir: data
+                .path()
+                .to_path_buf(),
+            games_launchbox_enabled: true,
+            games_launchbox_url: data
+                .path()
+                .join("missing.zip")
+                .to_string_lossy()
+                .into_owned(),
+            ..Default::default()
+        };
+        let lb = LaunchBox::default();
+        let client = reqwest::Client::new();
+        let cores = HashSet::from([Core::Nes]);
+        let guard = |f| async {
+            tokio::time::timeout(Duration::from_secs(60), f)
+                .await
+                .expect("hung")
+        };
+
+        lb.inner
+            .panic_next_update
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        lb.prewarm(&client, &config, &cores);
+        guard(lb.settled()).await;
+        assert!(
+            !lb.status()
+                .updating
+        );
+        assert_eq!(
+            lock(
+                &lb.inner
+                    .schedule
+            )
+            .failures,
+            1
+        );
+        {
+            // A backed-off retry was scheduled; let the backoff lapse
+            // without waiting for it.
+            let mut s = lock(
+                &lb.inner
+                    .schedule,
+            );
+            assert!(
+                s.retry_at
+                    .is_some()
+            );
+            s.retry_at = None;
+        }
+
+        // A later call is allowed to start (and here fail for real) again.
+        lb.prewarm(&client, &config, &cores);
+        guard(lb.settled()).await;
+        assert_eq!(
+            lock(
+                &lb.inner
+                    .schedule
+            )
+            .failures,
+            2
         );
     }
 }

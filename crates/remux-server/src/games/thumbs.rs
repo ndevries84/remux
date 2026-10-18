@@ -201,6 +201,25 @@ struct Inner {
     inflight: DashMap<PathBuf, SharedFetch>,
     /// Cache path -> when the last transient failure happened.
     failures: DashMap<PathBuf, Instant>,
+    /// Test hook: the next fetch task panics.
+    #[cfg(test)]
+    panic_next_fetch: std::sync::atomic::AtomicBool,
+}
+
+/// Removes an in-flight entry when its fetch task ends, including by
+/// unwinding; otherwise a panic would leave every later request joining a
+/// dead fetch (answering "retry" forever).
+struct InflightGuard {
+    inner: Arc<Inner>,
+    key: PathBuf,
+}
+
+impl Drop for InflightGuard {
+    fn drop(&mut self) {
+        self.inner
+            .inflight
+            .remove(&self.key);
+    }
 }
 
 /// Fetch-and-cache service. Cheap to clone.
@@ -228,6 +247,8 @@ impl Default for ThumbService {
                 permits: Semaphore::new(MAX_CONCURRENT_FETCHES),
                 inflight: DashMap::new(),
                 failures: DashMap::new(),
+                #[cfg(test)]
+                panic_next_fetch: std::sync::atomic::AtomicBool::new(false),
             }),
         }
     }
@@ -318,12 +339,18 @@ impl ThumbService {
                     .clone();
                 let key = png.clone();
                 let handle = tokio::spawn(async move {
-                    let result =
-                        fetch(&inner, &base, platforms, &names, kind, &key).await;
-                    inner
-                        .inflight
-                        .remove(&key);
-                    result
+                    let _guard = InflightGuard {
+                        inner: inner.clone(),
+                        key: key.clone(),
+                    };
+                    #[cfg(test)]
+                    if inner
+                        .panic_next_fetch
+                        .swap(false, std::sync::atomic::Ordering::SeqCst)
+                    {
+                        panic!("injected fetch panic");
+                    }
+                    fetch(&inner, &base, platforms, &names, kind, &key).await
                 });
                 let shared = async move {
                     handle
@@ -566,5 +593,51 @@ mod tests {
         assert_eq!(ThumbKind::parse_lenient(Some("title")), ThumbKind::Title);
         assert_eq!(ThumbKind::parse_lenient(Some("wat")), ThumbKind::Boxart);
         assert_eq!(ThumbKind::parse_lenient(None), ThumbKind::Boxart);
+    }
+
+    #[tokio::test]
+    async fn a_panicking_fetch_does_not_wedge_the_inflight_entry() {
+        let mock = httpmock::MockServer::start_async().await;
+        mock.mock_async(|when, then| {
+            when.method(httpmock::Method::GET);
+            then.status(200)
+                .body([PNG_MAGIC, b"data"].concat());
+        })
+        .await;
+        let data = tempfile::tempdir().unwrap();
+        let config = Config {
+            data_dir: data
+                .path()
+                .to_path_buf(),
+            games_thumbnails_enabled: true,
+            games_thumbnails_base_url: mock.base_url(),
+            ..Default::default()
+        };
+        let g = game(
+            "Adventure Island (USA).nes",
+            "Adventure Island (USA)",
+            Core::Nes,
+        );
+        let svc = ThumbService::default();
+
+        svc.inner
+            .panic_next_fetch
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let first = svc
+            .get(&config, &g, ThumbKind::Boxart)
+            .await;
+        assert!(matches!(first, ThumbResult::Retry(_)));
+        assert!(
+            svc.inner
+                .inflight
+                .is_empty(),
+            "the dead fetch must not stay registered"
+        );
+
+        // The next request starts a fresh fetch instead of joining the dead one.
+        let second = svc
+            .get(&config, &g, ThumbKind::Boxart)
+            .await;
+        assert!(matches!(second, ThumbResult::Found(_)));
     }
 }
