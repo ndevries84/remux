@@ -1167,6 +1167,11 @@ impl Default for Config {
     }
 }
 
+/// Literal `/moonfin` route segments containing `-`/`_` (which the generic
+/// alphanumeric-only lowercasing skips). Matched explicitly so mixed-case ids
+/// (library ids, BIOS ids, ROM tokens) keep their case.
+const MOONFIN_HYPHENATED_ROUTE_SEGMENTS: &[&str] = &["server-settings", "clear-cache"];
+
 pub fn rewrite_request_uri<B>(mut req: http::Request<B>) -> http::Request<B> {
     let uri = req.uri();
     // Moonfin plugin routes: only a leading `/emby` is stripped (later
@@ -1230,6 +1235,10 @@ pub fn rewrite_request_uri<B>(mut req: http::Request<B>) -> http::Request<B> {
             if seg
                 .chars()
                 .all(|c| c.is_ascii_alphanumeric())
+                || (is_moonfin
+                    && MOONFIN_HYPHENATED_ROUTE_SEGMENTS
+                        .iter()
+                        .any(|kw| seg.eq_ignore_ascii_case(kw)))
             {
                 seg.to_ascii_lowercase()
             } else {
@@ -1510,6 +1519,33 @@ mod rewrite_uri_tests {
             rewrite_pq("/Moonfin/Games/Saves/lr-fceumm-6a2f9c"),
             "/moonfin/games/saves/lr-fceumm-6a2f9c"
         );
+    }
+
+    #[test]
+    fn moonfin_hyphenated_route_segments_match_any_case() {
+        assert_eq!(
+            rewrite_pq("/Moonfin/Admin/Server-Settings"),
+            "/moonfin/admin/server-settings"
+        );
+        assert_eq!(
+            rewrite_pq("/emby/Moonfin/Admin/Mdblist/Clear-Cache"),
+            "/moonfin/admin/mdblist/clear-cache"
+        );
+        // Ids keep their case.
+        assert_eq!(
+            rewrite_pq("/Moonfin/Themes/Midnight-Blue"),
+            "/moonfin/themes/Midnight-Blue"
+        );
+        assert_eq!(
+            rewrite_pq("/Moonfin/Admin/Users/0B7C1E2A-9F3D/Settings"),
+            "/moonfin/admin/users/0B7C1E2A-9F3D/settings"
+        );
+        assert_eq!(
+            rewrite_pq("/Moonfin/Games/Saves/LR-fceumm-6A2F9C"),
+            "/moonfin/games/saves/LR-fceumm-6A2F9C"
+        );
+        // Non-moonfin paths are untouched.
+        assert_eq!(rewrite_pq("/Foo/Server-Settings"), "/foo/Server-Settings");
     }
 
     #[test]
