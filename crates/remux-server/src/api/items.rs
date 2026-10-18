@@ -3465,55 +3465,116 @@ pub async fn items_similar(
         .limit
         .unwrap_or(12)
         .min(50) as u32;
-    let offset = q
-        .start_index
-        .unwrap_or(0);
+    let result = similar_items_for(
+        &state,
+        SimilarItemsRequest {
+            id,
+            user_id: q
+                .user_id
+                .unwrap_or(
+                    session
+                        .user
+                        .id,
+                ),
+            user: &session.user,
+            limit,
+            offset: q
+                .start_index
+                .unwrap_or(0),
+            exclude: &[],
+            fields: q
+                .fields
+                .as_deref(),
+        },
+    )
+    .await?;
+    Ok(Json(serde_json::json!({
+        "Items": serialize_item_list(&result.items, q.fields.as_deref()),
+        "TotalRecordCount": result.total_record_count,
+        "StartIndex": result.start_index,
+    })))
+}
+
+/// Inputs to [`similar_items_for`].
+pub(crate) struct SimilarItemsRequest<'a> {
+    pub id: Uuid,
+    /// User whose watch state is attached to the returned items.
+    pub user_id: Uuid,
+    /// Viewer whose policy (parental rating, tag and filter rules) hides
+    /// candidates before the page is picked.
+    pub user: &'a db::User,
+    pub limit: u32,
+    pub offset: u32,
+    /// Items never returned (applied before `limit`).
+    pub exclude: &'a [Uuid],
+    pub fields: Option<&'a [api::ItemFields]>,
+}
+
+/// Genre-overlap similar items in score order, shared by the native
+/// `/items/{id}/similar` and the Moonfin recommendations wrapper.
+///
+/// `total_record_count` is the policy-filtered candidate count. When items can
+/// be dropped after scoring (exclusions) extra candidates are scored so
+/// `limit` can still be filled.
+pub(crate) async fn similar_items_for(
+    state: &AppState,
+    req: SimilarItemsRequest<'_>,
+) -> Result<api::BaseItemDtoQueryResult> {
+    let SimilarItemsRequest {
+        id,
+        user_id,
+        user,
+        limit,
+        offset,
+        exclude,
+        fields,
+    } = req;
+    // Over-fetch candidates so excluded items do not leave a short page.
+    let window = (limit as usize + exclude.len()).min(1000) as u32;
 
     let (scored_ids, total) = db::Media::get_similar_by_genres(
         &state
             .ctx
             .db,
         &id,
-        &session.user,
-        limit,
+        user,
+        window,
         offset,
     )
     .await?;
 
     if scored_ids.is_empty() {
-        return Ok(Json(serde_json::json!({
-            "Items": [],
-            "TotalRecordCount": total,
-            "StartIndex": offset,
-        })));
+        return Ok(api::BaseItemDtoQueryResult {
+            total_record_count: total,
+            start_index: offset,
+            ..Default::default()
+        });
     }
 
     // Fetch full items in score order.
     let ids: Vec<Uuid> = scored_ids
         .iter()
         .map(|(id, _)| *id)
+        .filter(|id| !exclude.contains(id))
         .collect();
+    if ids.is_empty() {
+        return Ok(api::BaseItemDtoQueryResult {
+            start_index: offset,
+            ..Default::default()
+        });
+    }
     let filter = db::MediaFilter {
         id: Some(ids),
-        user_id: q
-            .user_id
-            .or(Some(
-                session
-                    .user
-                    .id,
-            )),
+        user_id: Some(user_id),
         include_user_state: true,
         include_relations: api::fields_include_relations(
-            q.fields
-                .as_deref(),
+            fields,
         ),
         include_people: Some(api::fields_include_people(
-            q.fields
-                .as_deref(),
+            fields,
         )),
         include_tags: Some(api::fields_include_tags(
-            q.fields
-                .as_deref(),
+            fields,
         )),
         ..Default::default()
     };
@@ -3535,8 +3596,7 @@ pub async fn items_similar(
             api::db_media_to_item_for_list(
                 m,
                 false,
-                q.fields
-                    .as_deref(),
+                fields,
             )
         })
         .collect();
@@ -3549,12 +3609,14 @@ pub async fn items_similar(
                 .unwrap_or(0),
         )
     });
+    items.truncate(limit as usize);
 
-    Ok(Json(serde_json::json!({
-        "Items": serialize_item_list(&items, q.fields.as_deref()),
-        "TotalRecordCount": total,
-        "StartIndex": offset,
-    })))
+    Ok(api::BaseItemDtoQueryResult {
+        items,
+        total_record_count: total,
+        start_index: offset,
+        ..Default::default()
+    })
 }
 
 #[get("/items/{id}/thememedia")]
