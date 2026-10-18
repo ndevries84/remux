@@ -26,6 +26,22 @@
     p.hidden = !text;
   }
 
+  // Drop every transient message in the panel (stale success/failure notes).
+  function clearMessages() {
+    say('ss-message', '');
+    say('ss-cache-result', '');
+    var box = H.$('ss-key-result');
+    box.hidden = true;
+    H.clear(box);
+  }
+
+  var messageTimer = null;
+  function sayFor(id, text) {
+    say(id, text);
+    if (messageTimer) clearTimeout(messageTimer);
+    messageTimer = setTimeout(function () { say(id, ''); }, 8000);
+  }
+
   function setBadge(id, source, hasValue, envLabel) {
     var b = H.$(id);
     var key = source === 'database' ? 'database' : (hasValue ? 'environment' : 'none');
@@ -65,10 +81,10 @@
 
   // PUT one or more fields; a null value clears the override.
   function put(body, doneMessage) {
-    say('ss-message', '');
+    clearMessages();
     return H.api('PUT', '/moonfin/admin/server-settings', JSON.stringify(body)).then(function (v) {
       paint(v);
-      say('ss-message', doneMessage);
+      sayFor('ss-message', doneMessage);
       H.loadStatus();
     }).catch(function (err) {
       if (err && err.status === 400) say('ss-message', err.message, true);
@@ -132,6 +148,7 @@
   function testKey() {
     var candidate = H.$('ss-key-input').value.trim();
     var btn = H.$('ss-key-test');
+    clearMessages();
     btn.disabled = true;
     var box = H.$('ss-key-result');
     box.hidden = false;
@@ -148,10 +165,10 @@
   function clearCache() {
     H.confirmDialog('Clear the MDBList ratings cache? Cached ratings are deleted and fetched again from MDBList when needed, which uses your MDBList request quota.').then(function (ok) {
       if (!ok) return;
-      say('ss-cache-result', '');
+      clearMessages();
       H.api('POST', '/moonfin/admin/mdblist/clear-cache').then(function (r) {
         r = r || {};
-        say('ss-cache-result', 'Cleared ' + (r.clearedRatings || 0) + ' cached ratings, ' +
+        sayFor('ss-cache-result', 'Cleared ' + (r.clearedRatings || 0) + ' cached ratings, ' +
           (r.clearedFailures || 0) + ' remembered failures and ' + (r.clearedRateLimits || 0) + ' rate-limit waits.');
       }).catch(H.handleError);
     });
@@ -169,6 +186,10 @@
       put({ webEnableWebrtcScan: null }, 'WebRTC scan setting cleared.');
     });
 
+    ['ss-default-url-input', 'ss-forced-url-input', 'ss-key-input'].forEach(function (id) {
+      H.$(id).addEventListener('input', clearMessages);
+    });
+    H.$('ss-webrtc-input').addEventListener('change', clearMessages);
     H.$('ss-key-input').addEventListener('input', updateKeyButtons);
     H.$('ss-key-save').addEventListener('click', function () {
       var input = H.$('ss-key-input');

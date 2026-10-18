@@ -802,6 +802,7 @@
       H.api('POST', '/moonfin/admin/defaults/apply', JSON.stringify(body)).then(function (r) {
         showApplyResult(r);
         H.loadUsers();
+        H.loadStatus();
       }).catch(function (err) {
         if (err && (err.status === 400 || err.status === 404)) showApplyResult(null, err.message);
         else H.handleError(err);
