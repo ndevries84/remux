@@ -3510,6 +3510,34 @@ pub(crate) struct SimilarItemsRequest<'a> {
     pub fields: Option<&'a [api::ItemFields]>,
 }
 
+/// Copies the user's parental-rating, tag and filter-rule policy onto a media
+/// filter so queries hide what browsing hides.
+pub(crate) fn apply_user_policy(filter: &mut db::MediaFilter, user: &db::User) {
+    let Some(policy) = user
+        .policy
+        .as_ref()
+        .map(|p| &p.0)
+    else {
+        return;
+    };
+    filter.max_parental_rating = policy.max_parental_rating;
+    filter.blocked_tags = Some(
+        policy
+            .blocked_tags
+            .clone(),
+    )
+    .filter(|v| !v.is_empty());
+    filter.allowed_tags = Some(
+        policy
+            .allowed_tags
+            .clone(),
+    )
+    .filter(|v| !v.is_empty());
+    filter.policy_filter = policy
+        .filter_rules
+        .clone();
+}
+
 /// Genre-overlap similar items in score order, shared by the native
 /// `/items/{id}/similar` and the Moonfin recommendations wrapper.
 ///

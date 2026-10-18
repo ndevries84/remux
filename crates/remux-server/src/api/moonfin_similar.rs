@@ -13,7 +13,7 @@
 //!   does not apply it; only this wrapper does.
 //! * `userId` is accepted but the signed-in user is always used, so another
 //!   user's watch state is never read.
-//! * An unknown item is a 404; an item with no genres (or an episode) is an
+//! * An unknown item, or one the user's policy hides, is a 404; an item with no genres (or an episode) is an
 //!   empty list.
 //! * Items are the native `BaseItemDto`s, a superset of Moonbase's cards.
 //!   The client only reads `Id`, `UserData.Played`, `OfficialRating` and
@@ -32,7 +32,7 @@ use uuid::Uuid;
 use crate::{
     AppState,
     api::{
-        items::{SimilarItemsRequest, similar_items_for},
+        items::{SimilarItemsRequest, apply_user_policy, similar_items_for},
         moonfin_settings::{error_response, internal_error},
     },
     db::{self, auth::AuthSession},
@@ -80,16 +80,34 @@ pub async fn moonfin_similar(
     RawQuery(raw): RawQuery,
 ) -> Response {
     let q = SimilarQuery::parse(raw.as_deref());
-    let media = match db::Media::get_by_id(
+    // The source item must be visible to the user under the same policy that
+    // filters the candidates; otherwise hidden titles would leak via 404 vs 200.
+    let mut visible = db::MediaFilter {
+        id: Some(vec![id]),
+        user_id: Some(
+            session
+                .user
+                .id,
+        ),
+        ..Default::default()
+    };
+    apply_user_policy(&mut visible, &session.user);
+    let media = match db::Media::get_by_filter(
         &state
             .ctx
             .db,
-        &id,
+        &visible,
     )
     .await
     {
-        Ok(Some(media)) => media,
-        Ok(None) => return error_response(StatusCode::NOT_FOUND, "Item not found"),
+        Ok(result) => match result
+            .records
+            .into_iter()
+            .next()
+        {
+            Some(media) => media,
+            None => return error_response(StatusCode::NOT_FOUND, "Item not found"),
+        },
         Err(e) => return internal_error(e),
     };
     let result = similar_items_for(
@@ -346,6 +364,24 @@ mod tests {
         assert!(admin.contains(&mild) && admin.contains(&adult));
         let restricted = ids(&similar(&h, &kid, &seed, "").await);
         assert_eq!(restricted, vec![mild]);
+    }
+
+    #[tokio::test]
+    async fn source_hidden_by_parental_rating_is_404_but_visible_source_is_unchanged() {
+        let h = Harness::new().await;
+        let kid = restricted_user(&h, 13).await;
+        let adult_seed = movie(&h, "AdultSeed", &["Action"], Some(17)).await;
+        let mild_seed = movie(&h, "MildSeed", &["Action"], Some(10)).await;
+        let mild = movie(&h, "Mild", &["Action"], Some(10)).await;
+
+        h.get(&kid, &format!("/Moonfin/Items/{adult_seed}/Similar"))
+            .await
+            .assert_status(StatusCode::NOT_FOUND);
+        // Admin (no restriction) still sees the adult source.
+        similar(&h, &h.token, &adult_seed, "").await;
+        // A visible source behaves as before.
+        let got = ids(&similar(&h, &kid, &mild_seed, "").await);
+        assert_eq!(got, vec![mild]);
     }
 
     #[tokio::test]
