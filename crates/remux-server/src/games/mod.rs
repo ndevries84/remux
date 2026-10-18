@@ -18,7 +18,6 @@ use std::{
     time::{Duration, Instant},
 };
 
-use tokio::sync::RwLock;
 use uuid::Uuid;
 
 use crate::{Config, api};
@@ -73,13 +72,207 @@ pub fn games_view_item(name: &str) -> api::BaseItemDto {
     }
 }
 
+/// How long to wait before retrying after a scan that failed, timed out or
+/// found its roots missing (capped by the TTL).
+const FAILURE_BACKOFF: Duration = Duration::from_secs(30);
+
+/// What a scan produced, plus whether every configured root was readable.
+/// An empty snapshot from unreadable roots is a failure, not an empty library.
+pub struct ScanOutput {
+    pub snapshot: GamesSnapshot,
+    pub roots_ok: bool,
+}
+
+type ScanFn = Arc<dyn Fn(&[PathBuf]) -> ScanOutput + Send + Sync>;
+
+fn scan_roots(roots: &[PathBuf]) -> ScanOutput {
+    let roots_ok = roots
+        .iter()
+        .all(|r| {
+            r.canonicalize()
+                .is_ok_and(|c| c.is_dir())
+        });
+    ScanOutput {
+        snapshot: scanner::scan(roots),
+        roots_ok,
+    }
+}
+
+struct State {
+    current: Option<Arc<GamesSnapshot>>,
+    /// The last scan failed (or found its roots missing): `current` is
+    /// stale regardless of the TTL and a retry is due at `next_attempt`.
+    degraded: bool,
+    next_attempt: Option<Instant>,
+    /// A scan task (or its blocking thread) is alive. Single-flight.
+    running: bool,
+    /// Bumped every time a scan publishes an outcome.
+    generation: u64,
+}
+
+struct Shared {
+    ttl: Duration,
+    scan: ScanFn,
+    state: std::sync::Mutex<State>,
+    published: tokio::sync::Notify,
+}
+
+impl Shared {
+    fn lock(&self) -> std::sync::MutexGuard<'_, State> {
+        self.state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn backoff(&self) -> Duration {
+        self.ttl
+            .min(FAILURE_BACKOFF)
+    }
+
+    /// Records a scan outcome. A failure never replaces a non-empty snapshot.
+    fn publish(&self, outcome: Result<ScanOutput, &str>) {
+        let mut st = self.lock();
+        let old_has_games = st
+            .current
+            .as_ref()
+            .is_some_and(|s| {
+                !s.games
+                    .is_empty()
+            });
+        let now = Instant::now();
+        let failure = match &outcome {
+            Ok(out) => (out
+                .snapshot
+                .games
+                .is_empty()
+                && !out.roots_ok)
+                .then_some("games roots are not accessible"),
+            Err(why) => Some(*why),
+        };
+        match (failure, outcome) {
+            (Some(why), _) if old_has_games => {
+                tracing::warn!(
+                    reason = why,
+                    "games scan failed; keeping the previous game list"
+                );
+                st.degraded = true;
+                st.next_attempt = Some(now + self.backoff());
+            }
+            (Some(why), _) => {
+                tracing::warn!(
+                    reason = why,
+                    "games scan failed; serving an empty list"
+                );
+                st.current = Some(Arc::new(GamesSnapshot::empty()));
+                st.degraded = true;
+                st.next_attempt = Some(now + self.backoff());
+            }
+            (None, Ok(out)) => {
+                tracing::info!(
+                    games = out
+                        .snapshot
+                        .games
+                        .len(),
+                    "games scan complete"
+                );
+                st.current = Some(Arc::new(out.snapshot));
+                st.degraded = false;
+                st.next_attempt = None;
+            }
+            (None, Err(_)) => unreachable!("an Err outcome is always a failure"),
+        }
+        st.generation += 1;
+        drop(st);
+        self.published
+            .notify_waiters();
+    }
+
+    async fn run_scan(self: Arc<Self>, roots: Vec<PathBuf>, timeout: Duration) {
+        let started = Instant::now();
+        let scan = self
+            .scan
+            .clone();
+        let mut handle = tokio::task::spawn_blocking(move || scan(&roots));
+        match tokio::time::timeout(timeout, &mut handle).await {
+            Ok(Ok(out)) => self.publish(Ok(out)),
+            Ok(Err(e)) => {
+                tracing::warn!(error = %e, "games scan task failed");
+                self.publish(Err("scan task panicked"));
+            }
+            Err(_) => {
+                tracing::warn!(
+                    timeout_secs = timeout.as_secs(),
+                    "games scan timed out; serving the previous game list meanwhile"
+                );
+                self.publish(Err("scan timed out"));
+                // The blocking thread cannot be cancelled: stay single-flight
+                // until it ends, and accept its result if it does finish.
+                if let Ok(out) = handle.await {
+                    self.publish(Ok(out));
+                }
+            }
+        }
+        tracing::debug!(
+            elapsed_ms = started
+                .elapsed()
+                .as_millis() as u64,
+            "games scan finished"
+        );
+        self.lock()
+            .running = false;
+        // Waiters of an idle index (see `settled`) re-check `running`.
+        self.published
+            .notify_waiters();
+    }
+
+    /// Starts a scan task unless one is alive. Returns the generation to wait
+    /// past to observe an outcome of the (new or already running) scan.
+    fn start_scan(self: &Arc<Self>, config: &Config) -> u64 {
+        let mut st = self.lock();
+        let generation = st.generation;
+        if !st.running {
+            st.running = true;
+            let timeout = Duration::from_secs(config.games_scan_timeout_secs);
+            tokio::spawn(
+                self.clone()
+                    .run_scan(GamesIndex::roots(config), timeout),
+            );
+        }
+        generation
+    }
+
+    async fn wait_published(&self, after: u64) {
+        loop {
+            let notified = self
+                .published
+                .notified();
+            tokio::pin!(notified);
+            notified
+                .as_mut()
+                .enable();
+            if self
+                .lock()
+                .generation
+                > after
+            {
+                return;
+            }
+            notified.await;
+        }
+    }
+}
+
 /// Lazily-built, TTL-bound in-memory index of the games on disk. Cheap to
 /// clone (shared state). Ids resolve through the snapshot only; no filesystem
 /// path is ever derived from client input.
+///
+/// Stale-while-revalidate: once a snapshot exists, requests return it without
+/// waiting. An expired TTL starts a single background rescan, and a rescan
+/// that fails, times out or finds the roots missing never replaces a non-empty
+/// snapshot.
 #[derive(Clone)]
 pub struct GamesIndex {
-    ttl: Duration,
-    state: Arc<RwLock<Option<Arc<GamesSnapshot>>>>,
+    shared: Arc<Shared>,
 }
 
 impl Default for GamesIndex {
@@ -90,9 +283,23 @@ impl Default for GamesIndex {
 
 impl GamesIndex {
     pub fn with_ttl(ttl: Duration) -> Self {
+        Self::build(ttl, Arc::new(scan_roots))
+    }
+
+    fn build(ttl: Duration, scan: ScanFn) -> Self {
         Self {
-            ttl,
-            state: Arc::new(RwLock::new(None)),
+            shared: Arc::new(Shared {
+                ttl,
+                scan,
+                state: std::sync::Mutex::new(State {
+                    current: None,
+                    degraded: false,
+                    next_attempt: None,
+                    running: false,
+                    generation: 0,
+                }),
+                published: tokio::sync::Notify::new(),
+            }),
         }
     }
 
@@ -106,69 +313,87 @@ impl GamesIndex {
             .collect()
     }
 
-    fn fresh(&self, snap: &GamesSnapshot) -> bool {
-        snap.scanned_at
-            .elapsed()
-            < self.ttl
-    }
-
-    /// Current snapshot, scanning on first access or once the TTL expired.
-    /// Concurrent callers share a single scan.
+    /// Current snapshot. Returns the existing one immediately (starting a
+    /// background rescan when it is stale and one is due); only the very
+    /// first call waits for a scan, bounded by `games_scan_timeout_secs`.
     pub async fn snapshot(&self, config: &Config) -> Arc<GamesSnapshot> {
-        if let Some(s) = self
-            .state
-            .read()
-            .await
-            .as_ref()
-            .filter(|s| self.fresh(s))
-        {
-            return s.clone();
-        }
-        let mut guard = self
-            .state
-            .write()
+        let after = {
+            let st = self
+                .shared
+                .lock();
+            match &st.current {
+                Some(s) => {
+                    let stale = st.degraded
+                        || s.scanned_at
+                            .elapsed()
+                            >= self
+                                .shared
+                                .ttl;
+                    let due = st
+                        .next_attempt
+                        .is_none_or(|t| Instant::now() >= t);
+                    let current = s.clone();
+                    drop(st);
+                    if stale && due {
+                        self.shared
+                            .start_scan(config);
+                    }
+                    return current;
+                }
+                None => {
+                    drop(st);
+                    self.shared
+                        .start_scan(config)
+                }
+            }
+        };
+        self.shared
+            .wait_published(after)
             .await;
-        if let Some(s) = guard
-            .as_ref()
-            .filter(|s| self.fresh(s))
-        {
-            return s.clone();
-        }
-        let snap = Self::scan(config).await;
-        *guard = Some(snap.clone());
-        snap
+        self.current_or_empty()
     }
 
-    /// Forces a rescan regardless of TTL.
+    /// Forces a rescan regardless of TTL (joining one already running) and
+    /// waits for its outcome. A failed rescan leaves the previous snapshot.
     pub async fn rescan(&self, config: &Config) -> Arc<GamesSnapshot> {
-        let mut guard = self
-            .state
-            .write()
+        let after = self
+            .shared
+            .start_scan(config);
+        self.shared
+            .wait_published(after)
             .await;
-        let snap = Self::scan(config).await;
-        *guard = Some(snap.clone());
-        snap
+        self.current_or_empty()
     }
 
-    async fn scan(config: &Config) -> Arc<GamesSnapshot> {
-        let roots = Self::roots(config);
-        let started = Instant::now();
-        let snap = tokio::task::spawn_blocking(move || scanner::scan(&roots))
-            .await
-            .unwrap_or_else(|e| {
-                tracing::warn!(error = %e, "games scan task failed");
-                GamesSnapshot::empty()
-            });
-        tracing::info!(
-            games = snap
-                .games
-                .len(),
-            elapsed_ms = started
-                .elapsed()
-                .as_millis() as u64,
-            "games scan complete"
-        );
-        Arc::new(snap)
+    fn current_or_empty(&self) -> Arc<GamesSnapshot> {
+        self.shared
+            .lock()
+            .current
+            .clone()
+            .unwrap_or_else(|| Arc::new(GamesSnapshot::empty()))
+    }
+
+    /// Resolves once no scan is running.
+    #[cfg(test)]
+    async fn settled(&self) {
+        loop {
+            let notified = self
+                .shared
+                .published
+                .notified();
+            tokio::pin!(notified);
+            notified
+                .as_mut()
+                .enable();
+            if !self
+                .shared
+                .lock()
+                .running
+            {
+                return;
+            }
+            notified.await;
+        }
     }
 }
 
@@ -290,20 +515,20 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn expired_ttl_triggers_rescan() {
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::create_dir_all(
-            dir.path()
-                .join("NES"),
-        )
-        .unwrap();
+    fn write_game(root: &std::path::Path, name: &str) {
+        std::fs::create_dir_all(root.join("NES")).unwrap();
         std::fs::write(
-            dir.path()
-                .join("NES/a.nes"),
-            b"a",
+            root.join("NES")
+                .join(name),
+            name,
         )
         .unwrap();
+    }
+
+    #[tokio::test]
+    async fn expired_ttl_serves_the_old_list_then_picks_up_the_rescan() {
+        let dir = tempfile::tempdir().unwrap();
+        write_game(dir.path(), "a.nes");
         let cfg = config_with(dir.path());
 
         let index = GamesIndex::with_ttl(Duration::ZERO);
@@ -315,12 +540,388 @@ mod tests {
                 .len(),
             1
         );
-        std::fs::write(
+        write_game(dir.path(), "b.nes");
+        // Expired: the old list comes back at once and a rescan starts.
+        assert_eq!(
+            index
+                .snapshot(&cfg)
+                .await
+                .games
+                .len(),
+            1
+        );
+        index
+            .settled()
+            .await;
+        assert_eq!(
+            index
+                .snapshot(&cfg)
+                .await
+                .games
+                .len(),
+            2
+        );
+    }
+
+    /// A parked scan step for tests: the scanner blocks until released.
+    struct Gate {
+        released: std::sync::Mutex<bool>,
+        cv: std::sync::Condvar,
+    }
+
+    impl Gate {
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                released: std::sync::Mutex::new(false),
+                cv: std::sync::Condvar::new(),
+            })
+        }
+        fn release(&self) {
+            *self
+                .released
+                .lock()
+                .unwrap() = true;
+            self.cv
+                .notify_all();
+        }
+        fn wait(&self) {
+            let mut r = self
+                .released
+                .lock()
+                .unwrap();
+            while !*r {
+                r = self
+                    .cv
+                    .wait(r)
+                    .unwrap();
+            }
+        }
+    }
+
+    enum Step {
+        Real,
+        Panic,
+        Gated(Arc<Gate>),
+    }
+
+    /// An index whose scans follow a script (default: a real scan) and count
+    /// how many times the scanner ran.
+    fn scripted_index(
+        ttl: Duration,
+    ) -> (
+        GamesIndex,
+        Arc<std::sync::Mutex<std::collections::VecDeque<Step>>>,
+        Arc<std::sync::atomic::AtomicUsize>,
+    ) {
+        let steps = Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new()));
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let scan: ScanFn = {
+            let (steps, calls) = (steps.clone(), calls.clone());
+            Arc::new(move |roots: &[PathBuf]| {
+                calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let step = steps
+                    .lock()
+                    .unwrap()
+                    .pop_front();
+                match step.unwrap_or(Step::Real) {
+                    Step::Real => {}
+                    Step::Panic => panic!("scripted scan failure"),
+                    Step::Gated(g) => g.wait(),
+                }
+                scan_roots(roots)
+            })
+        };
+        (GamesIndex::build(ttl, scan), steps, calls)
+    }
+
+    fn zero_timeout(root: &std::path::Path) -> Config {
+        Config {
+            games_scan_timeout_secs: 0,
+            ..config_with(root)
+        }
+    }
+
+    async fn within<T>(f: impl std::future::Future<Output = T>) -> T {
+        // A hang guard, not a timing assertion: the awaited futures only
+        // finish through explicit sync points.
+        tokio::time::timeout(Duration::from_secs(60), f)
+            .await
+            .expect("hung")
+    }
+
+    #[tokio::test]
+    async fn stale_snapshot_is_served_without_waiting_and_one_rescan_runs() {
+        let dir = tempfile::tempdir().unwrap();
+        write_game(dir.path(), "a.nes");
+        let cfg = config_with(dir.path());
+        let (index, steps, calls) = scripted_index(Duration::ZERO);
+        assert_eq!(
+            index
+                .snapshot(&cfg)
+                .await
+                .games
+                .len(),
+            1
+        );
+
+        write_game(dir.path(), "b.nes");
+        let gate = Gate::new();
+        steps
+            .lock()
+            .unwrap()
+            .push_back(Step::Gated(gate.clone()));
+        // The rescan is parked, yet every concurrent request returns at once.
+        for _ in 0..5 {
+            assert_eq!(
+                within(index.snapshot(&cfg))
+                    .await
+                    .games
+                    .len(),
+                1
+            );
+        }
+        gate.release();
+        within(index.settled()).await;
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "first scan plus a single shared rescan"
+        );
+        assert_eq!(
+            index
+                .snapshot(&cfg)
+                .await
+                .games
+                .len(),
+            2
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_scan_keeps_the_old_snapshot_and_retries() {
+        let dir = tempfile::tempdir().unwrap();
+        write_game(dir.path(), "a.nes");
+        let cfg = config_with(dir.path());
+        let (index, steps, _) = scripted_index(Duration::ZERO);
+        assert_eq!(
+            index
+                .snapshot(&cfg)
+                .await
+                .games
+                .len(),
+            1
+        );
+
+        write_game(dir.path(), "b.nes");
+        steps
+            .lock()
+            .unwrap()
+            .push_back(Step::Panic);
+        assert_eq!(
+            within(index.rescan(&cfg))
+                .await
+                .games
+                .len(),
+            1
+        );
+        // The failure is retried on a later request.
+        assert_eq!(
+            index
+                .snapshot(&cfg)
+                .await
+                .games
+                .len(),
+            1
+        );
+        within(index.settled()).await;
+        assert_eq!(
+            index
+                .snapshot(&cfg)
+                .await
+                .games
+                .len(),
+            2
+        );
+    }
+
+    #[tokio::test]
+    async fn first_scan_failure_is_not_cached_as_fresh() {
+        let dir = tempfile::tempdir().unwrap();
+        write_game(dir.path(), "a.nes");
+        let cfg = config_with(dir.path());
+        let (index, steps, _) = scripted_index(Duration::ZERO);
+        steps
+            .lock()
+            .unwrap()
+            .push_back(Step::Panic);
+        assert_eq!(
+            within(index.snapshot(&cfg))
+                .await
+                .games
+                .len(),
+            0
+        );
+        assert_eq!(
+            index
+                .snapshot(&cfg)
+                .await
+                .games
+                .len(),
+            0
+        );
+        within(index.settled()).await;
+        assert_eq!(
+            index
+                .snapshot(&cfg)
+                .await
+                .games
+                .len(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn removed_root_keeps_the_old_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir
+            .path()
+            .join("roms");
+        write_game(&root, "a.nes");
+        let cfg = config_with(&root);
+        let index = GamesIndex::default();
+        assert_eq!(
+            index
+                .snapshot(&cfg)
+                .await
+                .games
+                .len(),
+            1
+        );
+
+        std::fs::remove_dir_all(&root).unwrap();
+        assert_eq!(
+            index
+                .rescan(&cfg)
+                .await
+                .games
+                .len(),
+            1
+        );
+
+        // Once the mount is back the new content is picked up.
+        write_game(&root, "a.nes");
+        write_game(&root, "b.nes");
+        assert_eq!(
+            index
+                .rescan(&cfg)
+                .await
+                .games
+                .len(),
+            2
+        );
+    }
+
+    #[tokio::test]
+    async fn genuinely_empty_library_replaces_the_old_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        write_game(dir.path(), "a.nes");
+        let cfg = config_with(dir.path());
+        let index = GamesIndex::default();
+        assert_eq!(
+            index
+                .snapshot(&cfg)
+                .await
+                .games
+                .len(),
+            1
+        );
+
+        std::fs::remove_file(
             dir.path()
-                .join("NES/b.nes"),
-            b"b",
+                .join("NES/a.nes"),
         )
         .unwrap();
+        assert_eq!(
+            index
+                .rescan(&cfg)
+                .await
+                .games
+                .len(),
+            0
+        );
+        assert_eq!(
+            index
+                .snapshot(&cfg)
+                .await
+                .games
+                .len(),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn first_scan_wait_is_bounded_and_a_late_result_is_applied() {
+        let dir = tempfile::tempdir().unwrap();
+        write_game(dir.path(), "a.nes");
+        let (index, steps, _) = scripted_index(DEFAULT_TTL);
+        let gate = Gate::new();
+        steps
+            .lock()
+            .unwrap()
+            .push_back(Step::Gated(gate.clone()));
+        // Timeout of zero seconds: the parked scan cannot finish in time.
+        let cfg = zero_timeout(dir.path());
+        assert_eq!(
+            within(index.snapshot(&cfg))
+                .await
+                .games
+                .len(),
+            0
+        );
+
+        gate.release();
+        within(index.settled()).await;
+        assert_eq!(
+            index
+                .snapshot(&cfg)
+                .await
+                .games
+                .len(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn timed_out_rescan_keeps_the_old_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        write_game(dir.path(), "a.nes");
+        let (index, steps, _) = scripted_index(Duration::ZERO);
+        assert_eq!(
+            index
+                .snapshot(&config_with(dir.path()))
+                .await
+                .games
+                .len(),
+            1
+        );
+
+        write_game(dir.path(), "b.nes");
+        let gate = Gate::new();
+        steps
+            .lock()
+            .unwrap()
+            .push_back(Step::Gated(gate.clone()));
+        let cfg = zero_timeout(dir.path());
+        assert_eq!(
+            within(index.rescan(&cfg))
+                .await
+                .games
+                .len(),
+            1
+        );
+
+        gate.release();
+        within(index.settled()).await;
         assert_eq!(
             index
                 .snapshot(&cfg)

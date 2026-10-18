@@ -737,6 +737,10 @@ pub struct Config {
     /// archive (non-arcade cores). Bigger ROMs answer 413.
     #[serde(default = "default_games_archive_max_extract_bytes")]
     pub games_archive_max_extract_bytes: u64,
+    /// Longest a library scan may run, in seconds, before the server gives up
+    /// waiting for it and keeps serving the previous game list.
+    #[serde(default = "default_games_scan_timeout_secs")]
+    pub games_scan_timeout_secs: u64,
     /// Display name of the synthetic Games view.
     #[serde(default = "default_games_library_name")]
     pub games_library_name: String,
@@ -938,6 +942,10 @@ fn default_games_cores_max_extract_bytes() -> u64 {
     1024 * 1024 * 1024
 }
 
+fn default_games_scan_timeout_secs() -> u64 {
+    120
+}
+
 fn default_games_library_name() -> String {
     "Games".to_string()
 }
@@ -1105,6 +1113,7 @@ impl Default for Config {
             otlp_endpoint: None,
             games_enabled: false,
             games_roots: Vec::new(),
+            games_scan_timeout_secs: default_games_scan_timeout_secs(),
             games_library_name: default_games_library_name(),
             games_archive_max_extract_bytes: default_games_archive_max_extract_bytes(),
             games_saves_max_bytes_per_user: default_games_saves_max_bytes_per_user(),
