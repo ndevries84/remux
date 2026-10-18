@@ -239,17 +239,66 @@
       t('LaunchBox indexed', lbi.indexed);
       t('LaunchBox updating', lbi.updating);
       t('MDBList key configured', s.mdblistConfigured);
-      t('Web app bundle present', s.webAppPresent);
       body.appendChild(tile('Themes', String(s.themesCount || 0)));
       body.appendChild(tile('Default settings keys', String(s.defaultsKeyCount || 0)));
-      if (s.webAppPresent) {
-        var link = el('a', { href: '/Moonfin/Web/', text: 'Open /Moonfin/Web/' });
-        body.appendChild(el('div', { class: 'tile' }, [el('div', { class: 'k', text: 'Web app' }), link]));
-      }
       t('EmulatorJS CDN fallback', s.emulatorjsCdnFallback);
+      renderWebApp(s.webApp || { present: !!s.webAppPresent });
       renderCores(s.cores || {});
       renderCdnNote(s);
     }).catch(handleError);
+  }
+
+  function renderWebApp(w) {
+    var body = $('webapp-body');
+    clear(body);
+    body.appendChild(tile('Installed', w.present ? 'Yes' : 'No', w.present ? 'yes' : 'bad'));
+    if (w.present) {
+      body.appendChild(tile('Version', w.version || 'unknown'));
+      body.appendChild(tile('Build', w.buildNumber || 'unknown'));
+    }
+    body.appendChild(tile('Bundle path', w.bundlePath || 'unknown'));
+    body.appendChild(tile('Default server URL', w.defaultServerUrl || 'Not set'));
+    body.appendChild(tile('Forced server URL', w.forcedServerUrl || 'Not set'));
+    body.appendChild(tile('WebRTC scan', w.enableWebRtcScan ? 'On' : 'Off', w.enableWebRtcScan ? 'yes' : 'no'));
+
+    var urlRow = $('webapp-url');
+    var input = $('webapp-url-input');
+    input.value = w.appUrl || '';
+    // Only same-origin navigation: the link is a relative path, never the value above.
+    $('webapp-open').hidden = !w.present;
+    urlRow.hidden = !w.appUrl && !w.present;
+    $('webapp-copy').disabled = !w.appUrl;
+    if (!w.appUrl) input.placeholder = 'The server could not work out its own address';
+    $('webapp-copy-note').hidden = true;
+
+    var help = $('webapp-help');
+    clear(help);
+    if (!w.present) {
+      help.appendChild(el('p', { text: 'The web app is not installed. To install it, download the Moonfin web release, extract it, and copy the extracted files into the bundle path above, so that index.html sits directly inside that folder. Then press Refresh. The folder can be changed with MOONFIN_WEB_PATH.' }));
+    }
+  }
+
+  function copyAppUrl() {
+    var input = $('webapp-url-input');
+    var note = $('webapp-copy-note');
+    var text = input.value;
+    if (!text) return;
+    function fallback() {
+      input.focus();
+      input.select();
+      var ok = false;
+      try { ok = document.execCommand && document.execCommand('copy'); } catch (e) { ok = false; }
+      note.textContent = ok ? 'Copied.' : 'The URL is selected. Press Ctrl+C (or Cmd+C) to copy it.';
+      note.hidden = false;
+    }
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      navigator.clipboard.writeText(text).then(function () {
+        note.textContent = 'Copied.';
+        note.hidden = false;
+      }, fallback);
+    } else {
+      fallback();
+    }
   }
 
   function renderCdnNote(s) {
@@ -496,6 +545,7 @@
     $('login-form').addEventListener('submit', login);
     $('logout').addEventListener('click', function () { logout(''); });
     $('status-refresh').addEventListener('click', loadStatus);
+    $('webapp-copy').addEventListener('click', copyAppUrl);
     $('users-refresh').addEventListener('click', loadUsers);
     $('themes-refresh').addEventListener('click', loadThemes);
     $('user-close').addEventListener('click', function () { selectedUser = null; $('user-detail').hidden = true; loadUsers(); });

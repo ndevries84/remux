@@ -37,6 +37,17 @@
     <section class="card" id="status-section">
       <div class="head"><h2>Status</h2><button id="status-refresh" type="button">Refresh</button></div>
       <div id="status-body" class="grid"></div>
+      <div id="webapp-block" class="detail">
+        <h3>Web app</h3>
+        <div id="webapp-body" class="grid"></div>
+        <div id="webapp-url" class="row" hidden>
+          <label class="webapp-url-label">App URL <input id="webapp-url-input" type="text" readonly spellcheck="false"></label>
+          <button id="webapp-copy" type="button">Copy</button>
+          <a id="webapp-open" class="button-link" href="/Moonfin/Web/" target="_blank" rel="noopener" hidden>Open web app</a>
+        </div>
+        <p id="webapp-copy-note" class="muted" role="status" hidden></p>
+        <div id="webapp-help" class="muted"></div>
+      </div>
       <h3>Cores</h3>
       <div id="cores-body"></div>
       <div id="cdn-note" class="muted"></div>
