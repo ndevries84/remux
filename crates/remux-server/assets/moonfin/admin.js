@@ -10,8 +10,6 @@
   var VERSION = '1.0';
 
   var token = '';
-  var defaultsOriginal = '';
-  var blockedKeys = [];
   var coresTimer = null;
   var selectedUser = null;
 
@@ -206,8 +204,10 @@
     return s.length > 120 ? s.slice(0, 117) + '...' : s;
   }
 
+  function defaults() { return window.MoonfinAdminDefaults; }
+
   function loadAll() {
-    loadStatus(); loadDefaults(); loadUsers(); loadThemes();
+    loadStatus(); defaults().load(); loadUsers(); loadThemes();
   }
 
   // ---- status ----------------------------------------------------------
@@ -306,48 +306,9 @@
   }
 
   // ---- defaults --------------------------------------------------------
+  // The forms, the raw JSON panel and "Apply to users" live in admin-defaults.js.
 
   function pretty(obj) { return JSON.stringify(obj, null, 2); }
-
-  function loadDefaults() {
-    return api('GET', '/moonfin/admin/defaults').then(function (d) {
-      blockedKeys = d.blockedKeys || [];
-      var b = $('blocked');
-      b.hidden = !blockedKeys.length;
-      b.textContent = 'Not allowed as defaults (managed by Remux user settings): ' + blockedKeys.join(', ');
-      defaultsOriginal = pretty(d.settings || {});
-      $('defaults-text').value = defaultsOriginal;
-      $('defaults-meta').textContent = d.updatedAt ? 'Last saved ' + fmtTime(d.updatedAt) : 'Nothing saved yet';
-      setErrors('defaults-errors', [], '');
-      renderDefaultsTable(d.settings || {});
-    }).catch(handleError);
-  }
-
-  function renderDefaultsTable(settings) {
-    var tbody = $('defaults-table').querySelector('tbody');
-    clear(tbody);
-    var keys = Object.keys(settings).sort();
-    if (!keys.length) {
-      tbody.appendChild(el('tr', null, [el('td', { text: 'No defaults set.', colspan: '3' })]));
-      return;
-    }
-    keys.forEach(function (k) {
-      var del = el('button', { type: 'button', class: 'danger', text: 'Delete' });
-      del.addEventListener('click', function () {
-        confirmDialog('Remove the default for "' + k + '"?').then(function (ok) {
-          if (!ok) return;
-          var next = Object.assign({}, settings);
-          delete next[k];
-          saveDefaults(next);
-        });
-      });
-      tbody.appendChild(el('tr', null, [
-        el('td', null, [el('code', { text: k })]),
-        el('td', { text: preview(settings[k]) }),
-        el('td', null, [del])
-      ]));
-    });
-  }
 
   function setErrors(id, errors, okText) {
     var ul = $(id);
@@ -356,41 +317,6 @@
     var items = errors.length ? errors : (okText ? [okText] : []);
     items.forEach(function (e) { ul.appendChild(el('li', { text: e })); });
     ul.hidden = !items.length;
-  }
-
-  // Returns the parsed object, or null after showing why it is not valid.
-  function validateDefaultsLocal() {
-    var obj;
-    try { obj = JSON.parse($('defaults-text').value || '{}'); }
-    catch (e) { setErrors('defaults-errors', ['Invalid JSON: ' + e.message]); return null; }
-    if (obj === null || typeof obj !== 'object' || Array.isArray(obj)) {
-      setErrors('defaults-errors', ['Settings must be a JSON object.']); return null;
-    }
-    var bad = Object.keys(obj).filter(function (k) { return blockedKeys.indexOf(k) >= 0; });
-    if (bad.length) {
-      setErrors('defaults-errors', ['These keys are managed by Remux user settings and cannot be defaults: ' + bad.join(', ')]);
-      return null;
-    }
-    var hs = 'homeSections' in obj, ho = 'homeRowOrder' in obj;
-    if (hs !== ho) {
-      setErrors('defaults-errors', ['homeSections and homeRowOrder are defaults that must be set together as a pair.']);
-      return null;
-    }
-    return obj;
-  }
-
-  function saveDefaults(obj) {
-    return api('PUT', '/moonfin/admin/defaults', JSON.stringify({ settings: obj })).then(function (d) {
-      $('defaults-text').value = pretty(d.settings || {});
-      defaultsOriginal = $('defaults-text').value;
-      $('defaults-meta').textContent = 'Last saved ' + fmtTime(d.updatedAt);
-      renderDefaultsTable(d.settings || {});
-      setErrors('defaults-errors', [], 'Saved.');
-      loadStatus();
-    }).catch(function (err) {
-      if (err && err.status === 400) setErrors('defaults-errors', [err.message]);
-      else handleError(err);
-    });
   }
 
   // ---- users -----------------------------------------------------------
@@ -585,16 +511,10 @@
       coresAction(p);
     });
 
-    $('defaults-validate').addEventListener('click', function () {
-      if (validateDefaultsLocal()) setErrors('defaults-errors', [], 'Looks valid.');
-    });
-    $('defaults-save').addEventListener('click', function () {
-      var obj = validateDefaultsLocal();
-      if (obj) saveDefaults(obj);
-    });
-    $('defaults-revert').addEventListener('click', function () {
-      $('defaults-text').value = defaultsOriginal;
-      setErrors('defaults-errors', [], '');
+    defaults().init({
+      $: $, el: el, clear: clear, api: api, confirmDialog: confirmDialog,
+      handleError: handleError, fmtTime: fmtTime, preview: preview, setErrors: setErrors,
+      loadStatus: loadStatus, loadUsers: loadUsers
     });
 
     $('theme-file').addEventListener('change', function (e) { readFile(e.target, $('theme-text')); });

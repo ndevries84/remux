@@ -6,6 +6,7 @@
 <meta name="color-scheme" content="light dark">
 <title>Moonfin admin</title>
 <link rel="stylesheet" href="/moonfin/admin/admin.css">
+<script src="/moonfin/admin/admin-defaults.js" defer></script>
 <script src="/moonfin/admin/admin.js" defer></script>
 </head>
 <body>
@@ -46,21 +47,62 @@
 
     <section class="card" id="defaults-section">
       <div class="head"><h2>Default client settings</h2></div>
-      <p class="muted">A JSON object applied to every user as the lowest layer. Users' own settings override these. The home rows (<code>homeSections</code> and <code>homeRowOrder</code>) are defaults that must be set together as a pair.</p>
+      <p class="muted">Settings applied to every user as the lowest layer. Users' own settings override them. A setting you leave unset keeps the app's built-in default. The home rows (<code>homeSections</code> and <code>homeRowOrder</code>) are defaults that must be set together as a pair.</p>
       <p id="blocked" class="muted" hidden></p>
-      <textarea id="defaults-text" spellcheck="false" rows="12" aria-label="Default settings JSON"></textarea>
-      <div class="row">
-        <button id="defaults-validate" type="button">Validate</button>
+
+      <div id="defaults-forms">
+        <label class="search">Search settings <input id="defaults-search" type="search" placeholder="Search by name or key" autocomplete="off"></label>
+        <span id="defaults-search-info" class="muted" role="status"></span>
+        <div id="defaults-tabs" class="tabs" role="tablist" aria-label="Settings groups"></div>
+        <div id="defaults-panels"></div>
+        <div id="defaults-excluded" class="excluded" hidden></div>
+      </div>
+
+      <h3>Other keys</h3>
+      <p class="muted">Stored defaults that none of the forms above cover. Edit them in Advanced (JSON) below, or remove them here.</p>
+      <p id="other-empty" class="muted">None.</p>
+      <ul id="other-keys" class="plain"></ul>
+
+      <details id="advanced" class="advanced">
+        <summary>Advanced (JSON)</summary>
+        <p class="muted">The same settings as one JSON object. Edits here update the forms and the other way round.</p>
+        <textarea id="defaults-text" spellcheck="false" rows="12" aria-label="Default settings JSON"></textarea>
+        <div class="row"><button id="defaults-validate" type="button">Validate</button></div>
+      </details>
+
+      <ul id="defaults-errors" class="errors" hidden></ul>
+      <div class="savebar">
         <button id="defaults-save" type="button" class="primary">Save</button>
         <button id="defaults-revert" type="button">Revert</button>
+        <span id="defaults-dirty" class="muted"></span>
         <span id="defaults-meta" class="muted"></span>
       </div>
-      <ul id="defaults-errors" class="errors" hidden></ul>
-      <div class="scroll">
-        <table id="defaults-table">
-          <thead><tr><th>Key</th><th>Value</th><th></th></tr></thead>
-          <tbody></tbody>
-        </table>
+
+      <div class="detail" id="apply-panel">
+        <h3>Apply to users</h3>
+        <p class="muted">Moonfin apps upload their settings the first time a user signs in, so new defaults only reach users who have not synced yet. Use this to push the saved defaults into users' stored settings.</p>
+        <p id="apply-unsaved" class="warn-text" hidden>You have unsaved changes. Applying uses the saved defaults, so save first.</p>
+        <fieldset>
+          <legend>Who</legend>
+          <label class="choice"><input type="radio" name="apply-scope" id="apply-scope-all" value="all" checked> Every user</label>
+          <label class="choice"><input type="radio" name="apply-scope" id="apply-scope-user" value="user"> One user</label>
+          <select id="apply-user" aria-label="User to apply to" disabled></select>
+        </fieldset>
+        <fieldset>
+          <legend>How</legend>
+          <label class="choice"><input type="radio" name="apply-mode" value="merge" checked> Merge: only fill in settings the user has not set</label>
+          <label class="choice"><input type="radio" name="apply-mode" value="overwrite"> Overwrite: replace the user's values for the settings in the defaults</label>
+        </fieldset>
+        <label>Profile
+          <select id="apply-profile">
+            <option value="global">Global (all devices)</option>
+            <option value="desktop">Desktop</option>
+            <option value="mobile">Mobile</option>
+            <option value="tv">TV</option>
+          </select>
+        </label>
+        <div class="row"><button id="apply-run" type="button" class="danger">Apply saved defaults</button></div>
+        <div id="apply-result" hidden></div>
       </div>
     </section>
 

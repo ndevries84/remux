@@ -1,6 +1,6 @@
 //! The standalone Moonfin admin page (`/Moonfin/Admin`).
 //!
-//! A small static shell (HTML + one script + one stylesheet, all embedded in
+//! A small static shell (HTML + two scripts + one stylesheet, all embedded in
 //! the binary) that manages only the Moonfin-specific things Remux hosts:
 //! default client settings, per-user settings, themes, cores and a status
 //! overview. Everything else stays in the Remux dashboard (`/admin`).
@@ -18,6 +18,7 @@ use remux_macros::get;
 
 const PAGE_HTML: &str = include_str!("../../assets/moonfin/admin.html");
 const PAGE_JS: &str = include_str!("../../assets/moonfin/admin.js");
+const PAGE_DEFAULTS_JS: &str = include_str!("../../assets/moonfin/admin-defaults.js");
 const PAGE_CSS: &str = include_str!("../../assets/moonfin/admin.css");
 /// The option schema behind the default settings forms. Derived from Moonbase
 /// (see NOTICE); data only.
@@ -63,6 +64,11 @@ pub async fn moonfin_admin_page() -> Response {
 #[get("/moonfin/admin/admin.js")]
 pub async fn moonfin_admin_script() -> Response {
     with_headers("text/javascript; charset=utf-8", PAGE_JS, false)
+}
+
+#[get("/moonfin/admin/admin-defaults.js")]
+pub async fn moonfin_admin_defaults_script() -> Response {
+    with_headers("text/javascript; charset=utf-8", PAGE_DEFAULTS_JS, false)
 }
 
 #[get("/moonfin/admin/admin.css")]
@@ -138,6 +144,16 @@ mod tests {
         js.assert_status_ok();
         assert_eq!(hdr(&js, "content-type"), "text/javascript; charset=utf-8");
         assert_eq!(hdr(&js, "x-content-type-options"), "nosniff");
+        let defaults_js = h
+            .server
+            .get("/Moonfin/Admin/admin-defaults.js")
+            .await;
+        defaults_js.assert_status_ok();
+        assert_eq!(
+            hdr(&defaults_js, "content-type"),
+            "text/javascript; charset=utf-8"
+        );
+        assert_eq!(hdr(&defaults_js, "x-content-type-options"), "nosniff");
         let css = h
             .server
             .get("/Moonfin/Admin/admin.css")
@@ -220,18 +236,22 @@ mod tests {
         for (name, text) in [
             ("html", html),
             ("js", super::PAGE_JS),
+            ("defaults-js", super::PAGE_DEFAULTS_JS),
             ("css", super::PAGE_CSS),
         ] {
             assert!(!text.contains("http://"), "{name} references http://");
             assert!(!text.contains("https://"), "{name} references https://");
             assert!(!text.contains("//cdn"), "{name} references a CDN");
         }
-        assert!(
-            !super::PAGE_JS.contains("innerHTML")
-                && !super::PAGE_JS.contains("insertAdjacentHTML")
-                && !super::PAGE_JS.contains("document.write"),
-            "script must build the DOM with textContent only"
-        );
+        for js in [super::PAGE_JS, super::PAGE_DEFAULTS_JS] {
+            assert!(
+                !js.contains("innerHTML")
+                    && !js.contains("insertAdjacentHTML")
+                    && !js.contains("document.write")
+                    && !js.contains("outerHTML"),
+                "scripts must build the DOM with textContent only"
+            );
+        }
     }
 
     mod options {
