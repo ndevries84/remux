@@ -43,6 +43,14 @@ use crate::{AppContext, AppState, Config, db::auth::AuthSession};
 
 /// Largest accepted profile-save body (real profiles are ~10-30 KB).
 pub(crate) const MAX_SAVE_BYTES: usize = 1024 * 1024;
+/// Cap on the serialized size of a merged (stored) profile. Each save is
+/// capped at `MAX_SAVE_BYTES`, but merges add keys forever without this.
+const MAX_PROFILE_BYTES: usize = MAX_SAVE_BYTES;
+/// Cap on top-level keys in a merged profile. The Moonfin client syncs a
+/// few hundred settings, so this is generous headroom, not a working limit.
+const MAX_PROFILE_KEYS: usize = 2000;
+/// Longest `clientId` stored in `updated_by`; longer values are truncated.
+const MAX_CLIENT_ID_CHARS: usize = 128;
 /// SSE heartbeat; the client treats 75 s of silence as a dead stream.
 const HEARTBEAT: Duration = Duration::from_secs(30);
 
@@ -732,7 +740,10 @@ pub async fn moonfin_settings_save(
     };
     let client_id = field(&body, "clientId")
         .and_then(Value::as_str)
-        .unwrap_or("unknown");
+        .unwrap_or("unknown")
+        .chars()
+        .take(MAX_CLIENT_ID_CHARS)
+        .collect::<String>();
 
     let user = session
         .user
@@ -746,7 +757,7 @@ pub async fn moonfin_settings_save(
     let db = &state
         .ctx
         .db;
-    let result: Result<(bool, bool), sqlx::Error> = async {
+    let result: Result<Option<(bool, bool)>, sqlx::Error> = async {
         let mut tx = db
             .begin()
             .await?;
@@ -769,6 +780,12 @@ pub async fn moonfin_settings_save(
         let mut after = before.clone();
         merge_profile(&mut after, incoming);
         let changed = after != before;
+        let too_many_keys = after.len() > MAX_PROFILE_KEYS;
+        let serialized = Value::Object(after).to_string();
+        if changed && (too_many_keys || serialized.len() > MAX_PROFILE_BYTES) {
+            // Dropping `tx` rolls back; stored data is untouched.
+            return Ok(None);
+        }
         if changed || row.is_none() {
             sqlx::query(
                 "INSERT INTO moonfin_settings (user_id, profile, data, updated_at, updated_by) \
@@ -779,19 +796,25 @@ pub async fn moonfin_settings_save(
             )
             .bind(user)
             .bind(&profile)
-            .bind(Value::Object(after).to_string())
+            .bind(&serialized)
             .bind(now_ms())
-            .bind(client_id)
+            .bind(&client_id)
             .execute(&mut *tx)
             .await?;
         }
         tx.commit()
             .await?;
-        Ok((!had_any, changed))
+        Ok(Some((!had_any, changed)))
     }
     .await;
     let (created, changed) = match result {
-        Ok(r) => r,
+        Ok(Some(r)) => r,
+        Ok(None) => {
+            return error_response(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "Merged profile too large",
+            );
+        }
         Err(e) => return internal_error(e),
     };
     if changed {
@@ -1565,6 +1588,65 @@ mod tests {
             h.resolved(&h.token, "global")
                 .await,
             json!({})
+        );
+    }
+
+    #[tokio::test]
+    async fn merged_profile_over_size_cap_is_rejected_and_unchanged() {
+        let h = harness().await;
+        let half = "x".repeat(600 * 1024);
+        h.push(&h.token, "global", json!({ "a": half }))
+            .await
+            .assert_status_ok();
+        let before = h
+            .resolved(&h.token, "global")
+            .await;
+        // Each request is under the per-request cap; the merge is not.
+        h.push(&h.token, "global", json!({ "b": half }))
+            .await
+            .assert_status(StatusCode::PAYLOAD_TOO_LARGE);
+        assert_eq!(
+            h.resolved(&h.token, "global")
+                .await,
+            before
+        );
+        // Replacing the existing key with a small value still works.
+        h.push(&h.token, "global", json!({ "a": "small" }))
+            .await
+            .assert_status_ok();
+        h.push(&h.token, "global", json!({ "b": "ok" }))
+            .await
+            .assert_status_ok();
+    }
+
+    #[tokio::test]
+    async fn merged_profile_over_key_cap_is_rejected_and_unchanged() {
+        let h = harness().await;
+        let full: serde_json::Map<String, Value> = (0..super::MAX_PROFILE_KEYS)
+            .map(|i| (format!("k{i}"), json!(i)))
+            .collect();
+        h.push(&h.token, "global", Value::Object(full))
+            .await
+            .assert_status_ok();
+        let before = h
+            .resolved(&h.token, "global")
+            .await;
+        h.push(&h.token, "global", json!({ "one-too-many": 1 }))
+            .await
+            .assert_status(StatusCode::PAYLOAD_TOO_LARGE);
+        assert_eq!(
+            h.resolved(&h.token, "global")
+                .await,
+            before
+        );
+        // Updating an existing key at the cap is a normal save.
+        h.push(&h.token, "global", json!({ "k0": "changed" }))
+            .await
+            .assert_status_ok();
+        assert_eq!(
+            h.resolved(&h.token, "global")
+                .await["k0"],
+            "changed"
         );
     }
 
