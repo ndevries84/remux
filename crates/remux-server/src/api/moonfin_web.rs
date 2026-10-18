@@ -204,6 +204,20 @@ async fn serve_file(root: &FsPath, full: PathBuf, req: Request<Body>) -> Respons
 }
 
 async fn serve_path(state: &AppState, requested: &str, req: Request<Body>) -> Response {
+    // The rewrite layer keeps the case of dotted segments, so `Config.json`
+    // misses the exact `/moonfin/web/config.json` route; any casing of the
+    // bundle-root config.json is the dynamic config, never the static copy.
+    if requested
+        .trim_matches('/')
+        .eq_ignore_ascii_case("config.json")
+    {
+        return web_config(
+            State(state.clone()),
+            req.headers()
+                .clone(),
+        )
+        .await;
+    }
     let root = web_root(state);
     if !tokio::fs::metadata(&root)
         .await
@@ -514,6 +528,27 @@ mod tests {
             resp.json::<serde_json::Value>()["defaultServerUrl"],
             "https://media.example"
         );
+    }
+
+    #[tokio::test]
+    async fn config_json_is_dynamic_for_any_casing() {
+        let data = tempfile::tempdir().unwrap();
+        write_bundle(&data);
+        let (server, _g) = server(&data, |_| {}).await;
+        for path in ["/Moonfin/Web/Config.json", "/Moonfin/Web/CONFIG.JSON"] {
+            let resp = server
+                .get(path)
+                .add_header("host", "media.example:8096")
+                .await;
+            resp.assert_status_ok();
+            let body = resp.json::<serde_json::Value>();
+            assert_eq!(body["pluginMode"], true, "{path}");
+            assert!(
+                body.get("static")
+                    .is_none(),
+                "{path}"
+            );
+        }
     }
 
     #[tokio::test]
