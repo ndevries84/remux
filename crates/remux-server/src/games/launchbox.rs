@@ -935,6 +935,33 @@ struct Inner {
     /// Test hook: the next background update panics.
     #[cfg(test)]
     panic_next_update: std::sync::atomic::AtomicBool,
+    /// Test hook: the next map load task panics.
+    #[cfg(test)]
+    panic_next_map_load: std::sync::atomic::AtomicBool,
+}
+
+/// Drops a `Loading` map slot when its load task unwinds, so later lookups
+/// start a fresh load instead of joining a dead one.
+struct MapLoadGuard {
+    inner: Arc<Inner>,
+    core: Core,
+    generation: String,
+}
+
+impl Drop for MapLoadGuard {
+    fn drop(&mut self) {
+        let mut maps = lock(
+            &self
+                .inner
+                .maps,
+        );
+        if matches!(
+            maps.get(&self.core),
+            Some(MapSlot::Loading { generation, .. }) if *generation == self.generation
+        ) {
+            maps.remove(&self.core);
+        }
+    }
 }
 
 /// Ends a background update when its task unwinds: clears `running` (else
@@ -1013,6 +1040,8 @@ impl Default for LaunchBox {
                 settled: tokio::sync::Notify::new(),
                 #[cfg(test)]
                 panic_next_update: std::sync::atomic::AtomicBool::new(false),
+                #[cfg(test)]
+                panic_next_map_load: std::sync::atomic::AtomicBool::new(false),
             }),
         }
     }
@@ -1242,7 +1271,22 @@ impl LaunchBox {
                         .clone();
                     let g2 = generation.clone();
                     let handle = tokio::spawn(async move {
+                        // Disarmed by publishing below; on unwind it frees
+                        // the slot.
+                        let guard = MapLoadGuard {
+                            inner: inner.clone(),
+                            core,
+                            generation: g2.clone(),
+                        };
+                        #[cfg(test)]
+                        if inner
+                            .panic_next_map_load
+                            .swap(false, std::sync::atomic::Ordering::SeqCst)
+                        {
+                            panic!("injected map load panic");
+                        }
                         let loaded = load_map(&path).await;
+                        std::mem::forget(guard);
                         let slot = match &loaded {
                             Some(map) => MapSlot::Ready {
                                 generation: g2.clone(),
@@ -2300,6 +2344,64 @@ mod tests {
             )
             .failures,
             2
+        );
+    }
+
+    #[tokio::test]
+    async fn a_panicking_map_load_does_not_wedge_the_slot() {
+        let data = tempfile::tempdir().unwrap();
+        let config = Config {
+            data_dir: data
+                .path()
+                .to_path_buf(),
+            games_launchbox_enabled: true,
+            ..Default::default()
+        };
+        let st = Settings::new(&config);
+        let gen_dir = st
+            .dir
+            .join("gen-g");
+        std::fs::create_dir_all(&gen_dir).unwrap();
+        std::fs::write(gen_dir.join("nes.json"), b"{}").unwrap();
+        write_stamp(
+            &st.dir,
+            &Stamp {
+                version: STAMP_VERSION,
+                generation: "g".into(),
+                cores: vec!["nes".into()],
+                source: "x".into(),
+                etag: None,
+                last_modified: None,
+                checked_at: 0,
+            },
+        )
+        .await
+        .unwrap();
+
+        let lb = LaunchBox::default();
+        let deadline = || tokio::time::Instant::now() + Duration::from_secs(60);
+        lb.inner
+            .panic_next_map_load
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        assert!(
+            lb.map_for(&st, Core::Nes, deadline())
+                .await
+                .is_none()
+        );
+        assert!(
+            !lock(
+                &lb.inner
+                    .maps
+            )
+            .contains_key(&Core::Nes),
+            "a dead load must not stay in the slot"
+        );
+
+        // The next lookup loads for real.
+        assert!(
+            lb.map_for(&st, Core::Nes, deadline())
+                .await
+                .is_some()
         );
     }
 }

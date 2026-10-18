@@ -147,6 +147,9 @@ struct Inner {
     slots: Mutex<HashMap<&'static str, Slot>>,
     crc_cache: Mutex<HashMap<PathBuf, (u64, SystemTime, Arc<Vec<u32>>)>>,
     crc_inflight: DashMap<PathBuf, SharedCrcs>,
+    /// Test hook: the next CRC task panics.
+    #[cfg(test)]
+    panic_next_crc: std::sync::atomic::AtomicBool,
     /// `scanned_at` of the snapshot last used to pre-load databases.
     prewarmed: Mutex<Option<Instant>>,
     launchbox: LaunchBox,
@@ -195,6 +198,21 @@ impl Drop for LoadGuard {
     }
 }
 
+/// Removes a CRC in-flight entry when its task ends, including by unwinding;
+/// otherwise a panic would leave every later request joining a dead task.
+struct CrcGuard {
+    inner: Arc<Inner>,
+    key: PathBuf,
+}
+
+impl Drop for CrcGuard {
+    fn drop(&mut self) {
+        self.inner
+            .crc_inflight
+            .remove(&self.key);
+    }
+}
+
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock()
         .unwrap_or_else(|e| e.into_inner())
@@ -227,6 +245,8 @@ impl Default for MetaService {
                 slots: Mutex::new(HashMap::new()),
                 crc_cache: Mutex::new(HashMap::new()),
                 crc_inflight: DashMap::new(),
+                #[cfg(test)]
+                panic_next_crc: std::sync::atomic::AtomicBool::new(false),
                 prewarmed: Mutex::new(None),
                 launchbox: LaunchBox::default(),
                 #[cfg(test)]
@@ -602,11 +622,18 @@ impl MetaService {
                 let max = st.max_hash_bytes;
                 let key = path.clone();
                 let handle = tokio::spawn(async move {
-                    let out = hash_cached(&inner, &key, core, max).await;
-                    inner
-                        .crc_inflight
-                        .remove(&key);
-                    out
+                    let _guard = CrcGuard {
+                        inner: inner.clone(),
+                        key: key.clone(),
+                    };
+                    #[cfg(test)]
+                    if inner
+                        .panic_next_crc
+                        .swap(false, std::sync::atomic::Ordering::SeqCst)
+                    {
+                        panic!("injected CRC task panic");
+                    }
+                    hash_cached(&inner, &key, core, max).await
                 });
                 let shared = async move {
                     handle
@@ -1377,5 +1404,42 @@ mod tests {
                 .as_deref(),
             Some("RPG")
         );
+    }
+
+    #[tokio::test]
+    async fn a_panicking_crc_task_does_not_stay_in_flight() {
+        let mut fx = warm_fixture();
+        fx.config
+            .games_launchbox_enabled = false;
+        let game = &fx
+            .snap
+            .games[0];
+        let st = Settings::new(&fx.config);
+        let svc = MetaService::default();
+        let run = |svc: &MetaService| match svc.crc_state(&st, game) {
+            CrcState::Pending(fut) => fut,
+            _ => panic!("expected a pending CRC"),
+        };
+
+        svc.inner
+            .panic_next_crc
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let fut = run(&svc);
+        let out = tokio::time::timeout(Duration::from_secs(60), fut)
+            .await
+            .expect("waiters must not hang on a dead task");
+        assert!(out.is_none());
+        assert!(
+            svc.inner
+                .crc_inflight
+                .is_empty(),
+            "the dead task must not stay registered"
+        );
+
+        // The next request starts a fresh hash and gets the real CRC.
+        let out = tokio::time::timeout(Duration::from_secs(60), run(&svc))
+            .await
+            .expect("hung");
+        assert!(out.is_some_and(|v| !v.is_empty()));
     }
 }
