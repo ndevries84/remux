@@ -411,7 +411,11 @@ impl MdbListService {
 
     /// Starts (or extends) the 429 gate for one key, keeping the map bounded.
     fn gate(&self, key_id: KeyId, wait: Duration) {
-        let now = Instant::now();
+        self.gate_at(key_id, wait, Instant::now());
+    }
+
+    /// [`Self::gate`] with an explicit clock reading, so tests can drive time.
+    fn gate_at(&self, key_id: KeyId, wait: Duration, now: Instant) {
         let map = &self
             .inner
             .rate_limited;
@@ -2178,9 +2182,14 @@ mod tests {
                 .len()
                 <= MAX_RATE_LIMITED_KEYS
         );
-        svc.gate(KeyId(u64::MAX), Duration::from_millis(1));
-        std::thread::sleep(Duration::from_millis(5));
-        svc.gate(KeyId(u64::MAX - 1), Duration::from_secs(60));
+        let t0 = Instant::now();
+        svc.gate_at(KeyId(u64::MAX), Duration::from_millis(1), t0);
+        // A later reading, past the first gate's expiry, with no real waiting.
+        svc.gate_at(
+            KeyId(u64::MAX - 1),
+            Duration::from_secs(60),
+            t0 + Duration::from_millis(5),
+        );
         assert!(
             !svc.inner
                 .rate_limited
