@@ -27,9 +27,10 @@ use uuid::Uuid;
 
 use super::moonfin_settings::{
     ADMIN_BLOCKED_KEYS, MAX_PROFILE_BYTES, MAX_PROFILE_KEYS, MAX_SAVE_BYTES, Profile,
-    StreamEvent, VALID_PROFILES, blocked_keys_in, internal_error, load_defaults,
-    load_profiles, merge_profile, now_ms, parse_profile, parse_stored, ping_body,
-    resolved_profile, save_defaults,
+    StreamEvent, VALID_PROFILES, api_key_names_in, blocked_keys_in, internal_error,
+    is_api_key_name, load_defaults, load_profiles, merge_profile, now_ms,
+    parse_profile, parse_stored, ping_body, resolved_profile, save_defaults,
+    within_profile_caps,
 };
 use crate::{AppState, db::auth::AuthSession, games};
 
@@ -126,6 +127,23 @@ pub async fn moonfin_admin_defaults_put(
                 "These settings are managed by Remux and cannot be defaults: {}",
                 blocked.join(", ")
             ),
+        );
+    }
+    let api_keys = api_key_names_in(&settings);
+    if !api_keys.is_empty() {
+        return json_error(
+            StatusCode::BAD_REQUEST,
+            format!(
+                "API keys cannot be admin defaults because every user would inherit them; \
+                 set the server key in Server settings instead: {}",
+                api_keys.join(", ")
+            ),
+        );
+    }
+    if !within_profile_caps(&settings) {
+        return json_error(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "Default settings exceed the key-count or size limit",
         );
     }
     match save_defaults(
@@ -250,6 +268,29 @@ pub async fn moonfin_admin_user_settings(
     }
 }
 
+/// Replaces credential values with `"set"` (a blank one is dropped), so the
+/// admin view shows whether a key exists without exposing it.
+fn redact_api_keys(settings: &mut Profile) {
+    settings.retain(|key, value| {
+        if !is_api_key_name(key) {
+            return true;
+        }
+        match value {
+            Value::String(s)
+                if s.trim()
+                    .is_empty() =>
+            {
+                false
+            }
+            Value::Null => false,
+            _ => {
+                *value = Value::String("set".into());
+                true
+            }
+        }
+    });
+}
+
 async fn user_settings_view(
     state: &AppState,
     id: Uuid,
@@ -268,6 +309,8 @@ async fn user_settings_view(
     let mut resolved = Map::new();
     for profile in VALID_PROFILES {
         if let Some((settings, updated_at, updated_by)) = stored.get(profile) {
+            let mut settings = settings.clone();
+            redact_api_keys(&mut settings);
             profiles.insert(
                 profile.to_string(),
                 json!({
@@ -277,10 +320,9 @@ async fn user_settings_view(
                 }),
             );
         }
-        resolved.insert(
-            profile.to_string(),
-            Value::Object(resolved_profile(state, id, profile).await?),
-        );
+        let mut view = resolved_profile(state, id, profile).await?;
+        redact_api_keys(&mut view);
+        resolved.insert(profile.to_string(), Value::Object(view));
     }
     Ok(Some(json!({
         "userId": simple(id),
@@ -410,7 +452,8 @@ fn has_value(profile: &Profile, key: &str) -> bool {
         .is_some_and(|v| !v.is_null())
 }
 
-/// `stored` after applying `defaults`. Blocked keys and nulls in `defaults`
+/// `stored` after applying `defaults`. Blocked keys, API keys (a blank one
+/// must never clobber a user's) and nulls in `defaults`
 /// are never written; keys outside `defaults` are never touched.
 ///
 /// * Merge: a default key is written only where the user has no value. The
@@ -423,7 +466,10 @@ fn apply_defaults(stored: &Profile, defaults: &Profile, mode: ApplyMode) -> Prof
         .iter()
         .any(|k| has_value(stored, k));
     for (key, value) in defaults {
-        if value.is_null() || ADMIN_BLOCKED_KEYS.contains(&key.as_str()) {
+        if value.is_null()
+            || ADMIN_BLOCKED_KEYS.contains(&key.as_str())
+            || is_api_key_name(key)
+        {
             continue;
         }
         if mode == ApplyMode::Merge {
@@ -1407,6 +1453,129 @@ mod tests {
         assert_eq!(body["webApp"]["version"], Value::Null);
         assert_eq!(body["webApp"]["forcedServerUrl"], Value::Null);
         assert_eq!(body["defaultsKeyCount"], 0);
+    }
+
+    #[tokio::test]
+    async fn api_keys_are_refused_as_defaults_and_nothing_is_stored() {
+        let h = Harness::new().await;
+        for key in ["mdblistApiKey", "tmdbApiKey", "anyOtherApiKey"] {
+            let resp = put_defaults(
+                &h,
+                &h.token,
+                json!({ "settings": { "posterSize": "small", key: "SECRETVAL" } }),
+            )
+            .await;
+            resp.assert_status(StatusCode::BAD_REQUEST);
+            let message = resp.json::<Value>()["error"]
+                .as_str()
+                .unwrap()
+                .to_string();
+            assert!(message.contains(key), "{message}");
+            assert!(message.contains("Server settings"), "{message}");
+            assert!(!message.contains("SECRETVAL"), "{message}");
+        }
+        let read = h
+            .get(&h.token, "/Moonfin/Admin/Defaults")
+            .await
+            .json::<Value>();
+        assert_eq!(read["settings"], json!({}));
+    }
+
+    #[tokio::test]
+    async fn legacy_api_keys_in_stored_defaults_never_resolve_or_apply() {
+        let h = Harness::new().await;
+        let other = h
+            .second_user()
+            .await;
+        let second = user_id(&h, "second").await;
+        sqlx::query(
+            "INSERT INTO moonfin_default_settings (id, data, updated_at) VALUES (1, ?1, 0)",
+        )
+        .bind(json!({ "a": 1, "mdblistApiKey": "SECRETVAL" }).to_string())
+        .execute(
+            &h.ctx
+                .db,
+        )
+        .await
+        .unwrap();
+        let read = h
+            .get(&h.token, "/Moonfin/Admin/Defaults")
+            .await
+            .json::<Value>();
+        assert_eq!(read["settings"], json!({ "a": 1 }));
+        push(&h, &other, "global", json!({ "b": 2 })).await;
+        apply(&h, &h.token, json!({ "scope": "all", "mode": "overwrite" }))
+            .await
+            .assert_status_ok();
+        let after = stored(&h, second, "global")
+            .await
+            .unwrap();
+        assert_eq!(after, json!({ "a": 1, "b": 2 }));
+    }
+
+    #[test]
+    fn apply_defaults_never_writes_api_keys_even_blank_ones() {
+        let obj = |v: Value| {
+            v.as_object()
+                .unwrap()
+                .clone()
+        };
+        let stored = obj(json!({ "tmdbApiKey": "mine" }));
+        let defaults = obj(json!({ "tmdbApiKey": "", "mdblistApiKey": "x", "a": 1 }));
+        for mode in [ApplyMode::Merge, ApplyMode::Overwrite] {
+            let after = apply_defaults(&stored, &defaults, mode);
+            assert_eq!(after.get("tmdbApiKey"), Some(&json!("mine")));
+            assert!(!after.contains_key("mdblistApiKey"));
+            assert_eq!(after.get("a"), Some(&json!(1)));
+        }
+    }
+
+    #[tokio::test]
+    async fn oversized_defaults_are_refused_like_user_saves() {
+        let h = Harness::new().await;
+        let many: serde_json::Map<String, Value> = (0..=MAX_PROFILE_KEYS)
+            .map(|i| (format!("k{i}"), json!(1)))
+            .collect();
+        put_defaults(&h, &h.token, json!({ "settings": many }))
+            .await
+            .assert_status(StatusCode::PAYLOAD_TOO_LARGE);
+        let read = h
+            .get(&h.token, "/Moonfin/Admin/Defaults")
+            .await
+            .json::<Value>();
+        assert_eq!(read["settings"], json!({}));
+    }
+
+    #[tokio::test]
+    async fn admin_user_view_hides_api_key_values() {
+        let h = Harness::new().await;
+        let other = h
+            .second_user()
+            .await;
+        let second = user_id(&h, "second").await;
+        push(
+            &h,
+            &other,
+            "global",
+            json!({ "mdblistApiKey": "SECRETVAL", "tmdbApiKey": "OTHERSECRET", "a": 1 }),
+        )
+        .await;
+        let resp = h
+            .get(
+                &h.token,
+                &format!("/Moonfin/Admin/Users/{}/Settings", simple(second)),
+            )
+            .await;
+        resp.assert_status_ok();
+        let text = resp.text();
+        assert!(!text.contains("SECRETVAL"), "{text}");
+        assert!(!text.contains("OTHERSECRET"), "{text}");
+        let body: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(
+            body["profiles"]["global"]["settings"],
+            json!({ "mdblistApiKey": "set", "tmdbApiKey": "set", "a": 1 })
+        );
+        assert_eq!(body["resolved"]["global"]["mdblistApiKey"], "set");
     }
 
     async fn apply(h: &Harness, token: &str, body: Value) -> axum_test::TestResponse {

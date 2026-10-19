@@ -236,6 +236,32 @@ pub(crate) fn now_ms() -> i64 {
     chrono::Utc::now().timestamp_millis()
 }
 
+/// Whether a settings key holds a credential (`mdblistApiKey`, `tmdbApiKey`,
+/// ...). Such keys are per-user: admin defaults never carry them, and blank
+/// values are never saved.
+pub(crate) fn is_api_key_name(key: &str) -> bool {
+    key.contains("ApiKey")
+}
+
+/// The credential-bearing keys present in `settings`.
+pub(crate) fn api_key_names_in(settings: &Profile) -> Vec<String> {
+    settings
+        .keys()
+        .filter(|k| is_api_key_name(k))
+        .cloned()
+        .collect()
+}
+
+/// Whether `settings` is within the per-profile key-count and size caps that
+/// user saves enforce.
+pub(crate) fn within_profile_caps(settings: &Profile) -> bool {
+    settings.len() <= MAX_PROFILE_KEYS
+        && Value::Object(settings.clone())
+            .to_string()
+            .len()
+            <= MAX_PROFILE_BYTES
+}
+
 /// Merges `incoming` into `stored` (top-level keys, whole-value replace).
 pub(crate) fn merge_profile(stored: &mut Profile, incoming: &Profile) {
     let present = |k: &str| {
@@ -251,7 +277,7 @@ pub(crate) fn merge_profile(stored: &mut Profile, incoming: &Profile) {
         if value.is_null() {
             continue;
         }
-        if key.contains("ApiKey")
+        if is_api_key_name(key)
             && let Some(s) = value.as_str()
             && (s
                 .trim()
@@ -412,7 +438,8 @@ pub(crate) fn blocked_keys_in(settings: &Profile) -> Vec<&'static str> {
 }
 
 /// Admin defaults from the database, or `None` when none were ever saved.
-/// Blocked keys that older data may still carry are dropped on the way out,
+/// Blocked keys and API keys that older data may still carry are dropped on
+/// the way out,
 /// so they can never reach a resolved profile.
 pub(crate) async fn load_defaults(
     db: &SqlitePool,
@@ -427,6 +454,7 @@ pub(crate) async fn load_defaults(
         for key in ADMIN_BLOCKED_KEYS {
             settings.remove(key);
         }
+        settings.retain(|k, _| !is_api_key_name(k));
         StoredDefaults {
             settings,
             updated_at,
@@ -516,9 +544,20 @@ pub(crate) async fn import_defaults_file(ctx: &AppContext) {
             return;
         }
     };
-    let dropped = blocked_keys_in(&settings);
+    let mut dropped: Vec<String> = blocked_keys_in(&settings)
+        .into_iter()
+        .map(str::to_string)
+        .collect();
+    dropped.extend(api_key_names_in(&settings));
     for key in &dropped {
-        settings.remove(*key);
+        settings.remove(key);
+    }
+    if !within_profile_caps(&settings) {
+        warn!(
+            path,
+            "ignoring Moonfin default settings file: over the size or key-count cap"
+        );
+        return;
     }
     let count = settings.len();
     let stored = sqlx::query(
@@ -2182,6 +2221,42 @@ mod tests {
             .unwrap();
         super::import_defaults_file(&h.ctx).await;
         assert_eq!(resolved_for(&h, "desktop").await, json!({}));
+    }
+
+    #[tokio::test]
+    async fn api_keys_in_the_defaults_file_are_not_imported() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir
+            .path()
+            .join("defaults.json");
+        std::fs::write(
+            &file,
+            r#"{"posterSize":"small","mdblistApiKey":"SECRETVAL","tmdbApiKey":"x"}"#,
+        )
+        .unwrap();
+        let path = file
+            .to_string_lossy()
+            .into_owned();
+        let h =
+            Shared::new_with(|c| c.moonfin_default_settings_path = Some(path)).await;
+        let stored = super::load_defaults(
+            &h.ctx
+                .db,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(stored.settings, profile(json!({ "posterSize": "small" })));
+        let raw: String = sqlx::query_scalar(
+            "SELECT data FROM moonfin_default_settings WHERE id = 1",
+        )
+        .fetch_one(
+            &h.ctx
+                .db,
+        )
+        .await
+        .unwrap();
+        assert!(!raw.contains("SECRETVAL"));
     }
 
     #[tokio::test]
