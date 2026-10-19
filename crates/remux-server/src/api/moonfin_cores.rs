@@ -342,9 +342,11 @@ mod tests {
         let body = r.text();
         assert!(!body.contains("https://cdn.emulatorjs.org"));
         let self_hosted = body.contains("window.EJS_pathtodata = './data/'");
+        // A stale install now says "out of date" rather than "aren't installed".
         assert_eq!(
             !self_hosted,
             body.contains("Emulator files aren't installed on this server")
+                || body.contains("Emulator files on this server are out of date")
         );
         !self_hosted
     }

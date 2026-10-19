@@ -41,6 +41,8 @@ const BRIDGE_JS: &str = include_str!("../../assets/moonfin/moonfin-bridge.js");
 
 /// Placeholder in `player.html` replaced with the EmulatorJS data URL.
 const PATHTODATA_PLACEHOLDER: &str = "__EJS_PATHTODATA__";
+/// Placeholder in `player-unavailable.html` replaced with the message.
+const MESSAGE_PLACEHOLDER: &str = "__MESSAGE__";
 /// Placeholder in `player.html` replaced with a per-response CSP nonce.
 const NONCE_PLACEHOLDER: &str = "__CSP_NONCE__";
 /// EmulatorJS release served from the CDN. Moonbase tracks the moving "stable"
@@ -138,17 +140,42 @@ enum PlayerSource {
     SelfHosted,
     /// Operator opted in to the CDN (`games_emulatorjs_cdn_fallback`).
     Cdn,
-    /// Nothing to load from: show the "not installed" page.
-    Unavailable,
+    /// Nothing to load from: show the "not installed" (or "out of date") page.
+    Unavailable(String),
 }
 
 impl PlayerSource {
-    fn resolve(installed: bool, cdn_fallback: bool) -> Self {
-        match (installed, cdn_fallback) {
-            (true, _) => Self::SelfHosted,
-            (false, true) => Self::Cdn,
-            (false, false) => Self::Unavailable,
+    fn resolve(state: &games::cores::DataState, cdn_fallback: bool) -> Self {
+        use games::cores::DataState;
+        match (state, cdn_fallback) {
+            (DataState::Installed, _) => Self::SelfHosted,
+            (_, true) => Self::Cdn,
+            (DataState::Stale { found }, false) => Self::Unavailable(format!(
+                "Emulator files on this server are out of date (installed {}, need \
+                 {EMULATORJS_VERSION}). An admin can reinstall them from /Moonfin/Admin.",
+                sanitize_version(found)
+            )),
+            (DataState::Missing, false) => Self::Unavailable(
+                "Emulator files aren't installed on this server. An admin can install \
+                 them from /Moonfin/Admin."
+                    .into(),
+            ),
         }
+    }
+}
+
+/// A marker file's text made safe to print in HTML: version-like characters
+/// only, bounded.
+fn sanitize_version(raw: &str) -> String {
+    let clean: String = raw
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_'))
+        .take(32)
+        .collect();
+    if clean.is_empty() {
+        "unknown".into()
+    } else {
+        clean
     }
 }
 
@@ -181,9 +208,9 @@ pub async fn emulator_player(
     };
     // A half-extracted or stale folder must not flip the player to a broken
     // self-hosted mode: it needs the required files and a matching version.
-    let installed = games::cores::data_installed(&data_root(&state)).await;
+    let data_state = games::cores::data_state(&data_root(&state)).await;
     let source = PlayerSource::resolve(
-        installed,
+        &data_state,
         state
             .ctx
             .config
@@ -193,8 +220,10 @@ pub async fn emulator_player(
     rand::thread_rng().fill_bytes(&mut nonce_bytes);
     let nonce = base64::engine::general_purpose::STANDARD.encode(nonce_bytes);
     let (html, csp) = match source {
-        PlayerSource::Unavailable => (
-            UNAVAILABLE_HTML.replace(NONCE_PLACEHOLDER, &nonce),
+        PlayerSource::Unavailable(ref message) => (
+            UNAVAILABLE_HTML
+                .replace(MESSAGE_PLACEHOLDER, message)
+                .replace(NONCE_PLACEHOLDER, &nonce),
             unavailable_content_security_policy(&nonce),
         ),
         PlayerSource::SelfHosted | PlayerSource::Cdn => {
@@ -543,6 +572,32 @@ mod tests {
             .await
             .text();
         assert!(body.contains("window.EJS_pathtodata = './data/'"));
+    }
+
+    #[tokio::test]
+    async fn stale_install_without_cdn_says_files_are_out_of_date() {
+        let data = tempfile::tempdir().unwrap();
+        let root = data
+            .path()
+            .join("games/emulatorjs/data");
+        std::fs::create_dir_all(&root).unwrap();
+        for f in ["loader.js", "emulator.min.js", "emulator.min.css"] {
+            std::fs::write(root.join(f), "x").unwrap();
+        }
+        std::fs::write(root.join(games::cores::VERSION_MARKER), "4.0.0").unwrap();
+        let (s, _g) = server(&data).await;
+        let resp = s
+            .get("/Moonfin/EmulatorJS/player.html?core=nes&rom=x")
+            .await;
+        resp.assert_status_ok();
+        let body = resp.text();
+        assert!(body.contains(&format!(
+            "Emulator files on this server are out of date (installed 4.0.0, need \
+             {EMULATORJS_VERSION}). An admin can reinstall them from /Moonfin/Admin."
+        )));
+        assert!(!body.contains("aren't installed"));
+        assert!(!body.contains(MESSAGE_PLACEHOLDER));
+        assert!(!body.contains("<script"));
     }
 
     #[tokio::test]

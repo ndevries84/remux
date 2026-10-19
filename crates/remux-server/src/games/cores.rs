@@ -57,23 +57,47 @@ pub fn data_dir(config: &Config) -> PathBuf {
     base_dir(config).join("data")
 }
 
-/// True when `data` holds a complete bundle of the pinned version: all
-/// [`REQUIRED_FILES`] exist and the version marker (when present) matches.
-/// A folder without a marker (copied in by hand) is accepted.
-pub async fn data_installed(data: &Path) -> bool {
+/// What is on disk in the emulator data folder.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DataState {
+    /// Complete bundle of the pinned version (or hand-copied, without marker).
+    Installed,
+    /// Complete, but marked as another EmulatorJS version (the marker text).
+    Stale { found: String },
+    /// Required files are missing.
+    Missing,
+}
+
+/// Classifies `data`: all [`REQUIRED_FILES`] must exist, and the version
+/// marker (when present) must match. A folder without a marker (copied in by
+/// hand) is accepted.
+pub async fn data_state(data: &Path) -> DataState {
     for name in REQUIRED_FILES {
         let is_file = tokio::fs::metadata(data.join(name))
             .await
             .map(|m| m.is_file())
             .unwrap_or(false);
         if !is_file {
-            return false;
+            return DataState::Missing;
         }
     }
     match tokio::fs::read_to_string(data.join(VERSION_MARKER)).await {
-        Ok(v) => v.trim() == EMULATORJS_VERSION,
-        Err(e) => e.kind() == io::ErrorKind::NotFound,
+        Ok(v) if v.trim() == EMULATORJS_VERSION => DataState::Installed,
+        Ok(v) => DataState::Stale {
+            found: v
+                .trim()
+                .to_string(),
+        },
+        Err(e) if e.kind() == io::ErrorKind::NotFound => DataState::Installed,
+        Err(_) => DataState::Stale {
+            found: "unreadable".into(),
+        },
     }
+}
+
+/// True when `data` holds a complete bundle of the pinned version.
+pub async fn data_installed(data: &Path) -> bool {
+    data_state(data).await == DataState::Installed
 }
 
 /// A SHA-256 digest, proven to be 64 hex digits.

@@ -946,10 +946,14 @@ struct MapLoadGuard {
     inner: Arc<Inner>,
     core: Core,
     generation: String,
+    armed: bool,
 }
 
 impl Drop for MapLoadGuard {
     fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
         let mut maps = lock(
             &self
                 .inner
@@ -1273,10 +1277,11 @@ impl LaunchBox {
                     let handle = tokio::spawn(async move {
                         // Disarmed by publishing below; on unwind it frees
                         // the slot.
-                        let guard = MapLoadGuard {
+                        let mut guard = MapLoadGuard {
                             inner: inner.clone(),
                             core,
                             generation: g2.clone(),
+                            armed: true,
                         };
                         #[cfg(test)]
                         if inner
@@ -1286,7 +1291,7 @@ impl LaunchBox {
                             panic!("injected map load panic");
                         }
                         let loaded = load_map(&path).await;
-                        std::mem::forget(guard);
+                        guard.armed = false;
                         let slot = match &loaded {
                             Some(map) => MapSlot::Ready {
                                 generation: g2.clone(),
