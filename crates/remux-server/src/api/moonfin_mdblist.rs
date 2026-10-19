@@ -315,6 +315,9 @@ enum Blame {
     /// Other 4xx (401/403/400/402/405...): this key is bad or refused;
     /// remembered per (key, title).
     Key,
+    /// A 200 reply without a `ratings` array: the key's fault when a user key
+    /// was used, otherwise the title's. Never cached as a success.
+    Malformed,
     /// 429: gates only this key for the given time; not a title failure.
     RateLimit(Duration),
 }
@@ -334,6 +337,7 @@ impl MdbListService {
         api_key: &str,
         media: MediaType,
         tmdb_id: u64,
+        user_key: bool,
     ) -> Result<Vec<Rating>, String> {
         let cache_key = format!("{media}:{tmdb_id}");
         let key_id = KeyId::of(api_key);
@@ -376,7 +380,13 @@ impl MdbListService {
                         Ok(ratings)
                     }
                     Fetch::Failed { message, blame } => {
+                        let blame = match blame {
+                            Blame::Malformed if user_key => Blame::Key,
+                            Blame::Malformed => Blame::Title,
+                            other => other,
+                        };
                         match blame {
+                            Blame::Malformed => unreachable!("resolved above"),
                             Blame::Title => self
                                 .inner
                                 .title_failures
@@ -518,7 +528,22 @@ impl MdbListService {
                 .json::<Value>()
                 .await
             {
-                Ok(body) => Fetch::Ratings(parse_upstream(&body)),
+                // An empty list is a real answer; a missing or non-array
+                // `ratings` field is a malformed reply and must not be cached.
+                Ok(body)
+                    if body
+                        .get("ratings")
+                        .is_some_and(Value::is_array) =>
+                {
+                    Fetch::Ratings(parse_upstream(&body))
+                }
+                Ok(_) => {
+                    warn!("MDBList reply had no ratings array");
+                    Fetch::Failed {
+                        message: "Failed to fetch from MDBList".into(),
+                        blame: Blame::Malformed,
+                    }
+                }
                 Err(e) => {
                     warn!(err = %e.without_url(), "MDBList returned an unreadable body");
                     Fetch::Failed {
@@ -703,6 +728,7 @@ pub async fn moonfin_mdblist_ratings(
             api_key,
             media,
             tmdb_id,
+            own_key.is_some(),
         )
         .await
     {
@@ -1787,6 +1813,99 @@ mod tests {
             );
             good.assert_hits(1);
         }
+    }
+
+    #[tokio::test]
+    async fn malformed_reply_from_a_user_key_is_scoped_to_that_key() {
+        let mock = MockServer::start();
+        let bad = mock.mock(|when, then| {
+            when.method(GET)
+                .path("/tmdb/movie/1")
+                .query_param("apikey", BAD);
+            then.status(200)
+                .json_body(json!({ "title": "x" }));
+        });
+        let good = mock_ok(&mock, "/tmdb/movie/1", KEY);
+        let h = harness(Some(KEY), mock.base_url()).await;
+        h.seed_movies(&[1])
+            .await;
+        let second = h
+            .second_user()
+            .await;
+        h.push_as(&second, json!({ "mdblistApiKey": BAD }))
+            .await;
+        for _ in 0..2 {
+            let body = h
+                .get_as(&second, URL_1)
+                .await
+                .json::<Value>();
+            assert_eq!(body["success"], false);
+        }
+        bad.assert_hits(1);
+        // Not cached as an empty success: the server-key user still gets data.
+        let body = h
+            .json(URL_1)
+            .await;
+        assert_eq!(body["success"], true);
+        assert!(
+            !body["ratings"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+        good.assert_hits(1);
+    }
+
+    #[tokio::test]
+    async fn malformed_reply_from_the_server_key_is_a_remembered_title_failure() {
+        let mock = MockServer::start();
+        let m = mock.mock(|when, then| {
+            when.method(GET)
+                .path("/tmdb/movie/1");
+            then.status(200)
+                .json_body(json!({ "ratings": "nope" }));
+        });
+        let h = harness(Some(KEY), mock.base_url()).await;
+        h.seed_movies(&[1])
+            .await;
+        for _ in 0..2 {
+            let body = h
+                .json(URL_1)
+                .await;
+            assert_eq!(body["success"], false);
+        }
+        m.assert_hits(1);
+        let cached: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM mdblist_ratings_cache")
+                .fetch_one(
+                    &h._guard
+                        .0
+                        .db,
+                )
+                .await
+                .unwrap();
+        assert_eq!(cached, 0);
+    }
+
+    #[tokio::test]
+    async fn an_explicit_empty_ratings_array_is_a_cached_success() {
+        let mock = MockServer::start();
+        let m = mock.mock(|when, then| {
+            when.method(GET)
+                .path("/tmdb/movie/1");
+            then.status(200)
+                .json_body(json!({ "ratings": [] }));
+        });
+        let h = harness(Some(KEY), mock.base_url()).await;
+        h.seed_movies(&[1])
+            .await;
+        for _ in 0..2 {
+            let body = h
+                .json(URL_1)
+                .await;
+            assert_eq!(body["success"], true);
+        }
+        m.assert_hits(1);
     }
 
     #[tokio::test]
