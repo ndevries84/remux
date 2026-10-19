@@ -273,7 +273,7 @@ struct Inner {
     /// Title cache key -> error from an upstream outage (5xx, network, parse).
     /// Independent of any key, so shared by everyone.
     title_failures: moka::sync::Cache<String, String>,
-    /// (key, title cache key) -> error for 401/403: only that key is bad.
+    /// (key, title cache key) -> error for non-404 4xx: only that key is bad.
     key_failures: moka::sync::Cache<(KeyId, String), String>,
     /// Key -> when upstream 429s stop applying. Memory only, bounded.
     rate_limited: DashMap<KeyId, Instant>,
@@ -312,7 +312,8 @@ impl Default for MdbListService {
 enum Blame {
     /// Upstream trouble (5xx, 404, network, parse): remembered per title.
     Title,
-    /// 401/403: this key is bad; remembered per (key, title).
+    /// Other 4xx (401/403/400/402/405...): this key is bad or refused;
+    /// remembered per (key, title).
     Key,
     /// 429: gates only this key for the given time; not a title failure.
     RateLimit(Duration),
@@ -498,10 +499,12 @@ impl MdbListService {
             }
             if !status.is_success() {
                 warn!(status = status.as_u16(), "MDBList returned an error status");
-                let blame = if matches!(
-                    status,
-                    reqwest::StatusCode::UNAUTHORIZED | reqwest::StatusCode::FORBIDDEN
-                ) {
+                // Only 404 and non-4xx statuses say something about the title
+                // (shared by everyone); any other 4xx is the caller's key or
+                // request being refused, so it stays scoped to that key.
+                let blame = if status.is_client_error()
+                    && status != reqwest::StatusCode::NOT_FOUND
+                {
                     Blame::Key
                 } else {
                     Blame::Title
@@ -1746,6 +1749,44 @@ mod tests {
             .await;
         assert_eq!(body["success"], true);
         good.assert_hits(1);
+    }
+
+    #[tokio::test]
+    async fn other_client_errors_are_scoped_to_the_key_not_the_title() {
+        for status in [400u16, 402, 405] {
+            let mock = MockServer::start();
+            let bad = mock.mock(|when, then| {
+                when.method(GET)
+                    .path("/tmdb/movie/1")
+                    .query_param("apikey", BAD);
+                then.status(status);
+            });
+            let good = mock_ok(&mock, "/tmdb/movie/1", KEY);
+            let h = harness(Some(KEY), mock.base_url()).await;
+            h.seed_movies(&[1])
+                .await;
+            let second = h
+                .second_user()
+                .await;
+            h.push_as(&second, json!({ "mdblistApiKey": BAD }))
+                .await;
+            for _ in 0..2 {
+                let body = h
+                    .get_as(&second, URL_1)
+                    .await
+                    .json::<Value>();
+                assert_eq!(body["success"], false);
+                assert_eq!(body["error"], format!("MDBList returned status {status}"));
+            }
+            bad.assert_hits(1);
+            // The server-key user is unaffected.
+            assert_eq!(
+                h.json(URL_1)
+                    .await["success"],
+                true
+            );
+            good.assert_hits(1);
+        }
     }
 
     #[tokio::test]
