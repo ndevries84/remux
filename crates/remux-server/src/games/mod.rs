@@ -108,7 +108,27 @@ struct State {
     running: bool,
     /// Bumped every time a scan publishes an outcome.
     generation: u64,
+    /// Id of the most recently started scan (ids start at 1).
+    scan_id: u64,
+    /// Id of the most recently finished scan (its blocking thread ended).
+    finished_id: u64,
+    /// The running scan already timed out and published its failure; only its
+    /// stuck blocking thread remains, so joining it can never yield news.
+    abandoned: bool,
 }
+
+/// What a caller of `start_scan` waits for.
+struct ScanTicket {
+    generation: u64,
+    scan_id: u64,
+    /// Joined a scan that had already timed out: nothing left to wait for.
+    abandoned: bool,
+    /// Hard backstop on the wait (scan timeout plus a margin).
+    limit: Duration,
+}
+
+/// Slack added to the scan timeout for the hard wait backstop.
+const WAIT_MARGIN: Duration = Duration::from_secs(5);
 
 struct Shared {
     ttl: Duration,
@@ -204,6 +224,8 @@ impl Shared {
                     timeout_secs = timeout.as_secs(),
                     "games scan timed out; serving the previous game list meanwhile"
                 );
+                self.lock()
+                    .abandoned = true;
                 self.publish(Err("scan timed out"));
                 // The blocking thread cannot be cancelled: stay single-flight
                 // until it ends, and accept its result if it does finish.
@@ -218,46 +240,72 @@ impl Shared {
                 .as_millis() as u64,
             "games scan finished"
         );
-        self.lock()
-            .running = false;
+        {
+            let mut st = self.lock();
+            st.running = false;
+            st.abandoned = false;
+            st.finished_id = st.scan_id;
+        }
         // Waiters of an idle index (see `settled`) re-check `running`.
         self.published
             .notify_waiters();
     }
 
-    /// Starts a scan task unless one is alive. Returns the generation to wait
-    /// past to observe an outcome of the (new or already running) scan.
-    fn start_scan(self: &Arc<Self>, config: &Config) -> u64 {
+    /// Starts a scan task unless one is alive. The ticket says what to wait
+    /// for to observe an outcome of the (new or already running) scan.
+    fn start_scan(self: &Arc<Self>, config: &Config) -> ScanTicket {
+        let timeout = Duration::from_secs(config.games_scan_timeout_secs);
         let mut st = self.lock();
-        let generation = st.generation;
         if !st.running {
             st.running = true;
-            let timeout = Duration::from_secs(config.games_scan_timeout_secs);
+            st.abandoned = false;
+            st.scan_id += 1;
             tokio::spawn(
                 self.clone()
                     .run_scan(GamesIndex::roots(config), timeout),
             );
         }
-        generation
+        ScanTicket {
+            generation: st.generation,
+            scan_id: st.scan_id,
+            abandoned: st.abandoned,
+            limit: timeout + WAIT_MARGIN,
+        }
     }
 
-    async fn wait_published(&self, after: u64) {
-        loop {
-            let notified = self
-                .published
-                .notified();
-            tokio::pin!(notified);
-            notified
-                .as_mut()
-                .enable();
-            if self
-                .lock()
-                .generation
-                > after
-            {
-                return;
+    /// Waits until a scan publishes past the ticket, the joined scan ends, or
+    /// the backstop elapses, whichever comes first. Never waits forever.
+    async fn wait_published(&self, ticket: ScanTicket) {
+        if ticket.abandoned {
+            return;
+        }
+        let wait = async {
+            loop {
+                let notified = self
+                    .published
+                    .notified();
+                tokio::pin!(notified);
+                notified
+                    .as_mut()
+                    .enable();
+                {
+                    let st = self.lock();
+                    if st.generation > ticket.generation
+                        || st.finished_id >= ticket.scan_id
+                    {
+                        return;
+                    }
+                }
+                notified.await;
             }
-            notified.await;
+        };
+        if tokio::time::timeout(ticket.limit, wait)
+            .await
+            .is_err()
+        {
+            tracing::warn!(
+                "games scan wait hit its backstop; serving the current list"
+            );
         }
     }
 }
@@ -297,6 +345,9 @@ impl GamesIndex {
                     next_attempt: None,
                     running: false,
                     generation: 0,
+                    scan_id: 0,
+                    finished_id: 0,
+                    abandoned: false,
                 }),
                 published: tokio::sync::Notify::new(),
             }),
@@ -317,7 +368,7 @@ impl GamesIndex {
     /// background rescan when it is stale and one is due); only the very
     /// first call waits for a scan, bounded by `games_scan_timeout_secs`.
     pub async fn snapshot(&self, config: &Config) -> Arc<GamesSnapshot> {
-        let after = {
+        let ticket = {
             let st = self
                 .shared
                 .lock();
@@ -348,7 +399,7 @@ impl GamesIndex {
             }
         };
         self.shared
-            .wait_published(after)
+            .wait_published(ticket)
             .await;
         self.current_or_empty()
     }
@@ -356,11 +407,11 @@ impl GamesIndex {
     /// Forces a rescan regardless of TTL (joining one already running) and
     /// waits for its outcome. A failed rescan leaves the previous snapshot.
     pub async fn rescan(&self, config: &Config) -> Arc<GamesSnapshot> {
-        let after = self
+        let ticket = self
             .shared
             .start_scan(config);
         self.shared
-            .wait_published(after)
+            .wait_published(ticket)
             .await;
         self.current_or_empty()
     }
@@ -930,6 +981,102 @@ mod tests {
                 .len(),
             2
         );
+    }
+
+    /// A rescan issued after a scan already timed out (its blocking thread is
+    /// still stuck) must return the previous list instead of joining forever.
+    #[tokio::test]
+    async fn rescan_after_a_timed_out_scan_does_not_hang() {
+        let dir = tempfile::tempdir().unwrap();
+        write_game(dir.path(), "a.nes");
+        let (index, steps, _) = scripted_index(Duration::ZERO);
+        assert_eq!(
+            index
+                .snapshot(&config_with(dir.path()))
+                .await
+                .games
+                .len(),
+            1
+        );
+
+        let gate = Gate::new();
+        steps
+            .lock()
+            .unwrap()
+            .push_back(Step::Gated(gate.clone()));
+        let cfg = zero_timeout(dir.path());
+        // Times out; the scan thread stays parked on the gate.
+        assert_eq!(
+            within(index.rescan(&cfg))
+                .await
+                .games
+                .len(),
+            1
+        );
+        // The failure is published but the scan is still "running".
+        assert!(
+            index
+                .shared
+                .lock()
+                .running
+        );
+        assert_eq!(
+            within(index.rescan(&cfg))
+                .await
+                .games
+                .len(),
+            1
+        );
+
+        gate.release();
+        within(index.settled()).await;
+    }
+
+    /// A caller that joins a scan which already published its outcome but has
+    /// not yet cleared `running` must wake when that scan finishes.
+    #[tokio::test]
+    async fn joining_a_scan_that_published_but_is_still_running_wakes_on_finish() {
+        let dir = tempfile::tempdir().unwrap();
+        let (index, _, _) = scripted_index(DEFAULT_TTL);
+        let cfg = config_with(dir.path());
+        {
+            let mut st = index
+                .shared
+                .lock();
+            st.running = true;
+            st.scan_id = 1;
+            st.generation = 1;
+        }
+        let ticket = index
+            .shared
+            .start_scan(&cfg);
+        assert!(!ticket.abandoned);
+        let waiter = tokio::spawn({
+            let shared = index
+                .shared
+                .clone();
+            async move {
+                shared
+                    .wait_published(ticket)
+                    .await
+            }
+        });
+        tokio::task::yield_now().await;
+        assert!(!waiter.is_finished());
+        {
+            let mut st = index
+                .shared
+                .lock();
+            st.running = false;
+            st.finished_id = 1;
+        }
+        index
+            .shared
+            .published
+            .notify_waiters();
+        within(waiter)
+            .await
+            .unwrap();
     }
 
     async fn server_with(
