@@ -13,7 +13,8 @@
 //!   `GET` echoes exactly what was saved.
 //! * `POST` of a non-empty order requires `collectionId` to be an existing
 //!   collection the user's policy lets them see (`404` otherwise), and a user
-//!   holds at most `MAX_ORDERS_PER_USER` orders (`413`). Clearing (`[]`) is
+//!   holds at most `MAX_ORDERS_PER_USER` orders and `MAX_ORDER_BYTES` of
+//!   stored order JSON in total (`413`). Clearing (`[]`) is
 //!   always allowed so stale rows for deleted collections can be removed.
 //! * Orders are per user and independent of the native, admin-only,
 //!   global `move` endpoint.
@@ -30,6 +31,7 @@ use uuid::Uuid;
 
 use crate::{
     AppState,
+    api::items::apply_user_policy,
     api::moonfin_settings::{error_response, internal_error},
     db::{self, auth::AuthSession},
 };
@@ -38,6 +40,8 @@ use crate::{
 const MAX_IDS: usize = 20_000;
 /// Most collections one user may hold a stored order for.
 const MAX_ORDERS_PER_USER: i64 = 1000;
+/// Most stored order JSON bytes one user may hold across all collections.
+const MAX_ORDER_BYTES: i64 = 8 * 1024 * 1024;
 /// Largest accepted body (a full list of dashed UUIDs is ~750 KB).
 const MAX_BODY_BYTES: usize = 2 * 1024 * 1024;
 
@@ -72,30 +76,31 @@ async fn collection_visible(
     session: &AuthSession,
     collection_id: Uuid,
 ) -> anyhow::Result<bool> {
-    let policy_filter = session
-        .user
-        .policy
-        .as_ref()
-        .and_then(|p| {
-            p.0.filter_rules
-                .clone()
-        });
+    let mut filter = db::MediaFilter {
+        id: Some(vec![collection_id]),
+        kind: Some(vec![db::MediaKind::Collection]),
+        limit: Some(1),
+        ..Default::default()
+    };
+    apply_user_policy(&mut filter, &session.user);
     let found = db::Media::get_by_filter(
         &state
             .ctx
             .db,
-        &db::MediaFilter {
-            id: Some(vec![collection_id]),
-            kind: Some(vec![db::MediaKind::Collection]),
-            policy_filter,
-            limit: Some(1),
-            ..Default::default()
-        },
+        &filter,
     )
     .await?;
-    Ok(!found
+    // Container rows are exempt from the SQL rating filter (see AGENTS.md), so
+    // a collection that carries its own certification is checked here.
+    let max_rating = filter.max_parental_rating;
+    Ok(found
         .records
-        .is_empty())
+        .first()
+        .is_some_and(|c| {
+            max_rating
+                .zip(c.certification_age)
+                .is_none_or(|(max, age)| age <= max)
+        }))
 }
 
 #[get("/moonfin/collections/{collection_id}/order")]
@@ -178,10 +183,14 @@ pub async fn moonfin_collection_order_save(
             "INSERT INTO moonfin_collection_order \
              (user_id, collection_id, item_ids, updated_at) \
              SELECT ?1, ?2, ?3, ?4 \
-             WHERE EXISTS (SELECT 1 FROM moonfin_collection_order \
+             WHERE (EXISTS (SELECT 1 FROM moonfin_collection_order \
                            WHERE user_id = ?1 AND collection_id = ?2) \
                 OR (SELECT COUNT(*) FROM moonfin_collection_order \
-                    WHERE user_id = ?1) < ?5 \
+                    WHERE user_id = ?1) < ?5) \
+             AND (SELECT COALESCE(SUM(LENGTH(item_ids)), 0) \
+                  FROM moonfin_collection_order \
+                  WHERE user_id = ?1 AND collection_id <> ?2) \
+                 + LENGTH(?3) <= ?6 \
              ON CONFLICT (user_id, collection_id) DO UPDATE SET \
              item_ids = excluded.item_ids, updated_at = excluded.updated_at",
         )
@@ -190,11 +199,12 @@ pub async fn moonfin_collection_order_save(
         .bind(serde_json::to_string(&order.0).unwrap_or_else(|_| "[]".into()))
         .bind(chrono::Utc::now().timestamp_millis())
         .bind(MAX_ORDERS_PER_USER)
+        .bind(MAX_ORDER_BYTES)
         .execute(db)
         .await
     };
     match result {
-        // The guarded insert wrote nothing: the per-user cap was hit.
+        // The guarded insert wrote nothing: a per-user cap was hit.
         Ok(done)
             if done.rows_affected() == 0
                 && !order
@@ -203,7 +213,10 @@ pub async fn moonfin_collection_order_save(
         {
             error_response(
                 StatusCode::PAYLOAD_TOO_LARGE,
-                format!("at most {MAX_ORDERS_PER_USER} collection orders per user"),
+                format!(
+                    "at most {MAX_ORDERS_PER_USER} collection orders and {} MiB of order data per user",
+                    MAX_ORDER_BYTES / (1024 * 1024)
+                ),
             )
         }
         Ok(_) => StatusCode::NO_CONTENT.into_response(),
@@ -577,6 +590,106 @@ mod tests {
             .await
             .assert_status(StatusCode::NO_CONTENT);
         assert_eq!(order(&h, &h.token, COL).await, json!(ids(3)));
+    }
+
+    #[tokio::test]
+    async fn stored_order_bytes_are_capped_per_user_but_a_row_can_shrink() {
+        let h = harness().await;
+        let user: Uuid = sqlx::query_scalar("SELECT id FROM users LIMIT 1")
+            .fetch_one(
+                &h.ctx
+                    .db,
+            )
+            .await
+            .unwrap();
+        // A stale row for another collection fills the whole byte quota.
+        sqlx::query(
+            "INSERT INTO moonfin_collection_order VALUES \
+             (?1, ?2, REPLACE(HEX(ZEROBLOB(?3)), '0', 'a'), 0)",
+        )
+        .bind(user)
+        .bind(Uuid::from_u128(1_000_000))
+        .bind(MAX_ORDER_BYTES / 2)
+        .execute(
+            &h.ctx
+                .db,
+        )
+        .await
+        .unwrap();
+        h.post(&h.token, &path(COL), &json!(ids(2)))
+            .await
+            .assert_status(StatusCode::PAYLOAD_TOO_LARGE);
+        assert_eq!(order(&h, &h.token, COL).await, json!([]));
+        // Another user has their own byte quota.
+        let other = h
+            .second_user()
+            .await;
+        h.post(&other, &path(COL), &json!(ids(2)))
+            .await
+            .assert_status(StatusCode::NO_CONTENT);
+        // Shrinking the stale row frees room.
+        sqlx::query("UPDATE moonfin_collection_order SET item_ids = '[]' WHERE collection_id = ?1")
+            .bind(Uuid::from_u128(1_000_000))
+            .execute(
+                &h.ctx
+                    .db,
+            )
+            .await
+            .unwrap();
+        h.post(&h.token, &path(COL), &json!(ids(2)))
+            .await
+            .assert_status(StatusCode::NO_CONTENT);
+    }
+
+    #[tokio::test]
+    async fn collection_rated_above_the_users_limit_is_404() {
+        let h = harness().await;
+        db::Media {
+            id: Uuid::parse_str(COL).unwrap(),
+            title: "adult".into(),
+            kind: db::MediaKind::Collection,
+            collection_kind: Some(db::CollectionKind::Manual),
+            certification_age: Some(18),
+            ..Default::default()
+        }
+        .save(
+            &h.ctx
+                .db,
+        )
+        .await
+        .unwrap();
+        let kid = h
+            .second_user()
+            .await;
+        let users = h
+            .get(&h.token, "/Users")
+            .await
+            .json::<Value>();
+        let second = users
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|u| u["Name"] == "second")
+            .unwrap();
+        let id = second["Id"]
+            .as_str()
+            .unwrap();
+        let mut policy = second["Policy"].clone();
+        policy["MaxParentalRating"] = json!(10);
+        h.post(&h.token, &format!("/Users/{id}/Policy"), &policy)
+            .await
+            .assert_status(StatusCode::NO_CONTENT);
+
+        h.post(&kid, &path(COL), &json!(ids(2)))
+            .await
+            .assert_status(StatusCode::NOT_FOUND);
+        // An unrated collection and the unrestricted admin are unaffected.
+        h.post(&kid, &path(COL2), &json!(ids(2)))
+            .await
+            .assert_status(StatusCode::NO_CONTENT);
+        h.post(&h.token, &path(COL), &json!(ids(2)))
+            .await
+            .assert_status(StatusCode::NO_CONTENT);
     }
 
     async fn row_count(h: &Harness) -> i64 {
