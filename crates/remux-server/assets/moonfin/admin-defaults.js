@@ -653,7 +653,40 @@
 
   function isDirty() { return !same(settings, stored); }
 
+  // Unknown home row ids are only warned about: the server accepts them and
+  // the app ignores rows it does not know, so a typo is worth flagging but
+  // not worth blocking a save.
+  function unknownRowIds() {
+    var HR = window.MoonfinHomeRows;
+    if (!HR) return [];
+    var known = {};
+    HR.SUPPORTED.forEach(function (s) { known[s.type] = true; });
+    var bad = [];
+    function check(t) {
+      if (typeof t !== 'string' || t === '' || t === 'none') return;
+      if (!known[t] && bad.indexOf(t) < 0) bad.push(t);
+    }
+    if (Array.isArray(settings.homeSections)) {
+      settings.homeSections.forEach(function (s) {
+        // Plugin-dynamic rows are identified by their source, not a type.
+        if (isObj(s) && !(typeof s.kind === 'string' && s.kind.toLowerCase() === 'plugindynamic')) check(s.type);
+      });
+    }
+    if (Array.isArray(settings.homeRowOrder)) settings.homeRowOrder.forEach(check);
+    return bad;
+  }
+
+  function updateWarnings() {
+    var bad = unknownRowIds();
+    var w = H.$('defaults-warn');
+    w.hidden = !bad.length;
+    w.textContent = bad.length
+      ? 'Unknown home row ids (Remux will not show these): ' + bad.join(', ') + '. You can still save.'
+      : '';
+  }
+
   function updateMeta() {
+    updateWarnings();
     var dirty = isDirty();
     H.$('defaults-dirty').textContent = !jsonValid ? 'The JSON has errors; fix it before saving.'
       : (dirty ? 'Unsaved changes' : 'No unsaved changes');
@@ -704,6 +737,10 @@
 
   function applyServer(d) {
     blockedKeys = d.blockedKeys || [];
+    // Mirrors MAX_PROFILE_KEYS / MAX_PROFILE_BYTES in moonfin_settings.rs.
+    var lim = isObj(d.limits) ? d.limits : null;
+    H.$('defaults-limits').textContent = lim
+      ? 'Limit: ' + lim.maxKeys + ' keys, ' + Math.round(lim.maxBytes / 1024) + ' KB.' : '';
     stored = isObj(d.settings) ? d.settings : {};
     settings = clone(stored);
     jsonValid = true;
@@ -725,7 +762,9 @@
       H.loadStatus();
     }).catch(function (err) {
       if (err && err.status === 400) H.setErrors('defaults-errors', [err.message]);
-      else H.handleError(err);
+      else if (err && err.status === 413) {
+        H.setErrors('defaults-errors', ['These defaults are too big for the server (' + (H.$('defaults-limits').textContent || 'see the limit shown next to Save') + ' Remove some settings and try again.']);
+      } else H.handleError(err);
     });
   }
 

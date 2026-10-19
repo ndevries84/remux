@@ -2436,14 +2436,6 @@
         {
           "value": "rewatch",
           "label": "Rewatch"
-        },
-        {
-          "value": "radarr_calendar",
-          "label": "Radarr Upcoming"
-        },
-        {
-          "value": "sonarr_calendar",
-          "label": "Sonarr Upcoming"
         }
       ],
       "help": "Row ids in display order. Must be set together with Home Sections (a pair)."

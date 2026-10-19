@@ -66,6 +66,7 @@ fn defaults_body(settings: Map<String, Value>, updated_at: Option<i64>) -> Respo
     Json(json!({
         "settings": settings,
         "blockedKeys": ADMIN_BLOCKED_KEYS,
+        "limits": { "maxKeys": MAX_PROFILE_KEYS, "maxBytes": MAX_PROFILE_BYTES },
         "updatedAt": updated_at,
     }))
     .into_response()
@@ -911,6 +912,7 @@ mod tests {
                     "defaultSubtitleLanguage",
                     "subtitleMode",
                 ],
+                "limits": { "maxKeys": MAX_PROFILE_KEYS, "maxBytes": MAX_PROFILE_BYTES },
                 "updatedAt": null,
             })
         );

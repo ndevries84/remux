@@ -453,6 +453,58 @@ mod tests {
         }
 
         #[test]
+        fn home_row_suggestions_reference_no_unsupported_section() {
+            let v: serde_json::Value =
+                serde_json::from_str(super::super::DEFAULT_OPTIONS_JSON)
+                    .expect("default-options.json parses");
+            let excluded: Vec<String> = v["excluded"]
+                .as_array()
+                .expect("excluded list")
+                .iter()
+                .map(|e| {
+                    e["key"]
+                        .as_str()
+                        .expect("key")
+                        .to_lowercase()
+                })
+                .collect();
+            // Section ids for rows Remux does not implement, in both the
+            // snake_case and the Enabled-flag spellings.
+            let unsupported = [
+                "radarr_calendar",
+                "sonarr_calendar",
+                "seerr",
+                "imdb",
+                "tmdb",
+            ];
+            let control = v["controls"]
+                .as_array()
+                .expect("controls")
+                .iter()
+                .find(|c| c["key"] == "homeRowOrder")
+                .expect("homeRowOrder control");
+            let suggestions = control["suggestions"]
+                .as_array()
+                .expect("suggestions");
+            assert!(!suggestions.is_empty());
+            for s in suggestions {
+                let id = s["value"]
+                    .as_str()
+                    .expect("value")
+                    .to_lowercase();
+                assert!(
+                    !excluded.contains(&id)
+                        && !excluded
+                            .contains(&format!("enable{}", id.replace('_', "")))
+                        && !unsupported
+                            .iter()
+                            .any(|u| id.contains(u)),
+                    "suggestion {id} references an unsupported section"
+                );
+            }
+        }
+
+        #[test]
         fn groups_and_types_are_consistent() {
             let s = schema();
             for c in &s.controls {
