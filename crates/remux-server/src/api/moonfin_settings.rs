@@ -35,6 +35,7 @@ use dashmap::DashMap;
 use remux_macros::{delete, get, post};
 use serde_json::{Map, Value, json};
 use sqlx::SqlitePool;
+use strum::IntoEnumIterator;
 use tokio::sync::broadcast;
 use tracing::{error, warn};
 use uuid::Uuid;
@@ -82,7 +83,7 @@ pub struct SettingsHub {
 }
 
 /// An event pushed down every open settings stream.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, strum::EnumIter)]
 pub(crate) enum StreamEvent {
     /// Stored or default settings changed; the client re-resolves them.
     SettingsUpdated,
@@ -112,10 +113,11 @@ fn frames_for(
 ) -> Option<Vec<Bytes>> {
     match msg {
         Ok(event) => Some(vec![event.frame()]),
-        Err(broadcast::error::RecvError::Lagged(_)) => Some(vec![
-            StreamEvent::SettingsUpdated.frame(),
-            StreamEvent::ThemesChanged.frame(),
-        ]),
+        Err(broadcast::error::RecvError::Lagged(_)) => Some(
+            StreamEvent::iter()
+                .map(StreamEvent::frame)
+                .collect(),
+        ),
         Err(broadcast::error::RecvError::Closed) => None,
     }
 }
@@ -2509,6 +2511,14 @@ mod tests {
                 super::StreamEvent::ThemesChanged.frame()
             ]
         );
+        // Every event kind is resent, however many variants exist.
+        assert_eq!(
+            frames.len(),
+            <super::StreamEvent as strum::IntoEnumIterator>::iter().count()
+        );
+        for event in <super::StreamEvent as strum::IntoEnumIterator>::iter() {
+            assert!(frames.contains(&event.frame()), "{event:?} missing on lag");
+        }
         // Queued events after the lag are delivered normally.
         let next = guard
             .rx
