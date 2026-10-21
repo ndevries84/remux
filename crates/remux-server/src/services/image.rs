@@ -1218,6 +1218,130 @@ fn collection_item_filter(
     }
 }
 
+/// Most child collections consulted when a parent has to borrow posters.
+const CHILD_COLLECTION_LIMIT: u32 = 12;
+/// Most posters taken from any single child collection, so one large child
+/// cannot crowd the others out of the interleave.
+const POSTERS_PER_CHILD: u32 = 6;
+
+/// Primary (else backdrop) image path of a content item.
+fn poster_path(m: &db::Media) -> Option<String> {
+    m.images
+        .get(ImageKind::Primary)
+        .map(|i| {
+            i.path
+                .clone()
+        })
+        .or_else(|| {
+            m.images
+                .get(ImageKind::Backdrop)
+                .map(|i| {
+                    i.path
+                        .clone()
+                })
+        })
+}
+
+/// Query for the child collections of a "collection of collections". A smart
+/// parent (e.g. `collection_id in [...]`) selects them by filter; a manual
+/// group container holds them via `parent_id`. Returns `None` for collections
+/// that are not collections of collections.
+fn child_collections_filter(
+    collection: &db::Media,
+    smart_filter_override: Option<&CollectionFilter>,
+) -> Option<db::MediaFilter> {
+    if collection.kind != db::MediaKind::Collection
+        || collection.collection_media_kind != Some(db::CollectionMediaKind::Collection)
+    {
+        return None;
+    }
+    let mut filter = db::MediaFilter {
+        kind: Some(vec![db::MediaKind::Collection]),
+        limit: Some(CHILD_COLLECTION_LIMIT),
+        ..Default::default()
+    };
+    if collection.collection_kind == Some(db::CollectionKind::Smart) {
+        filter.filter_rules = Some(
+            smart_filter_override
+                .cloned()
+                .or_else(|| {
+                    collection
+                        .parse_smart_filter()
+                        .cloned()
+                })?,
+        );
+    } else {
+        filter.parent_id = Some(collection.id);
+    }
+    Some(filter)
+}
+
+/// Round-robin merge of per-source path lists, de-duplicated, up to `limit`.
+fn interleave_paths(sources: Vec<Vec<String>>, limit: usize) -> Vec<String> {
+    let mut seen = HashSet::new();
+    let mut out = Vec::new();
+    let longest = sources
+        .iter()
+        .map(Vec::len)
+        .max()
+        .unwrap_or(0);
+    for i in 0..longest {
+        for source in &sources {
+            if let Some(path) = source.get(i) {
+                if out.len() < limit && seen.insert(path.clone()) {
+                    out.push(path.clone());
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Posters borrowed from a parent's child collections. Each child is resolved
+/// exactly as the generator resolves a normal collection (smart children by
+/// evaluating their own filter), because a smart child has no stored
+/// membership to read. Server-side art, so no user policy is applied.
+async fn collect_child_poster_urls(
+    collection: &db::Media,
+    db: &sqlx::SqlitePool,
+    limit: u32,
+    smart_filter_override: Option<&CollectionFilter>,
+) -> Vec<String> {
+    let Some(filter) = child_collections_filter(collection, smart_filter_override)
+    else {
+        return Vec::new();
+    };
+    let Ok(children) = db::Media::get_by_filter(db, &filter).await else {
+        return Vec::new();
+    };
+    let mut per_child = Vec::new();
+    for child in children
+        .records
+        .iter()
+        .filter(|c| c.id != collection.id)
+    {
+        let child_filter = db::MediaFilter {
+            limit: Some(POSTERS_PER_CHILD.saturating_mul(2)),
+            ..collection_item_filter(child, None)
+        };
+        let Ok(items) = db::Media::get_by_filter(db, &child_filter).await else {
+            continue;
+        };
+        let paths: Vec<String> = items
+            .records
+            .iter()
+            // Never reuse a nested collection's own generated art as a poster.
+            .filter(|m| m.kind != db::MediaKind::Collection)
+            .filter_map(poster_path)
+            .take(POSTERS_PER_CHILD as usize)
+            .collect();
+        if !paths.is_empty() {
+            per_child.push(paths);
+        }
+    }
+    interleave_paths(per_child, limit as usize)
+}
+
 /// Collect distinct poster image paths/URLs from collection items.
 async fn collect_poster_urls(
     _id: Uuid,
@@ -1231,32 +1355,44 @@ async fn collect_poster_urls(
         limit: Some(limit.saturating_mul(2)),
         ..collection_item_filter(collection, smart_filter_override)
     };
-    let Ok(result) = db::Media::get_by_filter(db, &filter).await else {
-        return Vec::new();
+    let own: Vec<String> = match db::Media::get_by_filter(db, &filter).await {
+        Ok(result) => {
+            let mut seen = HashSet::new();
+            result
+                .records
+                .iter()
+                .filter_map(poster_path)
+                .filter(|path| seen.insert(path.clone()))
+                .take(limit as usize)
+                .collect()
+        }
+        Err(_) => Vec::new(),
     };
-    let mut seen = HashSet::new();
-    result
-        .records
+    if own.len() >= limit as usize {
+        return own;
+    }
+    // A parent whose own query found too few posters (a smart collection of
+    // collections finds none: it has no stored members) borrows from its
+    // children, keeping any posters it already found first.
+    let borrowed =
+        collect_child_poster_urls(collection, db, limit, smart_filter_override).await;
+    if borrowed.is_empty() {
+        return own;
+    }
+    let mut seen: HashSet<String> = own
         .iter()
-        .filter_map(|m| {
-            m.images
-                .get(ImageKind::Primary)
-                .map(|i| {
-                    i.path
-                        .clone()
-                })
-                .or_else(|| {
-                    m.images
-                        .get(ImageKind::Backdrop)
-                        .map(|i| {
-                            i.path
-                                .clone()
-                        })
-                })
-        })
-        .filter(|path| seen.insert(path.clone()))
-        .take(limit as usize)
-        .collect()
+        .cloned()
+        .collect();
+    let mut out = own;
+    for path in borrowed {
+        if out.len() >= limit as usize {
+            break;
+        }
+        if seen.insert(path.clone()) {
+            out.push(path);
+        }
+    }
+    out
 }
 
 /// Find a backdrop or poster URL from collection items (for the legacy single-image path).
@@ -3082,5 +3218,141 @@ mod tests {
                 .unwrap(),
             upload
         );
+    }
+
+    #[test]
+    fn interleave_round_robins_across_sources_and_dedupes() {
+        let s = |v: &[&str]| {
+            v.iter()
+                .map(|x| x.to_string())
+                .collect::<Vec<_>>()
+        };
+        let merged = interleave_paths(
+            vec![s(&["a1", "a2", "dup"]), s(&["b1", "dup", "b3"]), s(&["c1"])],
+            5,
+        );
+        assert_eq!(merged, s(&["a1", "b1", "c1", "a2", "dup"]));
+    }
+
+    async fn save_movie_with_poster(db: &sqlx::SqlitePool, n: u32) -> Uuid {
+        let mut m = db::Media {
+            title: format!("Movie {n}"),
+            kind: db::MediaKind::Movie,
+            external_ids: db::ExternalIds {
+                imdb: db::NonEmptyString::try_new(format!("tt_art_{n}")).ok(),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        m.set_image(ImageKind::Primary, format!("/posters/{n}.jpg"));
+        m.save(db)
+            .await
+            .unwrap();
+        m.id
+    }
+
+    async fn save_collection(
+        db: &sqlx::SqlitePool,
+        title: &str,
+        kind: db::CollectionKind,
+        media_kind: db::CollectionMediaKind,
+        filter: Option<CollectionFilter>,
+    ) -> db::Media {
+        let mut c = db::Media {
+            title: title.into(),
+            kind: db::MediaKind::Collection,
+            collection_kind: Some(kind),
+            collection_media_kind: Some(media_kind),
+            collection_smart_filter: filter,
+            ..Default::default()
+        };
+        c.save(db)
+            .await
+            .unwrap();
+        c
+    }
+
+    fn collection_id_filter(ids: Vec<Uuid>) -> CollectionFilter {
+        CollectionFilter {
+            groups: vec![remux_sdks::remux::FilterGroup {
+                rules: vec![remux_sdks::remux::FilterRule::CollectionId {
+                    op: remux_sdks::remux::SetOp::In,
+                    ids,
+                }],
+                ..Default::default()
+            }],
+            ..Default::default()
+        }
+    }
+
+    /// A smart parent whose filter is `collection_id in [smart children]` has
+    /// no stored members; it must borrow posters from its children.
+    #[tokio::test]
+    async fn smart_parent_borrows_posters_from_smart_children() {
+        let (_server, guard) = crate::integration_test::new_test_server()
+            .await
+            .unwrap();
+        let db = &guard
+            .0
+            .db;
+        for n in 0..4 {
+            save_movie_with_poster(db, n).await;
+        }
+        let child_a = save_collection(
+            db,
+            "Child A",
+            db::CollectionKind::Smart,
+            db::CollectionMediaKind::Movie,
+            Some(CollectionFilter::default()),
+        )
+        .await;
+        let child_b = save_collection(
+            db,
+            "Child B",
+            db::CollectionKind::Smart,
+            db::CollectionMediaKind::Movie,
+            Some(CollectionFilter::default()),
+        )
+        .await;
+        let parent = save_collection(
+            db,
+            "Parent",
+            db::CollectionKind::Smart,
+            db::CollectionMediaKind::Collection,
+            Some(collection_id_filter(vec![child_a.id, child_b.id])),
+        )
+        .await;
+
+        let urls = collect_poster_urls(parent.id, &parent, db, 9, None).await;
+        assert_eq!(urls.len(), 4, "{urls:?}");
+        let unique: HashSet<_> = urls
+            .iter()
+            .collect();
+        assert_eq!(unique.len(), urls.len());
+    }
+
+    /// A collection that already finds its own posters is left alone.
+    #[tokio::test]
+    async fn collection_with_own_posters_is_unchanged() {
+        let (_server, guard) = crate::integration_test::new_test_server()
+            .await
+            .unwrap();
+        let db = &guard
+            .0
+            .db;
+        for n in 0..3 {
+            save_movie_with_poster(db, n).await;
+        }
+        let smart = save_collection(
+            db,
+            "Plain Smart",
+            db::CollectionKind::Smart,
+            db::CollectionMediaKind::Movie,
+            Some(CollectionFilter::default()),
+        )
+        .await;
+        let own = collect_poster_urls(smart.id, &smart, db, 3, None).await;
+        assert_eq!(own.len(), 3, "{own:?}");
+        assert!(child_collections_filter(&smart, None).is_none());
     }
 }
