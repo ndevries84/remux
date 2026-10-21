@@ -1324,6 +1324,45 @@ fn compose_collection_art(
         })
         .unwrap_or_else(|| gradient_background(background_color, shape));
 
+    // Posters-only portrait art (no overlay) has no text band to reserve, so the
+    // poster sheet covers the whole canvas instead of the upper field.
+    if shape == CollectionArtShape::Portrait
+        && matches!(overlay, CollectionOverlay::None)
+        && layout != CollectionPosterLayout::None
+        && !has_custom_background
+        && !posters.is_empty()
+    {
+        let count = posters
+            .len()
+            .min(GRID_POSTER_LIMIT);
+        stamp_portrait_cover(&mut canvas, &posters[..count]);
+        apply_bottom_scrim(&mut canvas, 0.68, 0.55);
+        return Ok(canvas);
+    }
+    if shape == CollectionArtShape::Portrait
+        && posters.is_empty()
+        && !has_custom_background
+    {
+        canvas = portrait_fallback_gradient(background_color);
+        if matches!(overlay, CollectionOverlay::None) {
+            // Nothing else identifies the tile, so print the name on it.
+            let name_overlay = CollectionOverlay::Text {
+                text: None,
+                font_size: Some(80),
+                font_family: None,
+                font_weight: Some(CollectionFontWeight::Bold),
+            };
+            apply_overlay_sync(
+                &mut canvas,
+                &name_overlay,
+                name,
+                None,
+                OverlayPlacement::Centre,
+            )?;
+            return Ok(canvas);
+        }
+    }
+
     let max_n = if layout == CollectionPosterLayout::Grid {
         GridSpec::for_shape(shape).limit()
     } else {
@@ -1572,6 +1611,124 @@ fn stamp_grid(
     }
 
     image::imageops::overlay(canvas, &projected, 0, 0);
+}
+
+/// Poster sheet used by posters-only portrait art: a 3x3 grid of 2:3 posters
+/// with thin gutters, rotated slightly about the canvas centre. The sheet is
+/// larger than the rotated canvas, so the whole 600x900 image is covered and
+/// posters bleed off every edge evenly. A single poster simply fills the
+/// canvas.
+fn stamp_portrait_cover(canvas: &mut RgbaImage, posters: &[RgbaImage]) {
+    const COLS: u32 = 3;
+    const ROWS: u32 = 3;
+    const CELL_W: u32 = 250;
+    const CELL_H: u32 = 375;
+    const GUTTER: u32 = 8;
+    const TILT_DEG: f32 = -7.0;
+
+    let (out_w, out_h) = (canvas.width(), canvas.height());
+
+    if posters.len() == 1 {
+        let filled = DynamicImage::ImageRgba8(posters[0].clone())
+            .resize_to_fill(out_w, out_h, image::imageops::FilterType::Lanczos3)
+            .into_rgba8();
+        image::imageops::overlay(canvas, &filled, 0, 0);
+        return;
+    }
+
+    let sheet_w = COLS * CELL_W + (COLS - 1) * GUTTER;
+    let sheet_h = ROWS * CELL_H + (ROWS - 1) * GUTTER;
+    let mut sheet = RgbaImage::new(sheet_w, sheet_h);
+    let prepared: Vec<RgbaImage> = posters
+        .iter()
+        .map(|poster| {
+            let mut resized = image::imageops::resize(
+                poster,
+                CELL_W,
+                CELL_H,
+                image::imageops::FilterType::Lanczos3,
+            );
+            apply_rounded_corners(&mut resized);
+            resized
+        })
+        .collect();
+    // Shift each row by one so a short poster list never repeats down a column.
+    for row in 0..ROWS {
+        for col in 0..COLS {
+            let idx = (row * COLS + col + row) as usize % prepared.len();
+            let x = col * (CELL_W + GUTTER);
+            let y = row * (CELL_H + GUTTER);
+            image::imageops::overlay(&mut sheet, &prepared[idx], x.into(), y.into());
+        }
+    }
+
+    let theta = TILT_DEG * std::f32::consts::PI / 180.0;
+    let (sin_t, cos_t) = theta.sin_cos();
+    let (half_sw, half_sh) = (sheet_w as f32 / 2.0, sheet_h as f32 / 2.0);
+    let (cx, cy) = (out_w as f32 / 2.0, out_h as f32 / 2.0);
+    let mut projected = RgbaImage::new(out_w, out_h);
+    for y in 0..out_h {
+        for x in 0..out_w {
+            let dx = x as f32 - cx;
+            let dy = y as f32 - cy;
+            // Inverse rotation back into sheet space.
+            let src_x = dx * cos_t + dy * sin_t + half_sw;
+            let src_y = -dx * sin_t + dy * cos_t + half_sh;
+            if src_x < 0.0
+                || src_y < 0.0
+                || src_x >= (sheet_w - 1) as f32
+                || src_y >= (sheet_h - 1) as f32
+            {
+                continue;
+            }
+            let (x0, y0) = (src_x as u32, src_y as u32);
+            let (tx, ty) = (src_x.fract(), src_y.fract());
+            let p00 = sheet
+                .get_pixel(x0, y0)
+                .0;
+            let p10 = sheet
+                .get_pixel(x0 + 1, y0)
+                .0;
+            let p01 = sheet
+                .get_pixel(x0, y0 + 1)
+                .0;
+            let p11 = sheet
+                .get_pixel(x0 + 1, y0 + 1)
+                .0;
+            let mut out = [0u8; 4];
+            for c in 0..4 {
+                let top = p00[c] as f32 + (p10[c] as f32 - p00[c] as f32) * tx;
+                let bottom = p01[c] as f32 + (p11[c] as f32 - p01[c] as f32) * tx;
+                out[c] = (top + (bottom - top) * ty) as u8;
+            }
+            projected.put_pixel(x, y, Rgba(out));
+        }
+    }
+    image::imageops::overlay(canvas, &projected, 0, 0);
+}
+
+/// Portrait background for art with no posters: the brand gradient, or a soft
+/// slate gradient when the configured colour is (near) black, so the tile is
+/// never a flat black rectangle.
+fn portrait_fallback_gradient(color: [u8; 3]) -> RgbaImage {
+    let (w, h) = CollectionArtShape::Portrait.dimensions();
+    let dark = color
+        .iter()
+        .all(|c| *c < 48);
+    if !dark {
+        return gradient_background(color, CollectionArtShape::Portrait);
+    }
+    let top = [58.0f32, 70.0, 104.0];
+    let bottom = [22.0f32, 26.0, 42.0];
+    RgbaImage::from_fn(w, h, |_, y| {
+        let t = y as f32 / (h - 1) as f32;
+        Rgba([
+            (top[0] + (bottom[0] - top[0]) * t) as u8,
+            (top[1] + (bottom[1] - top[1]) * t) as u8,
+            (top[2] + (bottom[2] - top[2]) * t) as u8,
+            255,
+        ])
+    })
 }
 
 /// Poster-sheet geometry for the `Grid` layout in each shape.
@@ -2348,10 +2505,75 @@ mod tests {
         assert!((CollectionArtShape::Portrait.aspect_ratio() - 2.0 / 3.0).abs() < 1e-6);
     }
 
+    /// Fraction of a coarse pixel grid whose colour is not (near) black.
+    fn lit_fraction(img: &RgbaImage) -> f32 {
+        let (mut lit, mut total) = (0u32, 0u32);
+        for gy in 0..30u32 {
+            for gx in 0..20u32 {
+                let p = img.get_pixel(gx * 30 + 15, gy * 30 + 15);
+                total += 1;
+                if p[0]
+                    .max(p[1])
+                    .max(p[2])
+                    > 24
+                {
+                    lit += 1;
+                }
+            }
+        }
+        lit as f32 / total as f32
+    }
+
+    #[test]
+    fn portrait_posters_only_art_covers_the_whole_canvas() {
+        for layout in [
+            CollectionPosterLayout::Grid,
+            CollectionPosterLayout::Row,
+            CollectionPosterLayout::Scatter,
+        ] {
+            for n in [1usize, 2, 3, 4, 6, 9] {
+                let canvas = compose(
+                    CollectionArtShape::Portrait,
+                    layout,
+                    n,
+                    &CollectionOverlay::None,
+                );
+                assert_eq!((canvas.width(), canvas.height()), (600, 900));
+                let frac = lit_fraction(&canvas);
+                assert!(frac > 0.9, "{layout:?} n={n}: only {frac} covered");
+                // Corners are covered too, not just the middle.
+                for (x, y) in [(2, 2), (597, 2), (2, 800), (597, 800)] {
+                    let p = canvas.get_pixel(x, y);
+                    assert!(
+                        p[0].max(p[1])
+                            .max(p[2])
+                            > 24,
+                        "{layout:?} n={n} ({x},{y})"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn portrait_without_posters_is_never_flat_black() {
+        let canvas = portrait_fallback_gradient([0, 0, 0]);
+        assert_eq!((canvas.width(), canvas.height()), (600, 900));
+        assert!(lit_fraction(&canvas) > 0.99);
+        assert_ne!(canvas.get_pixel(10, 10), canvas.get_pixel(10, 890));
+    }
+
     #[test]
     fn portrait_scrim_darkens_the_overlay_band_but_not_the_poster_field() {
-        let text = CollectionOverlay::None;
-        // No posters, no overlay: the canvas is the gradient plus the scrim only.
+        // A blank text overlay draws nothing but keeps the overlay band (and
+        // so the scrim) in play; a bare `None` overlay skips the band.
+        let text = CollectionOverlay::Text {
+            text: Some(" ".into()),
+            font_size: Some(90),
+            font_family: None,
+            font_weight: None,
+        };
+        // No posters, no visible overlay: the canvas is the gradient plus the scrim only.
         let portrait = compose(
             CollectionArtShape::Portrait,
             CollectionPosterLayout::Row,
