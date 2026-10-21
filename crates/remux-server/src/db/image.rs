@@ -35,6 +35,12 @@ pub struct MediaImage {
     pub path: String,
     pub width: Option<i64>,
     pub height: Option<i64>,
+    /// True for artwork the server rendered itself (collection art). Only such
+    /// rows may be regenerated, invalidated or reshaped; uploaded and provider
+    /// artwork must never be touched.
+    #[serde(default)]
+    #[sqlx(default)]
+    pub is_generated: bool,
 }
 
 impl MediaImage {
@@ -44,7 +50,7 @@ impl MediaImage {
         media_id: &Uuid,
     ) -> Result<MediaImages, sqlx::Error> {
         let rows = sqlx::query_as::<_, Self>(
-            "SELECT id, media_id, image_type, image_index, path, width, height \
+            "SELECT id, media_id, image_type, image_index, path, width, height, is_generated \
              FROM media_images WHERE media_id = ? ORDER BY image_type, image_index",
         )
         .bind(media_id)
@@ -64,7 +70,7 @@ impl MediaImage {
         let mut rows = Vec::new();
         for chunk in ids.chunks(super::media::SQLITE_VAR_LIMIT) {
             let mut qb = sqlx::QueryBuilder::new(
-                "SELECT id, media_id, image_type, image_index, path, width, height \
+                "SELECT id, media_id, image_type, image_index, path, width, height, is_generated \
                  FROM media_images WHERE media_id IN (",
             );
             let mut sep = qb.separated(", ");
@@ -308,6 +314,7 @@ mod tests {
                 path: path.into(),
                 width: None,
                 height: None,
+                is_generated: false,
             }],
             ..Default::default()
         }
@@ -412,5 +419,92 @@ mod tests {
             .path
             .clone();
         assert_eq!(path, "/data/img/user.jpg");
+    }
+
+    /// The backfill in the `is_generated` migration must only claim rows that
+    /// are provably server-generated collection art.
+    #[tokio::test]
+    async fn is_generated_backfill_only_claims_provably_generated_rows() {
+        let db = test_db().await;
+        let backfill =
+            include_str!("../../migrations/202610200001_media_images_is_generated.sql");
+        let backfill = format!(
+            "UPDATE{}",
+            backfill
+                .split_once("\nUPDATE")
+                .unwrap()
+                .1
+        );
+
+        async fn media(db: &SqlitePool, kind: &str, config: Option<&str>) -> Uuid {
+            let id = Uuid::new_v4();
+            sqlx::query(
+                "INSERT INTO media (id, title, kind, collection_image_config, created_at, updated_at) \
+                 VALUES (?, 'x', ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)",
+            )
+            .bind(id)
+            .bind(kind)
+            .bind(config)
+            .execute(db)
+            .await
+            .unwrap();
+            id
+        }
+        async fn primary(db: &SqlitePool, id: Uuid, path: &str, w: i64, h: i64) {
+            sqlx::query(
+                "INSERT INTO media_images (id, media_id, image_type, image_index, path, width, height) \
+                 VALUES (?, ?, 'primary', 0, ?, ?, ?)",
+            )
+            .bind(Uuid::new_v4())
+            .bind(id)
+            .bind(path)
+            .bind(w)
+            .bind(h)
+            .execute(db)
+            .await
+            .unwrap();
+        }
+
+        let gen_dir = |id: Uuid| format!("/data/meta/library/{id}/primary.jpg");
+        // Old generator signature (960x540 jpg) without a config.
+        let legacy_fallback = media(&db, "collection", None).await;
+        primary(&db, legacy_fallback, &gen_dir(legacy_fallback), 960, 540).await;
+        // Config set: its Primary can only be generated, whatever the size.
+        let configured = media(&db, "collection", Some("{\"layout\":\"grid\"}")).await;
+        primary(&db, configured, "/elsewhere/p.png", 600, 900).await;
+        // Stored JSON null is "no config".
+        let json_null = media(&db, "collection", Some("null")).await;
+        primary(&db, json_null, "/elsewhere/p.jpg", 300, 450).await;
+        // Uploaded art without a config: untouched.
+        let uploaded = media(&db, "collection", None).await;
+        primary(&db, uploaded, &gen_dir(uploaded), 300, 450).await;
+        // Provider URL at the generator's size: untouched.
+        let provider = media(&db, "collection", None).await;
+        primary(&db, provider, "https://image.tmdb.org/p.jpg", 960, 540).await;
+        // Not a collection: untouched even at the generator's size.
+        let movie = media(&db, "movie", None).await;
+        primary(&db, movie, &gen_dir(movie), 960, 540).await;
+
+        sqlx::raw_sql(&backfill)
+            .execute(&db)
+            .await
+            .unwrap();
+
+        let flag = |id: Uuid| {
+            let db = db.clone();
+            async move {
+                MediaImage::get_for_media(&db, &id)
+                    .await
+                    .unwrap()
+                    .primary[0]
+                    .is_generated
+            }
+        };
+        assert!(flag(legacy_fallback).await);
+        assert!(flag(configured).await);
+        assert!(!flag(json_null).await);
+        assert!(!flag(uploaded).await);
+        assert!(!flag(provider).await);
+        assert!(!flag(movie).await);
     }
 }

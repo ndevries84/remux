@@ -2403,6 +2403,7 @@ impl Media {
                 path: url,
                 width: None,
                 height: None,
+                is_generated: false,
             });
         }
     }

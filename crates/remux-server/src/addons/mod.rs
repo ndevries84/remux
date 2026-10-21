@@ -4070,6 +4070,7 @@ mod tests {
             path: path.into(),
             width: None,
             height: None,
+            is_generated: false,
         }
     }
 
