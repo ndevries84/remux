@@ -14,7 +14,7 @@ use crate::{
     AppState, OptionExt, ResultExt, api, db,
     db::{ImageKind, auth},
     sdks,
-    services::image::{ImageProcessOptions, ImageService},
+    services::image::{CollectionArtShape, ImageProcessOptions, ImageService},
 };
 use axum_anyhow::ApiResult as Result;
 
@@ -239,6 +239,7 @@ async fn items_images_inner(
                         &state
                             .ctx
                             .db,
+                        CollectionArtShape::Landscape,
                     )
                     .await
                     .context_not_found("no backdrop available for library")?;
@@ -547,6 +548,7 @@ async fn upload_item_image_inner(
             &state
                 .ctx
                 .db,
+            CollectionArtShape::Landscape,
         )
         .await
         .context_internal("failed to generate collection image")?;

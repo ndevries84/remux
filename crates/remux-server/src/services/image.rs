@@ -16,9 +16,110 @@ use crate::{
     },
 };
 
-/// Width/height of generated library placeholder images (16:9).
+/// Width/height of generated landscape library placeholder images (16:9).
 const OUT_W: u32 = 960;
 const OUT_H: u32 = 540;
+
+/// Width/height of generated portrait (2:3) collection posters.
+const PORTRAIT_W: u32 = 600;
+const PORTRAIT_H: u32 = 900;
+
+/// Portrait posters reserve the lower part of the canvas for the overlay; the
+/// poster field occupies everything above this fraction of the height.
+const PORTRAIT_BAND_TOP: f32 = 0.62;
+
+/// The shape of a generated collection image. Landscape is the classic 16:9
+/// tile every Jellyfin client expects from a library/collection Primary (and
+/// what Thumb serves); Portrait is a 2:3 poster for clients that ask for it.
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Hash,
+    strum_macros::Display,
+    strum_macros::EnumString,
+)]
+#[strum(serialize_all = "snake_case")]
+pub enum CollectionArtShape {
+    Landscape,
+    Portrait,
+}
+
+impl CollectionArtShape {
+    /// Output size in pixels as `(width, height)`.
+    pub const fn dimensions(self) -> (u32, u32) {
+        match self {
+            Self::Landscape => (OUT_W, OUT_H),
+            Self::Portrait => (PORTRAIT_W, PORTRAIT_H),
+        }
+    }
+
+    /// `width / height` of the generated image.
+    pub fn aspect_ratio(self) -> f32 {
+        let (w, h) = self.dimensions();
+        w as f32 / h as f32
+    }
+
+    /// File stem used for the stored render (`primary` keeps the historical
+    /// landscape file name so existing art stays valid).
+    fn file_stem(self) -> &'static str {
+        match self {
+            Self::Landscape => "primary",
+            Self::Portrait => "primary-portrait",
+        }
+    }
+}
+
+/// Prefix that marks a Primary image tag as "serve the portrait render".
+/// Listings built for portrait-preferring clients advertise it; every other
+/// tag (or none) selects the landscape image, exactly as before.
+const PORTRAIT_TAG_PREFIX: &str = "portrait-";
+
+/// The Primary tag advertised to portrait-preferring clients for a generated
+/// collection whose landscape Primary tag is `tag`. It changes whenever `tag`
+/// does, so regenerated art busts client caches in either shape.
+pub fn portrait_art_tag(tag: &str) -> String {
+    format!("{PORTRAIT_TAG_PREFIX}{tag}")
+}
+
+/// Whether an image request's `tag` selects the portrait render.
+pub fn is_portrait_art_tag(tag: &str) -> bool {
+    tag.starts_with(PORTRAIT_TAG_PREFIX)
+}
+
+/// Thumb tag of a collection whose Primary is generated. Derived purely from
+/// the (landscape) Primary tag, so it is distinct from Primary yet changes
+/// exactly when the art is regenerated.
+pub fn collection_thumb_tag(primary_tag: &str) -> String {
+    Uuid::new_v5(
+        &Uuid::NAMESPACE_URL,
+        format!("collection-thumb|{primary_tag}").as_bytes(),
+    )
+    .to_string()
+}
+
+/// Where the overlay (text / streaming logo) sits on the canvas.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OverlayPlacement {
+    /// Left-aligned in the text column beside the poster field (landscape).
+    LeftColumn,
+    /// Centred on the whole canvas (no posters).
+    Centre,
+    /// Centred in the lower band under the poster field (portrait).
+    LowerBand,
+}
+
+impl OverlayPlacement {
+    fn for_layout(shape: CollectionArtShape, layout: CollectionPosterLayout) -> Self {
+        match (shape, layout) {
+            (_, CollectionPosterLayout::None) => Self::Centre,
+            (CollectionArtShape::Landscape, _) => Self::LeftColumn,
+            (CollectionArtShape::Portrait, _) => Self::LowerBand,
+        }
+    }
+}
 
 /// Black overlay opacity — matches Jellyfin's `0x78` (≈ 47%).
 const OVERLAY_ALPHA: f32 = 0x78 as f32 / 255.0;
@@ -29,6 +130,9 @@ const MAX_TEXT_FRACTION: f32 = 0.90;
 /// Standard poster dimensions (2:3 ratio) used in fan layout.
 const POSTER_W: u32 = 190;
 const POSTER_H: u32 = 285;
+/// Poster size used by the portrait Row/Scatter layouts.
+const PORTRAIT_POSTER_W: u32 = 180;
+const PORTRAIT_POSTER_H: u32 = 270;
 
 /// A three-by-three poster sheet gives the grid enough depth to overflow the frame.
 const GRID_POSTER_LIMIT: usize = 9;
@@ -370,40 +474,92 @@ impl ImageService {
         ))
     }
 
-    /// Generate the library placeholder image, write it to disk, save the path
-    /// to `media_images` in the DB, and return the bytes.
+    /// Read an already-rendered collection image of `shape` from disk, if any.
+    async fn read_existing_art(
+        data_dir: &std::path::Path,
+        id: Uuid,
+        shape: CollectionArtShape,
+    ) -> Option<Vec<u8>> {
+        for ext in ["jpg", "png"] {
+            let p = Self::image_path(data_dir, id, shape.file_stem(), ext);
+            if let Ok(bytes) = tokio::fs::read(&p).await {
+                return Some(bytes);
+            }
+        }
+        None
+    }
+
+    /// Generate the collection's art, write it to disk, register the landscape
+    /// render in `media_images` (as generated), and return the bytes for
+    /// `wanted`.
+    ///
+    /// Both shapes are always rendered together when either is missing, so the
+    /// first portrait listing works even though only landscape existed before
+    /// (and vice versa). A shape that is already on disk is never re-rendered
+    /// here; call [`Self::invalidate_collection_image`] to force that.
+    ///
+    /// Only the landscape render gets a `media_images` row (its id is the
+    /// image tag every client keys its cache on); the portrait render is a
+    /// sibling file derived from the same row.
     pub async fn library_image(
         data_dir: &std::path::Path,
         id: Uuid,
         name: &str,
         db: &sqlx::SqlitePool,
+        wanted: CollectionArtShape,
     ) -> anyhow::Result<Vec<u8>> {
-        // Check for an existing generated file (either jpg or png).
-        for ext in ["jpg", "png"] {
-            let p = Self::image_path(data_dir, id, "primary", ext);
-            if p.exists() {
-                return Ok(tokio::fs::read(&p).await?);
+        let landscape =
+            Self::read_existing_art(data_dir, id, CollectionArtShape::Landscape).await;
+        let portrait =
+            Self::read_existing_art(data_dir, id, CollectionArtShape::Portrait).await;
+
+        let mut missing = Vec::new();
+        if landscape.is_none() {
+            missing.push(CollectionArtShape::Landscape);
+        }
+        if portrait.is_none() {
+            missing.push(CollectionArtShape::Portrait);
+        }
+        let mut have = [
+            (CollectionArtShape::Landscape, landscape),
+            (CollectionArtShape::Portrait, portrait),
+        ];
+
+        if !missing.is_empty() {
+            let rendered =
+                Self::generate(id, name, db, None, None, None, &missing).await?;
+            for (shape, bytes) in rendered {
+                let ct = detect_content_type(&bytes);
+                let ext = ext_for_content_type(ct);
+                let path = Self::image_path(data_dir, id, shape.file_stem(), ext);
+                Self::write_image_to_disk(&path, &bytes).await?;
+                if shape == CollectionArtShape::Landscape {
+                    let (w, h) = shape.dimensions();
+                    // INSERT OR IGNORE — don't replace if already exists (stable UUID for cache)
+                    sqlx::query(
+                        "INSERT OR IGNORE INTO media_images (id, media_id, image_type, image_index, path, width, height, is_generated) VALUES (?, ?, 'primary', 0, ?, ?, ?, 1)"
+                    )
+                    .bind(Uuid::new_v4())
+                    .bind(id)
+                    .bind(path.to_string_lossy().as_ref())
+                    .bind(w as i64)
+                    .bind(h as i64)
+                    .execute(db)
+                    .await?;
+                }
+                if let Some(slot) = have
+                    .iter_mut()
+                    .find(|(s, _)| *s == shape)
+                {
+                    slot.1 = Some(bytes);
+                }
             }
         }
 
-        let bytes = Self::generate(id, name, db, None, None, None).await?;
-        let ct = detect_content_type(&bytes);
-        let ext = ext_for_content_type(ct);
-        let path = Self::image_path(data_dir, id, "primary", ext);
-        Self::write_image_to_disk(&path, &bytes).await?;
-        // INSERT OR IGNORE — don't replace if already exists (stable UUID for cache)
-        sqlx::query(
-            "INSERT OR IGNORE INTO media_images (id, media_id, image_type, image_index, path, width, height) VALUES (?, ?, 'primary', 0, ?, ?, ?)"
-        )
-        .bind(Uuid::new_v4())
-        .bind(id)
-        .bind(path.to_string_lossy().as_ref())
-        .bind(OUT_W as i64)
-        .bind(OUT_H as i64)
-        .execute(db)
-        .await?;
-
-        Ok(bytes)
+        have.into_iter()
+            .find(|(s, _)| *s == wanted)
+            .and_then(|(_, bytes)| bytes)
+            .ok_or_else(|| anyhow::anyhow!("collection {id} art not generated"))
     }
 
     /// Render a collection image from draft, unsaved state — no disk write, no
@@ -418,8 +574,21 @@ impl ImageService {
         config: &CollectionImageConfig,
         smart_filter: Option<&CollectionFilter>,
     ) -> anyhow::Result<(Vec<u8>, &'static str)> {
-        let bytes =
-            Self::generate(id, name, db, Some(config), smart_filter, None).await?;
+        // The dashboard previews the landscape tile (it is a non-Moonfin client).
+        let bytes = Self::generate(
+            id,
+            name,
+            db,
+            Some(config),
+            smart_filter,
+            None,
+            &[CollectionArtShape::Landscape],
+        )
+        .await?
+        .into_iter()
+        .next()
+        .map(|(_, bytes)| bytes)
+        .ok_or_else(|| anyhow::anyhow!("preview render produced no image"))?;
         let ct = detect_content_type(&bytes);
         Ok((bytes, ct))
     }
@@ -577,6 +746,16 @@ impl ImageService {
                 ext,
             ))
             .await;
+            // The generated portrait render lives beside the landscape Primary.
+            if kind == ImageKind::Primary {
+                let _ = tokio::fs::remove_file(Self::image_path(
+                    data_dir,
+                    id,
+                    CollectionArtShape::Portrait.file_stem(),
+                    ext,
+                ))
+                .await;
+            }
         }
         db::MediaImage::delete_for_type(db, id, kind)
             .await
@@ -665,14 +844,30 @@ impl ImageService {
         Ok(())
     }
 
-    /// Regenerate the collection image: delete cached file and DB row, then
-    /// re-generate on next request. Call after `collection_image_config` changes.
+    /// Regenerate the collection image: delete cached files (both shapes) and
+    /// the DB row, then re-generate on next request. Call after
+    /// `collection_image_config` changes.
+    ///
+    /// Only touches server-generated art: a Primary that is uploaded or comes
+    /// from a provider (`is_generated = false`) is left exactly as it is, and
+    /// the call returns `Ok(false)`. Returns `Ok(true)` when it invalidated
+    /// (including the case where nothing was generated yet).
     pub async fn invalidate_collection_image(
         data_dir: &std::path::Path,
         id: Uuid,
         db: &sqlx::SqlitePool,
-    ) -> anyhow::Result<()> {
-        Self::delete_image(data_dir, id, ImageKind::Primary, db).await
+    ) -> anyhow::Result<bool> {
+        let images = db::MediaImage::get_for_media(db, &id)
+            .await
+            .map_err(anyhow::Error::from)?;
+        if images
+            .get(ImageKind::Primary)
+            .is_some_and(|row| !row.is_generated)
+        {
+            return Ok(false);
+        }
+        Self::delete_image(data_dir, id, ImageKind::Primary, db).await?;
+        Ok(true)
     }
 
     /// `config_override`/`smart_filter_override` take precedence over whatever
@@ -680,7 +875,8 @@ impl ImageService {
     /// (`generate_preview`) supplies unsaved draft state this way, while the
     /// persisting path (`library_image`) passes `None` for both and reads the
     /// stored config as before. `background_override` similarly stands in for
-    /// a locally-picked-but-not-yet-uploaded custom background.
+    /// a locally-picked-but-not-yet-uploaded custom background. Every shape in
+    /// `shapes` is rendered from one shared fetch of the posters/background.
     async fn generate(
         id: Uuid,
         name: &str,
@@ -688,7 +884,8 @@ impl ImageService {
         config_override: Option<&CollectionImageConfig>,
         smart_filter_override: Option<&CollectionFilter>,
         background_override: Option<Vec<u8>>,
-    ) -> anyhow::Result<Vec<u8>> {
+        shapes: &[CollectionArtShape],
+    ) -> anyhow::Result<Vec<(CollectionArtShape, Vec<u8>)>> {
         let collection = db::Media::get_by_id(db, &id)
             .await?
             .ok_or_else(|| anyhow::anyhow!("collection {id} not found"))?;
@@ -759,7 +956,11 @@ impl ImageService {
         };
 
         let poster_limit = if layout == CollectionPosterLayout::Grid {
-            GRID_SOURCE_POSTER_LIMIT as u32
+            shapes
+                .iter()
+                .map(|shape| GridSpec::for_shape(*shape).limit())
+                .max()
+                .unwrap_or(GRID_SOURCE_POSTER_LIMIT) as u32
         } else {
             4u32
         };
@@ -779,30 +980,42 @@ impl ImageService {
 
         if poster_urls.is_empty() && config.is_none() {
             // Fallback: single backdrop with label (original behaviour).
-            let bg = match find_backdrop_url_from_collection(&collection, db).await {
+            let source = match find_backdrop_url_from_collection(&collection, db).await
+            {
                 Ok(src) => {
                     let result = if src.contains("://") {
                         Self::fetch_rgb(&src).await
                     } else {
                         Self::read_rgb(&src).await
                     };
-                    match result {
-                        Ok(img) => {
-                            let resized = image::imageops::resize(
-                                &img,
-                                OUT_W,
-                                OUT_H,
-                                image::imageops::FilterType::Lanczos3,
-                            );
-                            apply_dark_overlay(resized)
-                        }
-                        Err(_) => solid_background(),
-                    }
+                    result.ok()
                 }
-                Err(_) => solid_background(),
+                Err(_) => None,
             };
-            let img = draw_label(bg, name)?;
-            return encode_jpeg(img);
+            let mut out = Vec::with_capacity(shapes.len());
+            for &shape in shapes {
+                let (w, h) = shape.dimensions();
+                let bg = match &source {
+                    Some(img) if shape == CollectionArtShape::Landscape => {
+                        let resized = image::imageops::resize(
+                            img,
+                            w,
+                            h,
+                            image::imageops::FilterType::Lanczos3,
+                        );
+                        apply_dark_overlay(resized)
+                    }
+                    // A landscape backdrop is centre-cropped to the poster shape.
+                    Some(img) => apply_dark_overlay(
+                        DynamicImage::ImageRgb8(img.clone())
+                            .resize_to_fill(w, h, image::imageops::FilterType::Lanczos3)
+                            .into_rgb8(),
+                    ),
+                    None => solid_background(shape),
+                };
+                out.push((shape, encode_jpeg(draw_label(bg, name)?)?));
+            }
+            return Ok(out);
         }
 
         let posters =
@@ -819,67 +1032,36 @@ impl ImageService {
             _ => None,
         };
 
-        // CPU-bound fan composition + PNG encode runs on the blocking pool.
+        // CPU-bound fan composition + JPEG encode runs on the blocking pool.
         let name_owned = name.to_string();
         let config_owned = config;
-        let bytes = tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<u8>> {
-            let has_custom_background = custom_background.is_some();
-            let mut canvas = custom_background
-                .map(|image| {
-                    DynamicImage::ImageRgba8(image)
-                        .resize_to_fill(
-                            OUT_W,
-                            OUT_H,
-                            image::imageops::FilterType::Lanczos3,
-                        )
-                        .into_rgba8()
-                })
-                .unwrap_or_else(|| gradient_background(background_color));
+        let shapes_owned = shapes.to_vec();
+        let rendered =
+            tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<_>> {
+                let overlay = config_owned
+                    .as_ref()
+                    .map(|c| &c.overlay)
+                    .unwrap_or(&CollectionOverlay::None);
+                shapes_owned
+                    .into_iter()
+                    .map(|shape| {
+                        let canvas = compose_collection_art(
+                            shape,
+                            layout,
+                            background_color,
+                            custom_background.as_ref(),
+                            &posters,
+                            overlay,
+                            &name_owned,
+                            logo_image.as_ref(),
+                        )?;
+                        Ok((shape, encode_jpeg_rgba(canvas)?))
+                    })
+                    .collect()
+            })
+            .await??;
 
-            let max_n = if layout == CollectionPosterLayout::Grid {
-                GRID_POSTER_LIMIT
-            } else {
-                4
-            };
-            let n = posters
-                .len()
-                .min(max_n);
-            if layout != CollectionPosterLayout::None && n > 0 && !has_custom_background
-            {
-                if layout == CollectionPosterLayout::Grid {
-                    stamp_grid(&mut canvas, &posters[..n]);
-                } else {
-                    let positions = layout_positions(layout, n);
-                    for idx in (0..n).rev() {
-                        let (cx, cy, angle_deg) = positions[idx];
-                        let resized = image::imageops::resize(
-                            &posters[idx],
-                            POSTER_W,
-                            POSTER_H,
-                            image::imageops::FilterType::Lanczos3,
-                        );
-                        rotate_and_stamp(&mut canvas, resized, cx, cy, angle_deg);
-                    }
-                }
-            }
-
-            let overlay = config_owned
-                .as_ref()
-                .map(|c| &c.overlay)
-                .unwrap_or(&CollectionOverlay::None);
-            apply_overlay_sync(
-                &mut canvas,
-                overlay,
-                &name_owned,
-                logo_image,
-                layout == CollectionPosterLayout::None,
-            )?;
-
-            encode_jpeg_rgba(canvas)
-        })
-        .await??;
-
-        Ok(bytes)
+        Ok(rendered)
     }
 
     async fn load_poster_images(urls: &[String], limit: usize) -> Vec<RgbaImage> {
@@ -1117,8 +1299,78 @@ async fn find_backdrop_url_from_collection(
         })
 }
 
+/// Pure CPU composition of one collection image in `shape`: background (custom
+/// or brand gradient), poster field, then the overlay (plus, for the portrait
+/// shape, a scrim under the lower band so text stays legible).
+#[allow(clippy::too_many_arguments)]
+fn compose_collection_art(
+    shape: CollectionArtShape,
+    layout: CollectionPosterLayout,
+    background_color: [u8; 3],
+    custom_background: Option<&RgbaImage>,
+    posters: &[RgbaImage],
+    overlay: &CollectionOverlay,
+    name: &str,
+    logo: Option<&RgbaImage>,
+) -> anyhow::Result<RgbaImage> {
+    let (out_w, out_h) = shape.dimensions();
+    let has_custom_background = custom_background.is_some();
+    let mut canvas = custom_background
+        .map(|image| {
+            // A background that does not match the shape is centre-cropped to fill it.
+            DynamicImage::ImageRgba8(image.clone())
+                .resize_to_fill(out_w, out_h, image::imageops::FilterType::Lanczos3)
+                .into_rgba8()
+        })
+        .unwrap_or_else(|| gradient_background(background_color, shape));
+
+    let max_n = if layout == CollectionPosterLayout::Grid {
+        GridSpec::for_shape(shape).limit()
+    } else {
+        4
+    };
+    let n = posters
+        .len()
+        .min(max_n);
+    if layout != CollectionPosterLayout::None && n > 0 && !has_custom_background {
+        if layout == CollectionPosterLayout::Grid {
+            stamp_grid(&mut canvas, &posters[..n], shape);
+        } else {
+            let positions = layout_positions(layout, n, shape);
+            let (poster_w, poster_h) = match shape {
+                CollectionArtShape::Landscape => (POSTER_W, POSTER_H),
+                CollectionArtShape::Portrait => (PORTRAIT_POSTER_W, PORTRAIT_POSTER_H),
+            };
+            for idx in (0..n).rev() {
+                let (cx, cy, angle_deg) = positions[idx];
+                let resized = image::imageops::resize(
+                    &posters[idx],
+                    poster_w,
+                    poster_h,
+                    image::imageops::FilterType::Lanczos3,
+                );
+                rotate_and_stamp(&mut canvas, resized, cx, cy, angle_deg);
+            }
+        }
+    }
+
+    let placement = OverlayPlacement::for_layout(shape, layout);
+    if placement == OverlayPlacement::LowerBand {
+        apply_bottom_scrim(&mut canvas, PORTRAIT_BAND_TOP - 0.1, 0.75);
+    }
+    apply_overlay_sync(&mut canvas, overlay, name, logo, placement)?;
+    Ok(canvas)
+}
+
 /// Poster positions (canvas center_x, center_y, clockwise angle°) for a given layout and n posters.
-fn layout_positions(layout: CollectionPosterLayout, n: usize) -> Vec<(i64, i64, f32)> {
+fn layout_positions(
+    layout: CollectionPosterLayout,
+    n: usize,
+    shape: CollectionArtShape,
+) -> Vec<(i64, i64, f32)> {
+    if shape == CollectionArtShape::Portrait {
+        return portrait_layout_positions(layout, n);
+    }
     let positions = match layout {
         // No posters are stamped for either layout — None skips them entirely,
         // and Grid is rendered as one transformed 3×3 plane by `stamp_grid`.
@@ -1162,6 +1414,40 @@ fn layout_positions(layout: CollectionPosterLayout, n: usize) -> Vec<(i64, i64, 
     }
 }
 
+/// Portrait poster field: 2:3 posters stacked in the upper part of the canvas
+/// (everything above `PORTRAIT_BAND_TOP`), leaving the lower band for the overlay.
+fn portrait_layout_positions(
+    layout: CollectionPosterLayout,
+    n: usize,
+) -> Vec<(i64, i64, f32)> {
+    match layout {
+        CollectionPosterLayout::None | CollectionPosterLayout::Grid => Vec::new(),
+        // A tidy, barely overlapping 2x2 stagger.
+        CollectionPosterLayout::Row => match n {
+            1 => vec![(300, 260, 0.0)],
+            2 => vec![(190, 235, 0.0), (410, 315, 0.0)],
+            3 => vec![(185, 170, 0.0), (415, 235, 0.0), (300, 420, 0.0)],
+            _ => vec![
+                (185, 140, 0.0),
+                (415, 205, 0.0),
+                (185, 410, 0.0),
+                (415, 475, 0.0),
+            ],
+        },
+        CollectionPosterLayout::Scatter => match n {
+            1 => vec![(300, 260, 0.0)],
+            2 => vec![(185, 230, -12.0), (415, 310, 13.0)],
+            3 => vec![(175, 160, -15.0), (425, 225, 11.0), (290, 425, -9.0)],
+            _ => vec![
+                (175, 150, -15.0),
+                (425, 205, 12.0),
+                (175, 405, 9.0),
+                (425, 465, -13.0),
+            ],
+        },
+    }
+}
+
 /// Apply rounded corners (CORNER_RADIUS px) to an RGBA image in-place.
 fn apply_rounded_corners(img: &mut RgbaImage) {
     let w = img.width();
@@ -1189,8 +1475,13 @@ fn apply_rounded_corners(img: &mut RgbaImage) {
 /// Build a non-overlapping 3×3 poster sheet, then project it as a single
 /// skewed plane. The plane starts beyond the text area and is intentionally
 /// larger than the output canvas, so it reads as a background element.
-fn stamp_grid(canvas: &mut RgbaImage, posters: &[RgbaImage]) {
-    let (grid_w, grid_h) = grid_dimensions();
+fn stamp_grid(
+    canvas: &mut RgbaImage,
+    posters: &[RgbaImage],
+    shape: CollectionArtShape,
+) {
+    let spec = GridSpec::for_shape(shape);
+    let (grid_w, grid_h) = grid_dimensions(shape);
     let mut grid = RgbaImage::new(grid_w, grid_h);
 
     let prepared_posters: Vec<RgbaImage> = posters
@@ -1198,8 +1489,8 @@ fn stamp_grid(canvas: &mut RgbaImage, posters: &[RgbaImage]) {
         .map(|poster| {
             let mut resized = image::imageops::resize(
                 poster,
-                GRID_POSTER_W,
-                GRID_POSTER_H,
+                spec.poster_w,
+                spec.poster_h,
                 image::imageops::FilterType::Lanczos3,
             );
             apply_rounded_corners(&mut resized);
@@ -1209,28 +1500,29 @@ fn stamp_grid(canvas: &mut RgbaImage, posters: &[RgbaImage]) {
 
     // Smaller collections still need a complete background plane. Reuse their
     // prepared posters cyclically instead of resizing the same image per cell.
-    for idx in 0..GRID_POSTER_LIMIT {
+    for idx in 0..spec.limit() {
         let poster = &prepared_posters[idx % prepared_posters.len()];
-        let col = idx % GRID_COLUMNS;
-        let row = idx / GRID_COLUMNS;
-        let x = col as u32 * (GRID_POSTER_W + GRID_GUTTER);
-        let y = row as u32 * (GRID_POSTER_H + GRID_GUTTER);
+        let col = idx % spec.columns;
+        let row = idx / spec.columns;
+        let x = col as u32 * (spec.poster_w + GRID_GUTTER);
+        let y = row as u32 * (spec.poster_h + GRID_GUTTER);
         image::imageops::overlay(&mut grid, poster, x.into(), y.into());
     }
 
     // An affine projection with a subtle clockwise rotation and horizontal
     // shear. Its centre sits off the right edge; most of the 3×3 sheet is
     // therefore clipped, leaving roughly the right third of the image visible.
-    let (a, b, c, d) = (0.74f32, -0.23f32, 0.23f32, 0.71f32);
+    let k = spec.projection_scale;
+    let (a, b, c, d) = (0.74f32 * k, -0.23f32 * k, 0.23f32 * k, 0.71f32 * k);
     let determinant = a * d - b * c;
-    let centre_x = 835.0;
-    let centre_y = 320.0;
+    let (centre_x, centre_y) = spec.centre;
     let half_w = grid_w as f32 / 2.0;
     let half_h = grid_h as f32 / 2.0;
-    let mut projected = RgbaImage::new(OUT_W, OUT_H);
+    let (out_w, out_h) = shape.dimensions();
+    let mut projected = RgbaImage::new(out_w, out_h);
 
-    for y in 0..OUT_H {
-        for x in 0..OUT_W {
+    for y in 0..out_h {
+        for x in 0..out_w {
             let dx = x as f32 - centre_x;
             let dy = y as f32 - centre_y;
             let src_x = (d * dx - b * dy) / determinant + half_w;
@@ -1282,11 +1574,54 @@ fn stamp_grid(canvas: &mut RgbaImage, posters: &[RgbaImage]) {
     image::imageops::overlay(canvas, &projected, 0, 0);
 }
 
-fn grid_dimensions() -> (u32, u32) {
-    let rows = GRID_POSTER_LIMIT.div_ceil(GRID_COLUMNS) as u32;
+/// Poster-sheet geometry for the `Grid` layout in each shape.
+struct GridSpec {
+    columns: usize,
+    rows: usize,
+    poster_w: u32,
+    poster_h: u32,
+    /// Uniform scale applied to the affine projection matrix.
+    projection_scale: f32,
+    /// Where the projected sheet's centre lands on the output canvas.
+    centre: (f32, f32),
+}
+
+impl GridSpec {
+    fn for_shape(shape: CollectionArtShape) -> Self {
+        match shape {
+            CollectionArtShape::Landscape => Self {
+                columns: GRID_COLUMNS,
+                rows: GRID_POSTER_LIMIT.div_ceil(GRID_COLUMNS),
+                poster_w: GRID_POSTER_W,
+                poster_h: GRID_POSTER_H,
+                projection_scale: 1.0,
+                centre: (835.0, 320.0),
+            },
+            // 2 columns x 3 rows, bleeding off the top and sides of the
+            // poster field above the overlay band.
+            CollectionArtShape::Portrait => Self {
+                columns: 2,
+                rows: 3,
+                poster_w: 200,
+                poster_h: 300,
+                projection_scale: 1.5,
+                centre: (290.0, 215.0),
+            },
+        }
+    }
+
+    /// Number of posters the sheet holds.
+    fn limit(&self) -> usize {
+        self.columns * self.rows
+    }
+}
+
+fn grid_dimensions(shape: CollectionArtShape) -> (u32, u32) {
+    let spec = GridSpec::for_shape(shape);
+    let (columns, rows) = (spec.columns as u32, spec.rows as u32);
     (
-        GRID_COLUMNS as u32 * GRID_POSTER_W + (GRID_COLUMNS as u32 - 1) * GRID_GUTTER,
-        rows * GRID_POSTER_H + (rows - 1) * GRID_GUTTER,
+        columns * spec.poster_w + (columns - 1) * GRID_GUTTER,
+        rows * spec.poster_h + (rows - 1) * GRID_GUTTER,
     )
 }
 
@@ -1383,9 +1718,21 @@ fn apply_overlay_sync(
     canvas: &mut RgbaImage,
     overlay: &CollectionOverlay,
     fallback_name: &str,
-    logo_image: Option<RgbaImage>,
-    centered: bool,
+    logo_image: Option<&RgbaImage>,
+    placement: OverlayPlacement,
 ) -> anyhow::Result<()> {
+    let (out_w, out_h) = (canvas.width(), canvas.height());
+    let centered = placement != OverlayPlacement::LeftColumn;
+    // Configured font sizes are authored against the 960px-wide landscape tile.
+    let width_scale = out_w as f32 / OUT_W as f32;
+    // Vertical extent the overlay is centred in: the whole canvas, or the lower
+    // band beneath the poster field.
+    let (area_top, area_h) = if placement == OverlayPlacement::LowerBand {
+        let top = out_h as f32 * PORTRAIT_BAND_TOP;
+        (top, out_h as f32 - top)
+    } else {
+        (0.0, out_h as f32)
+    };
     match overlay {
         CollectionOverlay::None => {}
         CollectionOverlay::Text {
@@ -1397,7 +1744,7 @@ fn apply_overlay_sync(
             let label = text
                 .as_deref()
                 .unwrap_or(fallback_name);
-            let size = (*font_size).unwrap_or(90) as f32;
+            let size = (*font_size).unwrap_or(90) as f32 * width_scale;
             let font_bytes = collection_font_bytes(font_family.unwrap_or_default());
             let mut font = FontRef::try_from_slice(font_bytes)
                 .map_err(|e| anyhow::anyhow!("font load: {e:?}"))?;
@@ -1410,7 +1757,7 @@ fn apply_overlay_sync(
             let fallbacks = fallback_fonts(weight);
 
             let max_w = if centered {
-                OUT_W as f32 * 0.85
+                out_w as f32 * 0.85
             } else {
                 TEXT_AREA_END as f32 - TEXT_LEFT_MARGIN as f32
             };
@@ -1423,7 +1770,7 @@ fn apply_overlay_sync(
             let line_gap = line_h * 0.18;
             let step = line_h + line_gap;
             let total_h = step * lines.len() as f32 - line_gap;
-            let start_y = ((OUT_H as f32 - total_h) / 2.0) as i32;
+            let start_y = (area_top + (area_h - total_h) / 2.0) as i32;
 
             for (i, line) in lines
                 .iter()
@@ -1431,7 +1778,7 @@ fn apply_overlay_sync(
             {
                 let y = start_y + (i as f32 * step) as i32;
                 let x = if centered {
-                    ((OUT_W as f32 - measure_text_width(&font, scale, line)) / 2.0)
+                    ((out_w as f32 - measure_text_width(&font, scale, line)) / 2.0)
                         as i32
                 } else {
                     TEXT_LEFT_MARGIN
@@ -1450,32 +1797,32 @@ fn apply_overlay_sync(
         }
         CollectionOverlay::StreamingLogo { .. } => {
             if let Some(logo) = logo_image {
-                let max_logo_h = if centered {
-                    OUT_H * 9 / 25
-                } else {
-                    OUT_H * 3 / 10
+                let max_logo_h = match placement {
+                    OverlayPlacement::Centre => out_h * 9 / 25,
+                    OverlayPlacement::LeftColumn => out_h * 3 / 10,
+                    OverlayPlacement::LowerBand => (out_h as f32 * 0.14) as u32,
                 };
                 let max_logo_w = if centered {
-                    (OUT_W as f32 * 0.7) as u32
+                    (out_w as f32 * 0.7) as u32
                 } else {
-                    (OUT_W as f32 * 0.34) as u32
+                    (out_w as f32 * 0.34) as u32
                 };
                 let scale = (max_logo_h as f32 / logo.height() as f32)
                     .min(max_logo_w as f32 / logo.width() as f32);
                 let lw = (logo.width() as f32 * scale) as u32;
                 let lh = (logo.height() as f32 * scale) as u32;
                 let scaled = image::imageops::resize(
-                    &logo,
+                    logo,
                     lw,
                     lh,
                     image::imageops::FilterType::Lanczos3,
                 );
                 let lx = if centered {
-                    (OUT_W.saturating_sub(lw) / 2) as i64
+                    (out_w.saturating_sub(lw) / 2) as i64
                 } else {
                     TEXT_LEFT_MARGIN as i64
                 };
-                let ly = (OUT_H.saturating_sub(lh) / 2) as i64;
+                let ly = (area_top + (area_h - lh as f32).max(0.0) / 2.0) as i64;
                 let mut shadow = scaled.clone();
                 for pixel in shadow.pixels_mut() {
                     if pixel[3] > 0 {
@@ -1594,8 +1941,9 @@ fn wrap_words(
     lines
 }
 
-fn solid_background() -> RgbImage {
-    RgbImage::from_pixel(OUT_W, OUT_H, Rgb([0, 0, 0]))
+fn solid_background(shape: CollectionArtShape) -> RgbImage {
+    let (w, h) = shape.dimensions();
+    RgbImage::from_pixel(w, h, Rgb([0, 0, 0]))
 }
 
 fn parse_hex_color(value: &str) -> Option<[u8; 3]> {
@@ -1610,10 +1958,11 @@ fn parse_hex_color(value: &str) -> Option<[u8; 3]> {
     ])
 }
 
-fn gradient_background(color: [u8; 3]) -> RgbaImage {
-    let mut image = RgbaImage::new(OUT_W, OUT_H);
-    for y in 0..OUT_H {
-        let t = y as f32 / (OUT_H.saturating_sub(1)) as f32;
+fn gradient_background(color: [u8; 3], shape: CollectionArtShape) -> RgbaImage {
+    let (out_w, out_h) = shape.dimensions();
+    let mut image = RgbaImage::new(out_w, out_h);
+    for y in 0..out_h {
+        let t = y as f32 / (out_h.saturating_sub(1)) as f32;
         let factor = 0.7 + t * 0.3;
         let pixel = Rgba([
             (color[0] as f32 * factor) as u8,
@@ -1621,7 +1970,7 @@ fn gradient_background(color: [u8; 3]) -> RgbaImage {
             (color[2] as f32 * factor) as u8,
             255,
         ]);
-        for x in 0..OUT_W {
+        for x in 0..out_w {
             image.put_pixel(x, y, pixel);
         }
     }
@@ -1640,14 +1989,37 @@ fn apply_dark_overlay(mut img: RgbImage) -> RgbImage {
     img
 }
 
+/// Darken the bottom of the canvas with a vertical black gradient (alpha 0 at
+/// `start_frac` of the height rising to `max_alpha` at the bottom edge), so the
+/// overlay stays legible over the poster field.
+fn apply_bottom_scrim(canvas: &mut RgbaImage, start_frac: f32, max_alpha: f32) {
+    let (w, h) = (canvas.width(), canvas.height());
+    let start = (h as f32 * start_frac) as u32;
+    let span = h
+        .saturating_sub(start)
+        .max(1) as f32;
+    for y in start..h {
+        let t = (y - start) as f32 / span;
+        let keep = 1.0 - max_alpha * t;
+        for x in 0..w {
+            let pixel = canvas.get_pixel_mut(x, y);
+            pixel[0] = (pixel[0] as f32 * keep) as u8;
+            pixel[1] = (pixel[1] as f32 * keep) as u8;
+            pixel[2] = (pixel[2] as f32 * keep) as u8;
+        }
+    }
+}
+
 /// Render the library name centered on the image in white text.
 fn draw_label(mut img: RgbImage, name: &str) -> anyhow::Result<RgbImage> {
+    let (out_w, out_h) = (img.width(), img.height());
     let font = FontRef::try_from_slice(FONT_BOLD)
         .map_err(|e| anyhow::anyhow!("font load failed: {e:?}"))?;
 
     // Start at ~20% of image height and scale down until it fits within 90% width.
-    let mut scale = PxScale::from(OUT_H as f32 * 0.20);
-    let max_width = OUT_W as f32 * MAX_TEXT_FRACTION;
+    // Sized from the shorter side so the label reads the same in either shape.
+    let mut scale = PxScale::from(out_w.min(out_h) as f32 * 0.20);
+    let max_width = out_w as f32 * MAX_TEXT_FRACTION;
     let mut tw = measure_text_width(&font, scale, name);
     if tw > max_width {
         scale = PxScale::from(scale.x * max_width / tw);
@@ -1659,8 +2031,8 @@ fn draw_label(mut img: RgbImage, name: &str) -> anyhow::Result<RgbImage> {
         sf.ascent() - sf.descent()
     };
 
-    let x = ((OUT_W as f32 - tw) / 2.0) as i32;
-    let y = ((OUT_H as f32 - text_height) / 2.0) as i32;
+    let x = ((out_w as f32 - tw) / 2.0) as i32;
+    let y = ((out_h as f32 - text_height) / 2.0) as i32;
 
     draw_text_mut(&mut img, Rgb([255, 255, 255]), x, y, scale, &font, name);
 
@@ -1895,11 +2267,181 @@ fn apply_sizing(img: DynamicImage, opts: &ImageProcessOptions) -> DynamicImage {
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn test_posters() -> Vec<RgbaImage> {
+        (0..9u32)
+            .map(|i| {
+                RgbaImage::from_fn(200, 300, |x, y| {
+                    Rgba([
+                        (i * 28 + x / 2) as u8,
+                        (255 - ((i * 20 + y / 3) % 255)) as u8,
+                        ((x + y + i * 40) % 256) as u8,
+                        255,
+                    ])
+                })
+            })
+            .collect()
+    }
+
+    fn test_overlays() -> Vec<(&'static str, CollectionOverlay)> {
+        vec![
+            ("none", CollectionOverlay::None),
+            (
+                "text",
+                CollectionOverlay::Text {
+                    text: Some("Marvel Cinematic Universe".into()),
+                    font_size: Some(90),
+                    font_family: None,
+                    font_weight: None,
+                },
+            ),
+        ]
+    }
+
+    fn compose(
+        shape: CollectionArtShape,
+        layout: CollectionPosterLayout,
+        n: usize,
+        overlay: &CollectionOverlay,
+    ) -> RgbaImage {
+        compose_collection_art(
+            shape,
+            layout,
+            [120, 30, 60],
+            None,
+            &test_posters()[..n],
+            overlay,
+            "Fallback",
+            None,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn composition_matches_the_shape_for_every_layout_and_overlay() {
+        for shape in [CollectionArtShape::Landscape, CollectionArtShape::Portrait] {
+            for layout in [
+                CollectionPosterLayout::Grid,
+                CollectionPosterLayout::Row,
+                CollectionPosterLayout::Scatter,
+                CollectionPosterLayout::None,
+            ] {
+                for (_, overlay) in test_overlays() {
+                    for n in [0usize, 1, 3, 9] {
+                        // Grid needs at least one poster (callers never pass 0).
+                        let n = if layout == CollectionPosterLayout::Grid {
+                            n.max(1)
+                        } else {
+                            n
+                        };
+                        let canvas = compose(shape, layout, n, &overlay);
+                        assert_eq!(
+                            (canvas.width(), canvas.height()),
+                            shape.dimensions(),
+                            "{shape} {layout:?} n={n}"
+                        );
+                    }
+                }
+            }
+        }
+        assert_eq!(CollectionArtShape::Landscape.dimensions(), (960, 540));
+        assert_eq!(CollectionArtShape::Portrait.dimensions(), (600, 900));
+        assert!((CollectionArtShape::Portrait.aspect_ratio() - 2.0 / 3.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn portrait_scrim_darkens_the_overlay_band_but_not_the_poster_field() {
+        let text = CollectionOverlay::None;
+        // No posters, no overlay: the canvas is the gradient plus the scrim only.
+        let portrait = compose(
+            CollectionArtShape::Portrait,
+            CollectionPosterLayout::Row,
+            0,
+            &text,
+        );
+        let plain = gradient_background([120, 30, 60], CollectionArtShape::Portrait);
+        // Untouched above the band, darker at the very bottom.
+        assert_eq!(portrait.get_pixel(10, 10), plain.get_pixel(10, 10));
+        assert!(portrait.get_pixel(10, 899)[0] < plain.get_pixel(10, 899)[0]);
+        // Landscape never gets a scrim.
+        let landscape = compose(
+            CollectionArtShape::Landscape,
+            CollectionPosterLayout::Row,
+            0,
+            &text,
+        );
+        assert_eq!(
+            landscape,
+            gradient_background([120, 30, 60], CollectionArtShape::Landscape)
+        );
+    }
+
+    #[test]
+    fn portrait_text_overlay_is_centred_in_the_lower_band() {
+        let overlay = CollectionOverlay::Text {
+            text: Some("Marvel".into()),
+            font_size: Some(90),
+            font_family: None,
+            font_weight: None,
+        };
+        let canvas = compose(
+            CollectionArtShape::Portrait,
+            CollectionPosterLayout::Row,
+            0,
+            &overlay,
+        );
+        // White glyph pixels exist, all of them below the poster field and
+        // horizontally centred around the middle.
+        let white: Vec<(u32, u32)> = canvas
+            .enumerate_pixels()
+            .filter(|(_, _, p)| p[0] > 240 && p[1] > 240 && p[2] > 240)
+            .map(|(x, y, _)| (x, y))
+            .collect();
+        assert!(!white.is_empty());
+        let band_top = (900.0 * PORTRAIT_BAND_TOP) as u32;
+        assert!(
+            white
+                .iter()
+                .all(|(_, y)| *y >= band_top)
+        );
+        let min_x = white
+            .iter()
+            .map(|(x, _)| *x)
+            .min()
+            .unwrap() as i32;
+        let max_x = white
+            .iter()
+            .map(|(x, _)| *x)
+            .max()
+            .unwrap() as i32;
+        assert!((min_x + max_x - 600).abs() < 40, "{min_x}..{max_x}");
+    }
+
+    #[test]
+    fn art_tags_select_the_shape_and_thumb_tag_tracks_the_primary_tag() {
+        let tag = Uuid::new_v4().to_string();
+        let portrait = portrait_art_tag(&tag);
+        assert!(is_portrait_art_tag(&portrait));
+        assert!(!is_portrait_art_tag(&tag));
+        assert!(!is_portrait_art_tag(&format!(
+            "{}-1700000000",
+            Uuid::new_v4()
+        )));
+
+        let thumb = collection_thumb_tag(&tag);
+        assert_ne!(thumb, tag);
+        assert!(!is_portrait_art_tag(&thumb));
+        assert_eq!(thumb, collection_thumb_tag(&tag), "stable");
+        assert_ne!(
+            thumb,
+            collection_thumb_tag(&Uuid::new_v4().to_string()),
+            "changes when the primary tag changes"
+        );
+    }
 
     #[test]
     fn grid_is_four_by_four_with_gutters() {
         assert_eq!(
-            grid_dimensions(),
+            grid_dimensions(CollectionArtShape::Landscape),
             (
                 3 * GRID_POSTER_W + 2 * GRID_GUTTER,
                 3 * GRID_POSTER_H + 2 * GRID_GUTTER,
@@ -1935,7 +2477,7 @@ mod tests {
             },
             "Collection",
             None,
-            false,
+            OverlayPlacement::LeftColumn,
         )
         .unwrap();
 
@@ -2090,5 +2632,233 @@ mod tests {
         .unwrap();
 
         assert_ne!(first_key, second_key);
+    }
+
+    async fn test_db() -> sqlx::SqlitePool {
+        let db = crate::db::connect("sqlite::memory:", 10_000)
+            .await
+            .unwrap();
+        crate::db::migrate(&db)
+            .await
+            .unwrap();
+        db
+    }
+
+    async fn insert_collection(db: &sqlx::SqlitePool) -> Uuid {
+        let now = chrono::Utc::now().naive_utc();
+        let mut collection = db::Media {
+            title: "Marvel".to_string(),
+            kind: db::MediaKind::Collection,
+            created_at: now,
+            updated_at: now,
+            ..Default::default()
+        };
+        collection
+            .save(db)
+            .await
+            .unwrap();
+        collection.id
+    }
+
+    fn dims(bytes: &[u8]) -> (u32, u32) {
+        let img = image::load_from_memory(bytes).unwrap();
+        (img.width(), img.height())
+    }
+
+    async fn primary_row(db: &sqlx::SqlitePool, id: Uuid) -> Option<db::MediaImage> {
+        db::MediaImage::get_for_media(db, &id)
+            .await
+            .unwrap()
+            .primary
+            .into_iter()
+            .next()
+    }
+
+    #[tokio::test]
+    async fn library_image_renders_both_shapes_and_registers_a_generated_landscape_row()
+    {
+        let dir = tempfile::tempdir().unwrap();
+        let db = test_db().await;
+        let id = insert_collection(&db).await;
+
+        // Asking for the portrait render generates (and stores) both.
+        let portrait = ImageService::library_image(
+            dir.path(),
+            id,
+            "Marvel",
+            &db,
+            CollectionArtShape::Portrait,
+        )
+        .await
+        .unwrap();
+        assert_eq!(dims(&portrait), (600, 900));
+        let landscape = ImageService::library_image(
+            dir.path(),
+            id,
+            "Marvel",
+            &db,
+            CollectionArtShape::Landscape,
+        )
+        .await
+        .unwrap();
+        assert_eq!(dims(&landscape), (960, 540));
+
+        // The row is the landscape render (so legacy clients keep AR 16:9) and
+        // is marked generated; its id is the tag, stable across both requests.
+        let row = primary_row(&db, id)
+            .await
+            .unwrap();
+        assert!(row.is_generated);
+        assert_eq!((row.width, row.height), (Some(960), Some(540)));
+        let again = ImageService::library_image(
+            dir.path(),
+            id,
+            "Marvel",
+            &db,
+            CollectionArtShape::Portrait,
+        )
+        .await
+        .unwrap();
+        assert_eq!(again, portrait, "stored render is reused, not regenerated");
+        assert_eq!(
+            primary_row(&db, id)
+                .await
+                .unwrap()
+                .id,
+            row.id
+        );
+    }
+
+    #[tokio::test]
+    async fn library_image_adds_a_missing_portrait_without_touching_existing_landscape()
+    {
+        let dir = tempfile::tempdir().unwrap();
+        let db = test_db().await;
+        let id = insert_collection(&db).await;
+        // Pre-existing (legacy) landscape-only art, as produced before portrait existed.
+        let legacy = ImageService::generate(
+            id,
+            "Marvel",
+            &db,
+            None,
+            None,
+            None,
+            &[CollectionArtShape::Landscape],
+        )
+        .await
+        .unwrap()
+        .remove(0)
+        .1;
+        let landscape_path = ImageService::image_path(dir.path(), id, "primary", "jpg");
+        ImageService::write_image_to_disk(&landscape_path, &legacy)
+            .await
+            .unwrap();
+
+        let portrait = ImageService::library_image(
+            dir.path(),
+            id,
+            "Marvel",
+            &db,
+            CollectionArtShape::Portrait,
+        )
+        .await
+        .unwrap();
+        assert_eq!(dims(&portrait), (600, 900));
+        assert_eq!(
+            tokio::fs::read(&landscape_path)
+                .await
+                .unwrap(),
+            legacy
+        );
+    }
+
+    #[tokio::test]
+    async fn invalidate_removes_both_generated_renders_and_the_row() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = test_db().await;
+        let id = insert_collection(&db).await;
+        ImageService::library_image(
+            dir.path(),
+            id,
+            "Marvel",
+            &db,
+            CollectionArtShape::Portrait,
+        )
+        .await
+        .unwrap();
+        let old_tag = primary_row(&db, id)
+            .await
+            .unwrap()
+            .id;
+
+        assert!(
+            ImageService::invalidate_collection_image(dir.path(), id, &db)
+                .await
+                .unwrap()
+        );
+        assert!(
+            primary_row(&db, id)
+                .await
+                .is_none()
+        );
+        for shape in [CollectionArtShape::Landscape, CollectionArtShape::Portrait] {
+            assert!(
+                ImageService::read_existing_art(dir.path(), id, shape)
+                    .await
+                    .is_none()
+            );
+        }
+
+        // Regeneration mints a new row id, i.e. a new image tag.
+        ImageService::library_image(
+            dir.path(),
+            id,
+            "Marvel",
+            &db,
+            CollectionArtShape::Landscape,
+        )
+        .await
+        .unwrap();
+        assert_ne!(
+            primary_row(&db, id)
+                .await
+                .unwrap()
+                .id,
+            old_tag
+        );
+    }
+
+    #[tokio::test]
+    async fn invalidate_never_touches_an_uploaded_primary() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = test_db().await;
+        let id = insert_collection(&db).await;
+        // A user upload goes through `save_image` (is_generated stays false).
+        let upload =
+            encode_jpeg(RgbImage::from_pixel(300, 450, Rgb([10, 200, 30]))).unwrap();
+        ImageService::save_image(dir.path(), id, ImageKind::Primary, &upload, &db)
+            .await
+            .unwrap();
+        let row = primary_row(&db, id)
+            .await
+            .unwrap();
+        assert!(!row.is_generated);
+
+        assert!(
+            !ImageService::invalidate_collection_image(dir.path(), id, &db)
+                .await
+                .unwrap()
+        );
+
+        let after = primary_row(&db, id)
+            .await
+            .unwrap();
+        assert_eq!(after.id, row.id, "tag unchanged");
+        assert_eq!(
+            tokio::fs::read(&after.path)
+                .await
+                .unwrap(),
+            upload
+        );
     }
 }
