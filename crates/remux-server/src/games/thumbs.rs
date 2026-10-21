@@ -90,17 +90,55 @@ pub enum ThumbResult {
 /// libretro platform (= thumbnail folder) names to try for a game, best first.
 /// Empty when libretro has no usable folder (arcade sets are keyed on long
 /// titles, not the short ROM names found on disk).
-pub fn platforms(core: Core, file_name: &str) -> &'static [&'static str] {
-    let ext = Path::new(file_name)
+///
+/// Several libretro platforms share one core id, so the choice uses, in order:
+/// the system folder name (`GBC`, `SG-1000`, ...), then the extension of the
+/// ROM actually served (the inner ROM of a single-ROM archive, never the
+/// `.zip` wrapper), then the core's default.
+pub fn platforms_for(game: &Game) -> &'static [&'static str] {
+    platforms(game.core, game.served_file_name(), &game.system)
+}
+
+pub fn platforms(core: Core, rom_name: &str, system: &str) -> &'static [&'static str] {
+    const GBC: &[&str] = &["Nintendo - Game Boy Color", "Nintendo - Game Boy"];
+    const SG: &[&str] = &["Sega - SG-1000", "Sega - Master System - Mark III"];
+    const FDS: &[&str] = &[
+        "Nintendo - Family Computer Disk System",
+        "Nintendo - Nintendo Entertainment System",
+    ];
+    const S32X: &[&str] = &["Sega - 32X", "Sega - Mega Drive - Genesis"];
+    const SCD: &[&str] = &["Sega - Mega-CD - Sega CD", "Sega - Mega Drive - Genesis"];
+    let ext = Path::new(rom_name)
         .extension()
         .and_then(|e| e.to_str())
         .map(str::to_ascii_lowercase);
+    let folder: String = system
+        .chars()
+        .filter(char::is_ascii_alphanumeric)
+        .map(|c| c.to_ascii_lowercase())
+        .collect();
+    let folder = folder.as_str();
     match (core, ext.as_deref()) {
-        (Core::Gb, Some("gbc")) => {
-            &["Nintendo - Game Boy Color", "Nintendo - Game Boy"]
+        (Core::Gb, _) if matches!(folder, "gbc" | "gameboycolor") => GBC,
+        (Core::Gb, Some("gbc")) => GBC,
+        (Core::SegaMs, _)
+            if matches!(folder, "sg1000" | "sg" | "segasg1000" | "sega1000") =>
+        {
+            SG
         }
-        (Core::SegaMs, Some("sg")) => {
-            &["Sega - SG-1000", "Sega - Master System - Mark III"]
+        (Core::SegaMs, Some("sg")) => SG,
+        (Core::Nes, _)
+            if matches!(
+                folder,
+                "fds" | "famicomdisksystem" | "nintendofamicomdisksystem"
+            ) =>
+        {
+            FDS
+        }
+        (Core::Nes, Some("fds")) => FDS,
+        (Core::SegaMd, _) if matches!(folder, "32x" | "sega32x") => S32X,
+        (Core::SegaMd, _) if matches!(folder, "segacd" | "megacd" | "segamegacd") => {
+            SCD
         }
         (Core::Nes, _) => &["Nintendo - Nintendo Entertainment System"],
         (Core::Snes, _) => &["Nintendo - Super Nintendo Entertainment System"],
@@ -284,7 +322,7 @@ impl ThumbService {
         if !config.games_thumbnails_enabled || !safe_id(&game.id) {
             return ThumbResult::Missing;
         }
-        let platforms = platforms(game.core, &game.file_name);
+        let platforms = platforms_for(game);
         let names = candidate_names(game);
         if platforms.is_empty() || names.is_empty() {
             return ThumbResult::Missing;
@@ -554,7 +592,7 @@ mod tests {
 
     #[test]
     fn platform_mapping() {
-        let p = |c, f| platforms(c, f);
+        let p = |c, f| platforms(c, f, "");
         assert_eq!(
             p(Core::Nes, "a.nes"),
             ["Nintendo - Nintendo Entertainment System"]
@@ -572,6 +610,70 @@ mod tests {
         assert_eq!(p(Core::SegaMd, "a.md"), ["Sega - Mega Drive - Genesis"]);
         assert_eq!(p(Core::Psx, "a.cue"), ["Sony - PlayStation"]);
         assert!(p(Core::Mame, "pacman.zip").is_empty());
+    }
+
+    #[test]
+    fn archives_and_folders_pick_the_platform() {
+        use super::super::archive::ArchiveRom;
+        const GBC: [&str; 2] = ["Nintendo - Game Boy Color", "Nintendo - Game Boy"];
+        let zipped = |file: &str, inner: &str, system: &str, core| {
+            let mut g = game(file, "T", core);
+            g.system = system.into();
+            g.inner_rom = Some(ArchiveRom {
+                name: inner.into(),
+                size: 1,
+                crc32: None,
+            });
+            g
+        };
+        // Zipped .gbc in a folder with no hint: the inner extension decides.
+        assert_eq!(
+            platforms_for(&zipped("a.zip", "a.gbc", "Handhelds", Core::Gb)),
+            GBC
+        );
+        // Zipped .gb in a GBC folder: the folder wins.
+        assert_eq!(
+            platforms_for(&zipped("a.zip", "a.gb", "GBC", Core::Gb)),
+            GBC
+        );
+        assert_eq!(
+            platforms_for(&zipped("a.zip", "a.gbc", "GBC", Core::Gb)),
+            GBC
+        );
+        assert_eq!(
+            platforms_for(&zipped("a.zip", "a.gb", "Game Boy", Core::Gb)),
+            ["Nintendo - Game Boy"]
+        );
+        // Loose files are unchanged.
+        let mut loose = game("a.gbc", "T", Core::Gb);
+        assert_eq!(platforms_for(&loose), GBC);
+        loose.file_name = "a.gb".into();
+        assert_eq!(platforms_for(&loose), ["Nintendo - Game Boy"]);
+        // SG-1000 and FDS via folder or inner extension.
+        assert_eq!(
+            platforms_for(&zipped("a.zip", "a.sms", "SG-1000", Core::SegaMs))[0],
+            "Sega - SG-1000"
+        );
+        assert_eq!(
+            platforms_for(&zipped("a.zip", "a.sg", "Sega", Core::SegaMs))[0],
+            "Sega - SG-1000"
+        );
+        assert_eq!(
+            platforms_for(&zipped("a.zip", "a.sms", "SMS", Core::SegaMs)),
+            ["Sega - Master System - Mark III"]
+        );
+        assert_eq!(
+            platforms_for(&zipped("a.zip", "a.fds", "NES", Core::Nes))[0],
+            "Nintendo - Family Computer Disk System"
+        );
+        assert_eq!(
+            platforms_for(&zipped("a.zip", "a.nes", "NES", Core::Nes)),
+            ["Nintendo - Nintendo Entertainment System"]
+        );
+        assert_eq!(
+            platforms_for(&zipped("a.zip", "a.md", "32X", Core::SegaMd))[0],
+            "Sega - 32X"
+        );
     }
 
     #[test]

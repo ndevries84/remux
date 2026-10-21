@@ -303,7 +303,7 @@ impl MetaService {
         let platforms: HashSet<&'static str> = snap
             .games
             .iter()
-            .flat_map(|g| thumbs::platforms(g.core, g.served_file_name()))
+            .flat_map(|g| thumbs::platforms_for(g))
             .copied()
             .collect();
         for platform in platforms {
@@ -375,7 +375,7 @@ impl MetaService {
         if !rdb_on && !lb_on {
             return GameMeta::default();
         }
-        let platforms = thumbs::platforms(game.core, game.served_file_name());
+        let platforms = thumbs::platforms_for(game);
         if platforms.is_empty() {
             return GameMeta::default();
         }
