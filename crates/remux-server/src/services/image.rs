@@ -1453,6 +1453,11 @@ fn compose_collection_art(
     let has_custom_background = custom_background.is_some();
     let mut canvas = custom_background
         .map(|image| {
+            if shape == CollectionArtShape::Portrait && image.width() >= image.height()
+            {
+                // A wide card (e.g. a logo on black) must stay whole, not be cropped.
+                return fit_background_contained(image, out_w, out_h);
+            }
             // A background that does not match the shape is centre-cropped to fill it.
             DynamicImage::ImageRgba8(image.clone())
                 .resize_to_fill(out_w, out_h, image::imageops::FilterType::Lanczos3)
@@ -1841,6 +1846,92 @@ fn stamp_portrait_cover(canvas: &mut RgbaImage, posters: &[RgbaImage]) {
         }
     }
     image::imageops::overlay(canvas, &projected, 0, 0);
+}
+
+/// Mean colour of the outermost 3px ring of `img` and whether that ring is
+/// uniform (mean absolute deviation per channel under 10).
+fn edge_ring_colour(img: &RgbaImage) -> ([u8; 3], bool) {
+    const RING: u32 = 3;
+    let (w, h) = img.dimensions();
+    let ring = RING
+        .min(w / 2)
+        .min(h / 2)
+        .max(1);
+    let mut pixels: Vec<[u8; 3]> = Vec::new();
+    for y in 0..h {
+        for x in 0..w {
+            if x < ring || y < ring || x >= w - ring || y >= h - ring {
+                let p = img.get_pixel(x, y);
+                // Transparent pixels read as black, matching how they composite.
+                let a = p[3] as u32;
+                pixels.push([
+                    (p[0] as u32 * a / 255) as u8,
+                    (p[1] as u32 * a / 255) as u8,
+                    (p[2] as u32 * a / 255) as u8,
+                ]);
+            }
+        }
+    }
+    let n = pixels
+        .len()
+        .max(1) as f32;
+    let mut mean = [0f32; 3];
+    for p in &pixels {
+        for c in 0..3 {
+            mean[c] += p[c] as f32;
+        }
+    }
+    for m in &mut mean {
+        *m /= n;
+    }
+    let mut dev = 0f32;
+    for p in &pixels {
+        for c in 0..3 {
+            dev += (p[c] as f32 - mean[c]).abs();
+        }
+    }
+    let uniform = dev / (n * 3.0) < 10.0;
+    ([mean[0] as u8, mean[1] as u8, mean[2] as u8], uniform)
+}
+
+/// Portrait canvas for a background that is not portrait-shaped: the whole
+/// image is scaled to the canvas width and centred vertically. The leftover
+/// bands are a solid fill when the image border is uniform, otherwise a
+/// blurred, darkened, cover-scaled copy of the image itself.
+fn fit_background_contained(image: &RgbaImage, out_w: u32, out_h: u32) -> RgbaImage {
+    let (edge, uniform) = edge_ring_colour(image);
+    let mut canvas = if uniform {
+        RgbaImage::from_pixel(out_w, out_h, Rgba([edge[0], edge[1], edge[2], 255]))
+    } else {
+        let cover = DynamicImage::ImageRgba8(image.clone())
+            .resize_to_fill(out_w / 4, out_h / 4, image::imageops::FilterType::Triangle)
+            .into_rgba8();
+        let mut blurred = image::imageops::blur(&cover, 8.0);
+        for p in blurred.pixels_mut() {
+            for c in 0..3 {
+                p[c] = (p[c] as f32 * 0.45) as u8;
+            }
+            p[3] = 255;
+        }
+        image::imageops::resize(
+            &blurred,
+            out_w,
+            out_h,
+            image::imageops::FilterType::Triangle,
+        )
+    };
+    let fit_h = ((image.height() as f64 * out_w as f64 / image.width() as f64).round()
+        as u32)
+        .clamp(1, out_h);
+    let fitted = image::imageops::resize(
+        image,
+        out_w,
+        fit_h,
+        image::imageops::FilterType::Lanczos3,
+    );
+    let top = ((out_h - fit_h) / 2) as i64;
+    image::imageops::overlay(&mut canvas, &fitted, 0, top);
+    canvas
 }
 
 /// Portrait background for art with no posters: the brand gradient, or a soft
@@ -3354,5 +3445,117 @@ mod tests {
         let own = collect_poster_urls(smart.id, &smart, db, 3, None).await;
         assert_eq!(own.len(), 3, "{own:?}");
         assert!(child_collections_filter(&smart, None).is_none());
+    }
+
+    fn wide_card() -> RgbaImage {
+        // 1600x900 black card with distinctive pixels at the left/right edges of the logo.
+        RgbaImage::from_fn(1600, 900, |x, y| {
+            if (700..=800).contains(&y) && (10..40).contains(&x) {
+                Rgba([255, 0, 0, 255])
+            } else if (700..=800).contains(&y) && (1560..1590).contains(&x) {
+                Rgba([0, 255, 0, 255])
+            } else {
+                Rgba([0, 0, 0, 255])
+            }
+        })
+    }
+
+    fn compose_with_bg(bg: &RgbaImage) -> RgbaImage {
+        compose_collection_art(
+            CollectionArtShape::Portrait,
+            CollectionPosterLayout::None,
+            [120, 30, 60],
+            Some(bg),
+            &[],
+            &CollectionOverlay::None,
+            "Fallback",
+            None,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn portrait_wide_background_is_contained_not_cropped() {
+        let out = compose_with_bg(&wide_card());
+        assert_eq!((out.width(), out.height()), (600, 900));
+        let (mut red_min_x, mut green_max_x) = (u32::MAX, 0u32);
+        for (x, _, p) in out.enumerate_pixels() {
+            if p[0] > 200 && p[1] < 60 {
+                red_min_x = red_min_x.min(x);
+            }
+            if p[1] > 200 && p[0] < 60 {
+                green_max_x = green_max_x.max(x);
+            }
+        }
+        assert!(
+            red_min_x < 30,
+            "left edge of the card was cropped: {red_min_x}"
+        );
+        assert!(
+            green_max_x > 570,
+            "right edge of the card was cropped: {green_max_x}"
+        );
+        // Uniform black border -> solid black fill above and below.
+        for (x, y) in [(5, 5), (300, 100), (594, 275), (5, 895), (300, 800)] {
+            let p = out.get_pixel(x, y);
+            assert!(
+                p[0].max(p[1])
+                    .max(p[2])
+                    < 8,
+                "({x},{y}) = {p:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn portrait_wide_background_fill_matches_uniform_edge_colour() {
+        let navy = RgbaImage::from_fn(1600, 900, |x, y| {
+            if (700..900).contains(&x) && (400..500).contains(&y) {
+                Rgba([255, 255, 255, 255])
+            } else {
+                Rgba([10, 20, 90, 255])
+            }
+        });
+        let out = compose_with_bg(&navy);
+        let p = out.get_pixel(300, 50);
+        assert_eq!([p[0], p[1], p[2]], [10, 20, 90]);
+    }
+
+    #[test]
+    fn portrait_wide_background_with_busy_edges_gets_blurred_backdrop() {
+        let busy = RgbaImage::from_fn(1600, 900, |x, y| {
+            Rgba([
+                (x % 256) as u8,
+                (y % 256) as u8,
+                ((x / 7 + y / 5) % 256) as u8,
+                255,
+            ])
+        });
+        let out = compose_with_bg(&busy);
+        let p = out.get_pixel(300, 40);
+        assert!(
+            p[0].max(p[1])
+                .max(p[2])
+                > 10
+        );
+        assert!(
+            p[0].max(p[1])
+                .max(p[2])
+                < 200
+        );
+    }
+
+    #[test]
+    fn portrait_shaped_background_still_covers() {
+        let tall = RgbaImage::from_fn(600, 900, |x, _| {
+            if x < 50 {
+                Rgba([255, 0, 0, 255])
+            } else {
+                Rgba([0, 0, 255, 255])
+            }
+        });
+        let out = compose_with_bg(&tall);
+        assert_eq!(out.get_pixel(5, 5)[0], 255);
+        assert_eq!(out.get_pixel(595, 895)[2], 255);
     }
 }
