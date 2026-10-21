@@ -370,6 +370,35 @@ fn community_rating(media: &db::Media) -> Option<f64> {
     }
 }
 
+/// Re-shape a listed item's collection art for a client that prefers the
+/// portrait (2:3) Primary. Only server-generated collection art is affected:
+/// its Primary tag becomes the portrait-selecting tag and its aspect ratio
+/// 2:3. Uploaded art, every other item kind, and every other client keep the
+/// plain DTO from [`db_media_to_item`] untouched.
+pub fn apply_collection_art_style(dto: &mut BaseItemDto, prefers_portrait: bool) {
+    if !prefers_portrait
+        || !dto
+            .remux
+            .as_ref()
+            .is_some_and(|r| r.generated_image == Some(true))
+    {
+        return;
+    }
+    if let Some(tags) = dto
+        .image_tags
+        .as_mut()
+    {
+        if let Some(primary) = tags
+            .primary
+            .as_mut()
+        {
+            *primary = crate::services::image::portrait_art_tag(primary);
+        }
+    }
+    dto.primary_image_aspect_ratio =
+        Some(crate::services::image::CollectionArtShape::Portrait.aspect_ratio());
+}
+
 pub fn db_media_to_item(media: db::Media, hide_sources: bool) -> BaseItemDto {
     db_media_to_item_inner(media, hide_sources, true)
 }
@@ -426,6 +455,16 @@ fn db_media_to_item_inner(
             None
         }
     });
+
+    // A collection's Primary is server-generated unless an uploaded or provider
+    // image occupies the slot (no row at all also means "generate on request").
+    // Uploaded art is never reshaped and keeps the plain Primary tag/AR for
+    // every client.
+    let generated_collection_art = media.kind == db::MediaKind::Collection
+        && media
+            .images
+            .get(db::ImageKind::Primary)
+            .is_none_or(|row| row.is_generated);
 
     let mut item = BaseItemDto {
         id: media
@@ -548,14 +587,21 @@ fn db_media_to_item_inner(
             primary: primary_tag.clone(),
             logo: media_image_tag(&media, db::ImageKind::Logo),
             backdrop: media_image_tag(&media, db::ImageKind::Backdrop),
-            // A collection has no dedicated Thumb of its own — Thumb is just
-            // the generated Primary artwork (see the matching serve-time
-            // fallback in api/images.rs), so report the identical tag rather
-            // than nothing, or a value a client would treat as a distinct
-            // image and cache separately.
+            // A collection with no dedicated Thumb gets one of two things:
+            // - generated Primary art: a distinct Thumb tag, derived from the
+            //   Primary tag so it changes whenever the art is regenerated. It
+            //   always serves the wide 16:9 render (see api/images.rs).
+            // - uploaded/provider Primary: the identical Primary tag, since
+            //   Thumb then serves that same image.
             thumb: media_image_tag(&media, db::ImageKind::Thumb).or_else(|| {
                 if media.kind == db::MediaKind::Collection {
-                    primary_tag.clone()
+                    if generated_collection_art {
+                        primary_tag
+                            .as_deref()
+                            .map(crate::services::image::collection_thumb_tag)
+                    } else {
+                        primary_tag.clone()
+                    }
                 } else {
                     None
                 }
@@ -1000,6 +1046,7 @@ fn db_media_to_item_inner(
                 .collection_image_config
                 .clone(),
             sort_order: media.sort_order,
+            generated_image: generated_collection_art.then_some(true),
         }),
         enable_media_source_display: Some(true),
         date_created: Some(

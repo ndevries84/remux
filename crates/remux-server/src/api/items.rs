@@ -83,6 +83,8 @@ pub struct ItemsQueryResultBuilder {
     session: auth::AuthSession,
     apply_permissions: bool,
     hide_sources: bool,
+    /// Moonfin-style clients get portrait (2:3) generated collection art.
+    portrait_collection_art: bool,
     /// Per-client override for CollectionType::Mixed. None = leave as Mixed.
     mixed_collection_type: Option<api::CollectionType>,
     fields: Option<Vec<api::ItemFields>>,
@@ -100,6 +102,7 @@ impl ItemsQueryResultBuilder {
             session,
             apply_permissions: false,
             hide_sources: false,
+            portrait_collection_art: false,
             mixed_collection_type: None,
             fields: None,
         }
@@ -116,6 +119,7 @@ impl ItemsQueryResultBuilder {
             session,
             apply_permissions: false,
             hide_sources: false,
+            portrait_collection_art: false,
             mixed_collection_type: None,
             fields: None,
         }
@@ -143,6 +147,7 @@ impl ItemsQueryResultBuilder {
             .device
             .jellyfin_client();
         self.hide_sources = client.hide_sources();
+        self.portrait_collection_art = client.prefers_portrait_collection_art();
         self.mixed_collection_type = client.mixed_collection_type();
         self
     }
@@ -192,6 +197,7 @@ impl ItemsQueryResultBuilder {
             }
         };
         for item in &mut items {
+            api::apply_collection_art_style(item, self.portrait_collection_art);
             if item.collection_type == Some(api::CollectionType::Mixed) {
                 item.collection_type = self
                     .mixed_collection_type
@@ -2284,6 +2290,13 @@ async fn item_for_user(
         )
         .await?;
     let mut base_item = api::db_media_to_item(media.clone(), false);
+    api::apply_collection_art_style(
+        &mut base_item,
+        session
+            .device
+            .jellyfin_client()
+            .prefers_portrait_collection_art(),
+    );
 
     if needs_streams {
         crate::conversions::apply_filename_probe_fallback(

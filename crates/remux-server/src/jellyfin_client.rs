@@ -18,6 +18,12 @@ pub trait JellyfinClient: Send {
         false
     }
 
+    /// Whether this client wants generated collection art as a portrait (2:3)
+    /// Primary. Every other client keeps the classic wide (16:9) Primary.
+    fn prefers_portrait_collection_art(&self) -> bool {
+        false
+    }
+
     fn mixed_collection_type(&self) -> Option<CollectionType> {
         None
     }
@@ -46,6 +52,7 @@ pub trait JellyfinClient: Send {
 }
 
 pub struct Plezy;
+pub struct Moonfin;
 pub struct Swiftfin;
 pub struct SenPlayer;
 pub struct Infuse;
@@ -53,6 +60,12 @@ pub struct GenericClient;
 
 impl JellyfinClient for Plezy {
     fn hide_sources(&self) -> bool {
+        true
+    }
+}
+
+impl JellyfinClient for Moonfin {
+    fn prefers_portrait_collection_art(&self) -> bool {
         true
     }
 }
@@ -131,6 +144,17 @@ pub fn from_device(device: &Device) -> Box<dyn JellyfinClient> {
         .as_str()
     {
         "Plezy" => Box::new(Plezy),
+        // Moonfin's Flutter app reports "Moonfin for <platform>" (tvOS,
+        // Android TV, Android, iOS, macOS, Windows, Linux, Web), "Moonfin on
+        // Github" (standalone web build) or a bare "Moonfin". The Moonfin
+        // plugin's UI inside jellyfin-web reports jellyfin-web's own name and
+        // is therefore treated as a stock client.
+        s if s
+            .to_ascii_lowercase()
+            .starts_with("moonfin") =>
+        {
+            Box::new(Moonfin)
+        }
         s if s.contains("Swiftfin") => Box::new(Swiftfin),
         "SenPlayer" => Box::new(SenPlayer),
         s if s
@@ -178,6 +202,47 @@ pub fn merge_device_profile_subtitles(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_moonfin_clients_prefer_portrait_collection_art() {
+        let prefers = |app_name: &str| {
+            from_device(&Device {
+                app_name: app_name.into(),
+                ..Default::default()
+            })
+            .prefers_portrait_collection_art()
+        };
+        // Names Moonfin sends (moonfin-core lib/di/injection.dart `_clientName`).
+        for moonfin in [
+            "Moonfin for tvOS",
+            "Moonfin for Android TV",
+            "Moonfin for Android",
+            "Moonfin for iOS",
+            "Moonfin for macOS",
+            "Moonfin for Windows",
+            "Moonfin for Linux",
+            "Moonfin for Web",
+            "Moonfin on Github",
+            "Moonfin",
+            "moonfin",
+        ] {
+            assert!(prefers(moonfin), "{moonfin} should prefer portrait art");
+        }
+        for other in [
+            "Jellyfin Web",
+            "Jellyfin Android",
+            "Swiftfin",
+            "Swiftfin iOS",
+            "Infuse-Direct",
+            "SenPlayer",
+            "Plezy",
+            "Generic",
+            "Unknown",
+            "",
+        ] {
+            assert!(!prefers(other), "{other:?} must keep wide collection art");
+        }
+    }
 
     #[test]
     fn date_created_sort_counts_as_default_sort() {

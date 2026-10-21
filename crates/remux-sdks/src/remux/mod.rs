@@ -4497,6 +4497,10 @@ pub struct RemuxInfo {
     pub watchlist: Option<bool>,
     /// Whether the requesting user ignores this item.
     pub ignored: Option<bool>,
+    /// `true` when the item's Primary image is server-generated collection art
+    /// (as opposed to an uploaded or provider image). Only generated art has
+    /// shape variants.
+    pub generated_image: Option<bool>,
 }
 
 /// A user's remux-only marks on one item, as returned by the watchlist and
