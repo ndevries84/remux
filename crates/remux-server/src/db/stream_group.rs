@@ -35,6 +35,20 @@ pub enum MatchOutcome {
     NoMatch,
 }
 
+/// A set rule with no values selects nothing, so it is treated as "not
+/// configured" and ignored rather than rejecting every stream.
+fn is_empty_value_rule(rule: &StreamRule) -> bool {
+    match rule {
+        StreamRule::Resolution { values, .. } => values.is_empty(),
+        StreamRule::Quality { values, .. } => values.is_empty(),
+        StreamRule::Codec { values, .. } => values.is_empty(),
+        StreamRule::AudioLanguage { values, .. } => values.is_empty(),
+        StreamRule::Addon { values, .. } => values.is_empty(),
+        StreamRule::SubtitleLanguage { values, .. } => values.is_empty(),
+        _ => false,
+    }
+}
+
 fn bool_to_outcome(hit: bool) -> MatchOutcome {
     if hit {
         MatchOutcome::Match
@@ -409,10 +423,12 @@ impl StreamGroup {
         runtime_secs: Option<i64>,
     ) -> MatchOutcome {
         let filter = &self.filter;
-        if filter
+        let active_rules: Vec<&StreamRule> = filter
             .rules
-            .is_empty()
-        {
+            .iter()
+            .filter(|r| !is_empty_value_rule(r))
+            .collect();
+        if active_rules.is_empty() {
             return MatchOutcome::Match;
         }
 
@@ -566,9 +582,8 @@ impl StreamGroup {
             }
         };
 
-        let outcomes: Vec<MatchOutcome> = filter
-            .rules
-            .iter()
+        let outcomes: Vec<MatchOutcome> = active_rules
+            .into_iter()
             .map(eval)
             .collect();
         match filter.match_mode {
@@ -1945,5 +1960,77 @@ mod tests {
             ..nameless_info()
         };
         assert_eq!(mixed.match_outcome(&uncached, None), MatchOutcome::NoMatch);
+    }
+
+    fn kept_names(
+        mode: FilterMatchMode,
+        rules: Vec<StreamRule>,
+        names: &[&str],
+    ) -> Vec<String> {
+        let filter = StreamFilter {
+            match_mode: mode,
+            rules,
+        };
+        let sources = names
+            .iter()
+            .map(|n| Media {
+                stream_info: Some(info(n)),
+                ..Default::default()
+            })
+            .collect();
+        apply_stream_filter(&filter, sources)
+            .into_iter()
+            .filter_map(|m| {
+                m.stream_info
+                    .and_then(|i| i.filename)
+            })
+            .collect()
+    }
+
+    const S1080: &str = "Movie.2020.1080p.WEB-DL.x264-GRP.mkv";
+    const S2160: &str = "Movie.2020.2160p.WEB-DL.x265-GRP.mkv";
+
+    #[test]
+    fn empty_values_resolution_rule_keeps_streams_for_real_user_policy() {
+        let rules = vec![
+            StreamRule::AudioLanguage {
+                op: SetOp::In,
+                values: vec!["eng".to_string()],
+            },
+            StreamRule::Resolution {
+                op: SetOp::In,
+                values: vec![],
+            },
+        ];
+        assert_eq!(
+            kept_names(FilterMatchMode::All, rules, &[S1080, S2160]),
+            vec![S1080.to_string(), S2160.to_string()]
+        );
+    }
+
+    #[test]
+    fn empty_values_rule_alone_is_a_no_op_in_all_and_any_modes() {
+        for mode in [FilterMatchMode::All, FilterMatchMode::Any] {
+            let rules = vec![StreamRule::Resolution {
+                op: SetOp::In,
+                values: vec![],
+            }];
+            assert_eq!(
+                kept_names(mode, rules, &[S1080, S2160]),
+                vec![S1080.to_string(), S2160.to_string()]
+            );
+        }
+    }
+
+    #[test]
+    fn non_empty_resolution_rule_still_filters() {
+        let rules = vec![StreamRule::Resolution {
+            op: SetOp::In,
+            values: vec![StreamResolution::R1080p],
+        }];
+        assert_eq!(
+            kept_names(FilterMatchMode::All, rules, &[S1080, S2160]),
+            vec![S1080.to_string()]
+        );
     }
 }
