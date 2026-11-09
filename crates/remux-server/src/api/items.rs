@@ -1004,7 +1004,7 @@ pub async fn items_flat(
     if q.parent_id
         .is_some_and(|p| games_view_for(&state, p).is_some())
     {
-        return Ok(Json(Vec::<api::BaseItemDto>::new()));
+        return Ok(Json(Vec::<serde_json::Value>::new()));
     }
     let client = session
         .device
@@ -1099,14 +1099,14 @@ pub async fn items(
         .is_some_and(|p| games_view_for(&state, p).is_some())
     {
         // The synthetic Games view has no DB children.
-        return Ok(Json(api::BaseItemDtoQueryResult {
-            items: vec![],
-            total_record_count: 0,
-            start_index: q
+        return Ok(Json(serde_json::json!({
+            "Items": [],
+            "TotalRecordCount": 0,
+            "StartIndex": q
                 .start_index
                 .unwrap_or(0),
-            ..Default::default()
-        }));
+        }))
+        .into_response());
     }
     let items = get_items(state.clone(), session.clone(), q.clone(), true)
         .await?
@@ -3608,15 +3608,9 @@ pub(crate) async fn similar_items_for(
         id: Some(ids),
         user_id: Some(user_id),
         include_user_state: true,
-        include_relations: api::fields_include_relations(
-            fields,
-        ),
-        include_people: Some(api::fields_include_people(
-            fields,
-        )),
-        include_tags: Some(api::fields_include_tags(
-            fields,
-        )),
+        include_relations: api::fields_include_relations(fields),
+        include_people: Some(api::fields_include_people(fields)),
+        include_tags: Some(api::fields_include_tags(fields)),
         ..Default::default()
     };
     let result = db::Media::get_by_filter(
@@ -3633,13 +3627,7 @@ pub(crate) async fn similar_items_for(
     let mut items: Vec<api::BaseItemDto> = result
         .records
         .into_iter()
-        .map(|m| {
-            api::db_media_to_item_for_list(
-                m,
-                false,
-                fields,
-            )
-        })
+        .map(|m| api::db_media_to_item_for_list(m, false, fields))
         .collect();
     items.sort_by_key(|item| {
         let id = item.id;

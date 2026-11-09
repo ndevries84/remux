@@ -45,7 +45,10 @@ fn is_empty_value_rule(rule: &StreamRule) -> bool {
         StreamRule::AudioLanguage { values, .. } => values.is_empty(),
         StreamRule::Addon { values, .. } => values.is_empty(),
         StreamRule::SubtitleLanguage { values, .. } => values.is_empty(),
-        _ => false,
+        // Listed explicitly so a new rule variant forces a decision here.
+        StreamRule::Size { .. }
+        | StreamRule::Bitrate { .. }
+        | StreamRule::Cached { .. } => false,
     }
 }
 
@@ -2032,5 +2035,43 @@ mod tests {
             kept_names(FilterMatchMode::All, rules, &[S1080, S2160]),
             vec![S1080.to_string()]
         );
+    }
+
+    #[test]
+    fn every_values_list_rule_is_ignored_when_empty() {
+        let empties = vec![
+            StreamRule::Resolution {
+                op: SetOp::In,
+                values: vec![],
+            },
+            StreamRule::Quality {
+                op: SetOp::In,
+                values: vec![],
+            },
+            StreamRule::Codec {
+                op: SetOp::In,
+                values: vec![],
+            },
+            StreamRule::AudioLanguage {
+                op: SetOp::In,
+                values: vec![],
+            },
+            StreamRule::Addon {
+                op: SetOp::In,
+                values: vec![],
+            },
+            StreamRule::SubtitleLanguage {
+                op: SetOp::In,
+                values: vec![],
+            },
+        ];
+        for rule in empties {
+            assert!(is_empty_value_rule(&rule), "{rule:?}");
+            assert_eq!(
+                kept_names(FilterMatchMode::All, vec![rule], &[S1080, S2160]),
+                vec![S1080.to_string(), S2160.to_string()]
+            );
+        }
+        assert!(!is_empty_value_rule(&StreamRule::Cached { value: true }));
     }
 }

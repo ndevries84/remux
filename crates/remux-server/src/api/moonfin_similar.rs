@@ -120,7 +120,8 @@ pub async fn moonfin_similar(
             limit: q.limit,
             offset: 0,
             exclude: &q.exclude,
-            policy: Some(&session.user),
+            user: &session.user,
+            fields: None,
         },
     )
     .await;

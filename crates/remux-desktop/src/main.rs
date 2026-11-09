@@ -190,19 +190,20 @@ async fn serve(config: remux_server::Config) -> anyhow::Result<()> {
     #[cfg(not(remux_web_built))]
     let remux_web = None;
 
-    let (router, ctx) = remux_server::init_app(config, None, admin, remux_web, |pool| {
-        #[cfg(jellyfin_web_built)]
-        {
-            remux_server::WebClientService::from_embedded(&JELLYFIN_WEB, pool)
-        }
+    let (router, ctx) =
+        remux_server::init_app(config, None, admin, remux_web, |pool| {
+            #[cfg(jellyfin_web_built)]
+            {
+                remux_server::WebClientService::from_embedded(&JELLYFIN_WEB, pool)
+            }
 
-        #[cfg(not(jellyfin_web_built))]
-        {
-            let paths = remux_server::FilesystemPaths::load_from_env();
-            remux_server::WebClientService::from_filesystem(&paths.web_path, pool)
-        }
-    })
-    .await?;
+            #[cfg(not(jellyfin_web_built))]
+            {
+                let paths = remux_server::FilesystemPaths::load_from_env();
+                remux_server::WebClientService::from_filesystem(&paths.web_path, pool)
+            }
+        })
+        .await?;
     remux_server::spawn_games_warmup(&ctx);
     remux_server::bind_and_serve(router, addr).await
 }

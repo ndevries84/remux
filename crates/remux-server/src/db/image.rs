@@ -427,7 +427,7 @@ mod tests {
     async fn is_generated_backfill_only_claims_provably_generated_rows() {
         let db = test_db().await;
         let backfill =
-            include_str!("../../migrations/202610200001_media_images_is_generated.sql");
+            include_str!("../../migrations/202611060001_media_images_is_generated.sql");
         let backfill = format!(
             "UPDATE{}",
             backfill
