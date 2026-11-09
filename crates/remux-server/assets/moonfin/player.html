@@ -1,4 +1,4 @@
-<!-- Origin: Moonfin plugin (Moonbase), Jellyfin/backend/EmulatorJS/player.html @ 9b9ee1e35a7b6d23f496c9866246b0ccb2e234dd. GPL-3.0. Remux changes: the data-path and CSP-nonce placeholders are substituted at serve time; inline script tags carry the CSP nonce; the EmulatorJS update check (checkForUpdates) is disabled, see the inline script that loads loader.js. -->
+<!-- Origin: Moonfin plugin (Moonbase), Jellyfin/backend/EmulatorJS/player.html @ c3288b7bb6388b64e191a8d9126c47a99f609707. GPL-3.0. Remux changes: the data-path and CSP-nonce placeholders are substituted at serve time; inline script tags carry the CSP nonce; the EmulatorJS update check (checkForUpdates) is disabled, see the inline script that loads loader.js. -->
 <!doctype html>
 <html>
   <head>
@@ -21,7 +21,7 @@
     <div id="game"></div>
     <div id="moonfin-error" style="display:none"></div>
     <script nonce="__CSP_NONCE__">
-      // Query params (URL-encoded): core, rom (with &ApiKey=), bios, save, name.
+      // Query params (URL-encoded): core, rom (with &ApiKey=), bios, save, sram, name.
       (function () {
         var params = new URLSearchParams(location.search);
         var core = params.get('core');
@@ -43,6 +43,9 @@
         if (bios) { window.EJS_biosUrl = bios; }
         var save = params.get('save');
         if (save) { window.EJS_loadStateURL = save; }
+        // A save state already holds the battery save, so a Continue skips it.
+        var sram = params.get('sram');
+        if (sram && !save) { window.moonfinSramUrl = sram; }
         var name = params.get('name');
         if (name) { window.EJS_gameName = name; }
       })();
