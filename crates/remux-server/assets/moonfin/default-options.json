@@ -71,6 +71,32 @@
       "help": "Ask before the back button leaves the app."
     },
     {
+      "key": "keyboardStyle",
+      "label": "Keyboard Style (TV clients only)",
+      "group": "General",
+      "section": "Behavior",
+      "type": "enum",
+      "options": [
+        {
+          "value": "native",
+          "label": "Native"
+        },
+        {
+          "value": "classic",
+          "label": "Classic"
+        },
+        {
+          "value": "glass",
+          "label": "Glass"
+        },
+        {
+          "value": "docked",
+          "label": "Docked"
+        }
+      ],
+      "help": "Native uses the TV's own keyboard, the others are Moonfin's on-screen keyboard."
+    },
+    {
       "key": "updateNotificationsEnabled",
       "label": "Update Notifications",
       "group": "General",
@@ -295,6 +321,14 @@
       "type": "bool"
     },
     {
+      "key": "showLibrariesIndividually",
+      "label": "Show Libraries Individually",
+      "group": "Appearance",
+      "section": "Navigation Bar Buttons",
+      "type": "bool",
+      "help": "Show each library as its own button in the navigation bar instead of in the Libraries menu."
+    },
+    {
       "key": "showSyncPlayButton",
       "label": "Show SyncPlay Button",
       "group": "Appearance",
@@ -471,11 +505,63 @@
       ]
     },
     {
-      "key": "backdropEnabled",
-      "label": "Background Backdrops",
+      "key": "homeBackdropEnabled",
+      "label": "Home Screen Backdrop Enabled",
+      "group": "Appearance",
+      "section": "Display",
+      "type": "bool",
+      "help": "Whether the home screen shows a backdrop. homeBackdropStyle says how."
+    },
+    {
+      "key": "homeBackdropStyle",
+      "label": "Home Screen Backdrop",
+      "group": "Appearance",
+      "section": "Display",
+      "type": "enum",
+      "options": [
+        {
+          "value": "off",
+          "label": "Off"
+        },
+        {
+          "value": "fullScreen",
+          "label": "Full Screen"
+        },
+        {
+          "value": "corner",
+          "label": "Corner"
+        },
+        {
+          "value": "top",
+          "label": "Top"
+        }
+      ],
+      "help": "On TV and desktop, Corner fades the backdrop out from the top right and Top shows only its top half, fading out toward the middle. Phones show it full screen."
+    },
+    {
+      "key": "detailsBackdropEnabled",
+      "label": "Details Screen Backdrop",
       "group": "Appearance",
       "section": "Display",
       "type": "bool"
+    },
+    {
+      "key": "detailsBackdropSize",
+      "label": "Details Backdrop Size",
+      "group": "Appearance",
+      "section": "Display",
+      "type": "enum",
+      "options": [
+        {
+          "value": "fullScreen",
+          "label": "Full Screen"
+        },
+        {
+          "value": "fit",
+          "label": "Fit"
+        }
+      ],
+      "help": "Phones only. Fit shows the whole backdrop across the top of the details screen."
     },
     {
       "key": "browsingBlur",
@@ -579,6 +665,14 @@
           "label": "Heavy"
         }
       ]
+    },
+    {
+      "key": "seasonalFollower",
+      "label": "Seasonal Effects Focus Follower",
+      "group": "Appearance",
+      "section": "Seasonal Effects",
+      "type": "bool",
+      "help": "A holiday piece, like Halloween's planchette, follows what is selected on Home. In the desktop layout it replaces the mouse pointer."
     },
     {
       "key": "seasonalRowHiddenHolidays",
@@ -997,6 +1091,24 @@
       "section": "Row Options",
       "type": "bool",
       "help": "Combine Continue Watching and Next Up into a single home row by default."
+    },
+    {
+      "key": "continueWatchingDefaultAction",
+      "label": "Continue Watching Default Action",
+      "group": "Home Screen",
+      "section": "Row Options",
+      "type": "enum",
+      "options": [
+        {
+          "value": "details",
+          "label": "Go to Details screen"
+        },
+        {
+          "value": "play",
+          "label": "Play immediately"
+        }
+      ],
+      "help": "What selecting a Continue Watching or Next Up item does."
     },
     {
       "key": "nextUpMaxDays",
@@ -2041,6 +2153,14 @@
       ]
     },
     {
+      "key": "mediaBarRowPeek",
+      "label": "Peek Home Rows",
+      "group": "Home Screen",
+      "section": "Media Bar",
+      "type": "bool",
+      "help": "Show the top half of the first home row along the bottom of the media bar on TV and desktop. The Banner style ignores it."
+    },
+    {
       "key": "mediaBarTrailerPreview",
       "label": "Trailer Preview",
       "group": "Home Screen",
@@ -2055,12 +2175,100 @@
       "type": "bool"
     },
     {
+      "key": "trailerVolume",
+      "label": "Trailer Volume",
+      "group": "Home Screen",
+      "section": "Media Bar",
+      "type": "number",
+      "min": 0,
+      "max": 100,
+      "step": 5,
+      "default": 100,
+      "help": "How loud media bar trailers play."
+    },
+    {
       "key": "mediaBarTrailerCaptions",
       "label": "Trailer Captions",
       "group": "Home Screen",
       "section": "Media Bar",
       "type": "bool",
       "help": "Show closed captions on YouTube trailers when available."
+    },
+    {
+      "key": "mediaBarMdblistEnabled",
+      "label": "Media Bar MDBList Ratings",
+      "group": "Home Screen",
+      "section": "Media Bar",
+      "type": "bool",
+      "help": "Enable MDBList ratings on the media bar by default (requires an MDBList API key). Only the Moonfin, MakD, Gallery and Banner styles show ratings."
+    },
+    {
+      "key": "mediaBarMdblistRatingSources",
+      "label": "Media Bar Rating Sources",
+      "group": "Home Screen",
+      "section": "Media Bar",
+      "type": "list",
+      "suggestions": [
+        {
+          "value": "tomatoes",
+          "label": "Rotten Tomatoes"
+        },
+        {
+          "value": "tomatoes_audience",
+          "label": "RT Audience Score"
+        },
+        {
+          "value": "imdb",
+          "label": "IMDb"
+        },
+        {
+          "value": "tmdb",
+          "label": "TMDB"
+        },
+        {
+          "value": "metacritic",
+          "label": "Metacritic"
+        },
+        {
+          "value": "metacriticUser",
+          "label": "Metacritic User"
+        },
+        {
+          "value": "stars",
+          "label": "Stars"
+        },
+        {
+          "value": "trakt",
+          "label": "Trakt"
+        },
+        {
+          "value": "letterboxd",
+          "label": "Letterboxd"
+        },
+        {
+          "value": "myAnimeList",
+          "label": "MyAnimeList"
+        },
+        {
+          "value": "rogerEbert",
+          "label": "Roger Ebert"
+        }
+      ],
+      "help": "Which ratings to display, in order."
+    },
+    {
+      "key": "mediaBarMdblistShowRatingNames",
+      "label": "Media Bar Rating Labels",
+      "group": "Home Screen",
+      "section": "Media Bar",
+      "type": "bool"
+    },
+    {
+      "key": "mediaBarMdblistShowRatingBadges",
+      "label": "Media Bar Rating Badges",
+      "group": "Home Screen",
+      "section": "Media Bar",
+      "type": "bool"
     },
     {
       "key": "mediaBarLibraryIds",
@@ -2249,12 +2457,122 @@
       "type": "bool"
     },
     {
+      "key": "mediaPreviewMode",
+      "label": "Media Preview",
+      "group": "Home Screen",
+      "section": "Per-Row Image Types",
+      "type": "enum",
+      "options": [
+        {
+          "value": "off",
+          "label": "Off"
+        },
+        {
+          "value": "media",
+          "label": "Media Preview"
+        },
+        {
+          "value": "trailer",
+          "label": "Trailer Preview"
+        }
+      ],
+      "help": "What a focused home card plays after a moment: a clip of the title or its trailer."
+    },
+    {
       "key": "previewAudioEnabled",
       "label": "Preview Audio",
       "group": "Home Screen",
       "section": "Per-Row Image Types",
       "type": "bool",
       "help": "Chart rows the home sections page can offer. IMDb rows need IMDb Charts enabled above, TMDB rows need a TMDB API key."
+    },
+    {
+      "key": "previewVolume",
+      "label": "Preview Volume",
+      "group": "Home Screen",
+      "section": "Per-Row Image Types",
+      "type": "number",
+      "min": 0,
+      "max": 100,
+      "step": 5,
+      "default": 100,
+      "help": "How loud media previews on cards play."
+    },
+    {
+      "key": "homeRowsMdblistEnabled",
+      "label": "Home Row MDBList Ratings",
+      "group": "Home Screen",
+      "section": "Per-Row Image Types",
+      "type": "bool",
+      "help": "Enable MDBList ratings in the home row info area by default (requires an MDBList API key)."
+    },
+    {
+      "key": "homeRowsMdblistRatingSources",
+      "label": "Home Row Rating Sources",
+      "group": "Home Screen",
+      "section": "Per-Row Image Types",
+      "type": "list",
+      "suggestions": [
+        {
+          "value": "tomatoes",
+          "label": "Rotten Tomatoes"
+        },
+        {
+          "value": "tomatoes_audience",
+          "label": "RT Audience Score"
+        },
+        {
+          "value": "imdb",
+          "label": "IMDb"
+        },
+        {
+          "value": "tmdb",
+          "label": "TMDB"
+        },
+        {
+          "value": "metacritic",
+          "label": "Metacritic"
+        },
+        {
+          "value": "metacriticUser",
+          "label": "Metacritic User"
+        },
+        {
+          "value": "stars",
+          "label": "Stars"
+        },
+        {
+          "value": "trakt",
+          "label": "Trakt"
+        },
+        {
+          "value": "letterboxd",
+          "label": "Letterboxd"
+        },
+        {
+          "value": "myAnimeList",
+          "label": "MyAnimeList"
+        },
+        {
+          "value": "rogerEbert",
+          "label": "Roger Ebert"
+        }
+      ],
+      "help": "Which ratings to display, in order."
+    },
+    {
+      "key": "homeRowsMdblistShowRatingNames",
+      "label": "Home Row Rating Labels",
+      "group": "Home Screen",
+      "section": "Per-Row Image Types",
+      "type": "bool"
+    },
+    {
+      "key": "homeRowsMdblistShowRatingBadges",
+      "label": "Home Row Rating Badges",
+      "group": "Home Screen",
+      "section": "Per-Row Image Types",
+      "type": "bool"
     },
     {
       "key": "homeRowImageTypes",
@@ -2538,6 +2856,13 @@
     {
       "key": "useDetailedSubHeadings",
       "label": "Use Detailed Subheadings",
+      "group": "Libraries",
+      "section": "Library Pages",
+      "type": "bool"
+    },
+    {
+      "key": "libraryCardTitles",
+      "label": "Titles Under Posters",
       "group": "Libraries",
       "section": "Library Pages",
       "type": "bool"
@@ -4777,6 +5102,14 @@
       "type": "bool"
     },
     {
+      "key": "cinemaModeSkipEnabled",
+      "label": "Cinema Mode Skip Button",
+      "group": "Playback",
+      "section": "Pre-roll",
+      "type": "bool",
+      "help": "Show a Skip button during Cinema Mode trailers, commercials, and other pre-rolls."
+    },
+    {
       "key": "nextUpTimeout",
       "label": "Next Up Timeout",
       "group": "Playback",
@@ -5243,6 +5576,54 @@
       "label": "Seerr Discovery Rows",
       "group": "Integrations",
       "reason": "Seerr integration is not implemented in Remux"
+    },
+    {
+      "key": "homeRowsTmdbEpisodeRatingsEnabled",
+      "label": "Home Row TMDB Episode Ratings",
+      "group": "Home Screen",
+      "reason": "Needs a TMDB API key on the server"
+    },
+    {
+      "key": "mediaBarExternalLists",
+      "label": "Media Bar External Lists",
+      "group": "Home Screen",
+      "reason": "External lists need MDBList, TMDB or Seerr rows, which are not served by Remux"
+    },
+    {
+      "key": "imdbRowsSortBy",
+      "label": "IMDb Rows Sort By",
+      "group": "Home Screen",
+      "reason": "These rows are not served by Remux"
+    },
+    {
+      "key": "imdbRowsSortOrder",
+      "label": "IMDb Rows Sort Order",
+      "group": "Home Screen",
+      "reason": "These rows are not served by Remux"
+    },
+    {
+      "key": "tmdbRowsSortBy",
+      "label": "TMDB Rows Sort By",
+      "group": "Home Screen",
+      "reason": "These rows are not served by Remux"
+    },
+    {
+      "key": "tmdbRowsSortOrder",
+      "label": "TMDB Rows Sort Order",
+      "group": "Home Screen",
+      "reason": "These rows are not served by Remux"
+    },
+    {
+      "key": "seerrRowsSortBy",
+      "label": "Seerr Rows Sort By",
+      "group": "Home Screen",
+      "reason": "These rows are not served by Remux"
+    },
+    {
+      "key": "seerrRowsSortOrder",
+      "label": "Seerr Rows Sort Order",
+      "group": "Home Screen",
+      "reason": "These rows are not served by Remux"
     }
   ]
 }
